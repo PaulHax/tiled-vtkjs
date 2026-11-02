@@ -15,14 +15,22 @@ its traversal and renderer adapter. Only content relevant to the current camera
 is fetched, decoded, and submitted. Decoded CPU payloads, renderer/GPU
 residency, and active draw are separate lifecycle states.
 
-Previously published as `pointcloud-lod`; this release uses the `tiled-vtkjs`
+Previously published as `pointcloud-lod`; this repository uses the `tiled-vtkjs`
 identity and format-specific entry points.
 
 ## Install
 
+The `tiled-vtkjs` npm package has not been released. Build from this source
+repository:
+
 ```bash
-npm install tiled-vtkjs
+git clone https://github.com/PaulHax/tiled-vtkjs.git
+cd tiled-vtkjs
+npm ci --ignore-scripts
+npm rebuild
 ```
+
+Build and link the pinned vtk.js package below, then run `npm run prepare`.
 
 ### Modules and renderer requirements
 

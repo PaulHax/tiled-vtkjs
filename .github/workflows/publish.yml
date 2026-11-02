@@ -2,7 +2,8 @@ name: CI
 
 # Test on every push/PR. On merge to main, semantic-release analyzes the
 # Conventional Commits since the last release, derives the next version, tags
-# it, publishes to npm, and creates a GitHub Release. Merges with no
+# it, publishes to npm, and creates a GitHub Release when the repository
+# variable NPM_PUBLISH_ENABLED is true. Merges with no
 # releasable commits (only chore/docs/etc.) publish nothing.
 #
 # Auth is npm TRUSTED PUBLISHING (OIDC): no NPM_TOKEN secret — npm trusts this
@@ -47,7 +48,7 @@ jobs:
         run: npm run commitlint -- --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
       # Also guard commits pushed directly to the repository.
       - name: Lint pushed commits
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         env:
           BASE_SHA: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
@@ -114,7 +115,7 @@ jobs:
 
   release:
     needs: [test, example-chain]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.NPM_PUBLISH_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write # create git tags + GitHub Releases
