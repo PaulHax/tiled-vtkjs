@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createTiles3dFixtureTileset } from "../../scripts/generateTiles3dFixture.mjs";
-import type { PerspectiveCameraView } from "../camera";
+import type { PerspectiveCameraView } from "../core/camera";
 import { parseTileset } from "./tilesetSource";
 import {
   createTilesetTraversal,

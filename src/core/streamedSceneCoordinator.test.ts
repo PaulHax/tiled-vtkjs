@@ -1,0 +1,886 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { perspectiveView } from "../../test/helpers";
+import type { CameraView } from "./camera";
+import type { Mat16 } from "./mat4";
+import { createMemoryPool } from "./memoryPool";
+import {
+  createStreamedSceneCoordinator,
+  type StreamedSceneCoordinatorOptions,
+} from "./streamedSceneCoordinator";
+import type {
+  Allocation,
+  GovernorInputs,
+  Importance,
+  MemberPickResult,
+  OcclusionResult,
+} from "./streamedMember";
+
+const VIEW = perspectiveView();
+
+/**
+ * A coordinator over its own small page pool unless a test shares one. Its
+ * clock stands still unless a test supplies one, so no member stalls however
+ * long a test takes to run.
+ */
+const makeCoordinator = ({
+  totalBytes = 300,
+  ...options
+}: Partial<StreamedSceneCoordinatorOptions> & {
+  readonly totalBytes?: number;
+} = {}) =>
+  createStreamedSceneCoordinator({
+    scheduleRender: vi.fn(),
+    memory: createMemoryPool({ totalBytes }),
+    now: () => 0,
+    ...options,
+  });
+
+/** One turn of the event loop, so every queued input check has run. */
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+const makeMember = (overrides: Partial<GovernorInputs> = {}) => {
+  const inputs: GovernorInputs = {
+    projectedImportance: 1 as Importance,
+    qualityDemand: 1,
+    work: { operations: 0, progressSerial: 0 },
+    physicalTileOperations: 0,
+    physicalHierarchyOperations: 0,
+    residentBytes: 0,
+    ...overrides,
+  };
+  const allocations: Allocation[] = [];
+  return {
+    allocations,
+    setCamera: vi.fn<(view: CameraView) => void>(),
+    setModelMatrix: vi.fn<(matrix: Mat16 | null) => void>(),
+    setDevicePixelRatio: vi.fn<(devicePixelRatio: number) => void>(),
+    setActive: vi.fn<(active: boolean) => void>(),
+    setConfig: vi.fn<(config: object) => void>(),
+    beginInteraction: vi.fn<() => void>(),
+    endInteraction: vi.fn<() => void>(),
+    prepareFrame: vi.fn<() => void>(),
+    onStall: vi.fn<(error: Error) => void>(),
+    governorInputs: () => inputs,
+    applyAllocation: (allocation: Allocation) => allocations.push(allocation),
+    pick: (): MemberPickResult => ({ status: "miss" }),
+    occlusionDepth: (): OcclusionResult => ({ status: "clear" }),
+    stats: () => ({}),
+    dispose: vi.fn<() => void>(),
+  };
+};
+
+describe("createStreamedSceneCoordinator", () => {
+  it.each(["hide", "release"])(
+    "remeasures after an active peer is removed by %s",
+    (action) => {
+      const scheduleRender = vi.fn();
+      const coordinator = makeCoordinator({
+        scheduleRender,
+        totalBytes: 1000,
+        governor: { minSamples: 2, windowSize: 10, cooldownMs: 0 },
+      });
+      coordinator.register(makeMember(), { qualityManaged: true });
+      const peer = coordinator.register(makeMember());
+      let now = 0;
+      let serial = 0;
+      const frame = (hostFrameMs: number) => {
+        coordinator.prepareFrame((serial += 1));
+        coordinator.recordHostFrame({ hostFrameMs, now: (now += 100) });
+      };
+      frame(66);
+      frame(66);
+      // The old workload settles at half quality, one late frame in ten.
+      for (let index = 0; index < 9; index += 1) frame(33);
+      frame(50);
+      expect(coordinator.stats().viewQualityFraction).toBe(0.5);
+      expect(coordinator.needsFrame()).toBe(false);
+      scheduleRender.mockClear();
+      if (action === "hide") peer.setActive(false);
+      else peer.release();
+      expect(scheduleRender).toHaveBeenCalledOnce();
+      expect(coordinator.needsFrame()).toBe(true);
+      // The mutation presentation is not a clean capacity sample.
+      frame(200);
+      expect(coordinator.stats().governor.samples).toBe(0);
+      for (let index = 0; index < 30; index += 1) frame(16.7);
+      expect(coordinator.stats().viewQualityFraction).toBe(1);
+      coordinator.dispose();
+    },
+  );
+
+  it.each(["configure", "add"])(
+    "remeasures a more expensive workload after %s without queued work",
+    (action) => {
+      const scheduleRender = vi.fn();
+      const coordinator = makeCoordinator({
+        scheduleRender,
+        totalBytes: 1000,
+        governor: { minSamples: 2, windowSize: 4, cooldownMs: 0 },
+      });
+      const member = coordinator.register(makeMember(), {
+        qualityManaged: true,
+      });
+      let now = 0;
+      let serial = 0;
+      const frame = (hostFrameMs: number) => {
+        coordinator.prepareFrame((serial += 1));
+        coordinator.recordHostFrame({ hostFrameMs, now: (now += 100) });
+      };
+      for (let index = 0; index < 4; index += 1) frame(16.7);
+      expect(coordinator.needsFrame()).toBe(false);
+      scheduleRender.mockClear();
+      if (action === "configure") member.setConfig({ diameterCssPx: 32 });
+      else coordinator.register(makeMember());
+      expect(scheduleRender).toHaveBeenCalledOnce();
+      expect(coordinator.needsFrame()).toBe(true);
+      frame(200);
+      expect(coordinator.stats().governor.samples).toBe(0);
+      frame(66);
+      frame(66);
+      // Two refreshes of budget against four presented.
+      expect(coordinator.stats().viewQualityFraction).toBeCloseTo(
+        2 / Math.sqrt(12),
+      );
+      coordinator.dispose();
+    },
+  );
+
+  it("does not restart learning for inactive changes or unchanged visibility", async () => {
+    const scheduleRender = vi.fn();
+    const coordinator = makeCoordinator({
+      scheduleRender,
+      totalBytes: 1000,
+      governor: { minSamples: 2 },
+    });
+    const active = coordinator.register(makeMember(), { qualityManaged: true });
+    const inactive = coordinator.register(makeMember(), { active: false });
+    coordinator.prepareFrame(1);
+    coordinator.recordHostFrame({ hostFrameMs: 33, now: 0 });
+    coordinator.recordHostFrame({ hostFrameMs: 33, now: 1 });
+    scheduleRender.mockClear();
+    active.setActive(true);
+    active.setQualityPolicy(true);
+    inactive.setConfig({ diameterCssPx: 32 });
+    inactive.release();
+    await settle();
+    expect(coordinator.stats().governor.samples).toBe(2);
+    expect(coordinator.needsFrame()).toBe(false);
+    expect(scheduleRender).not.toHaveBeenCalled();
+    coordinator.dispose();
+  });
+
+  it("remeasures after an active member changes quality policy", () => {
+    const scheduleRender = vi.fn();
+    const coordinator = makeCoordinator({
+      scheduleRender,
+      totalBytes: 1000,
+      governor: { minSamples: 2 },
+    });
+    coordinator.register(makeMember(), { qualityManaged: true });
+    const peer = coordinator.register(makeMember());
+    coordinator.prepareFrame(1);
+    coordinator.recordHostFrame({ hostFrameMs: 33, now: 0 });
+    coordinator.recordHostFrame({ hostFrameMs: 33, now: 1 });
+    expect(coordinator.needsFrame()).toBe(false);
+    scheduleRender.mockClear();
+    peer.setQualityPolicy(true);
+    expect(coordinator.stats().governor.samples).toBe(0);
+    expect(coordinator.needsFrame()).toBe(true);
+    expect(scheduleRender).toHaveBeenCalledOnce();
+    coordinator.dispose();
+  });
+
+  it("owns one memory registration per active member and fans out byte shares", () => {
+    const memory = createMemoryPool({ totalBytes: 900 });
+    const coordinator = makeCoordinator({ memory });
+    const a = makeMember();
+    const b = makeMember();
+    const aRegistration = coordinator.register(a, { qualityManaged: true });
+    coordinator.register(b, { qualityManaged: true });
+    expect(memory.memberCount()).toBe(2);
+    coordinator.prepareFrame(1);
+    expect(a.allocations.at(-1)?.memoryBudgetBytes).toBe(450);
+    expect(b.allocations.at(-1)?.memoryBudgetBytes).toBe(450);
+    aRegistration.setActive(false);
+    expect(memory.memberCount()).toBe(1);
+    coordinator.prepareFrame(2);
+    expect(b.allocations.at(-1)?.memoryBudgetBytes).toBe(900);
+  });
+
+  it.each([true, false])(
+    "wakes finished work without a submission for adaptive=%s",
+    async (qualityManaged) => {
+      let pending = true;
+      const scheduleRender = vi.fn();
+      const coordinator = makeCoordinator({ scheduleRender, totalBytes: 1000 });
+      const base = makeMember();
+      coordinator.register(
+        {
+          ...base,
+          governorInputs: () => ({
+            ...base.governorInputs(),
+            work: {
+              operations: pending ? 1 : 0,
+              progressSerial: pending ? 0 : 1,
+            },
+          }),
+        },
+        { qualityManaged },
+      );
+      coordinator.prepareFrame(1);
+      await settle();
+      scheduleRender.mockClear();
+      pending = false;
+      coordinator.context({}).onWorkChange?.();
+      await settle();
+      expect(scheduleRender).toHaveBeenCalledTimes(qualityManaged ? 1 : 0);
+      coordinator.stats();
+      expect(scheduleRender).toHaveBeenCalledTimes(qualityManaged ? 1 : 0);
+      coordinator.dispose();
+    },
+  );
+
+  it("asks for a frame when a change moves an allocation, and applies it there", async () => {
+    const scheduleRender = vi.fn();
+    const coordinator = makeCoordinator({ scheduleRender, totalBytes: 1000 });
+    const first = makeMember();
+    coordinator.register(first);
+    await settle();
+    expect(scheduleRender).toHaveBeenCalledOnce();
+    expect(first.allocations).toHaveLength(0);
+    expect(coordinator.needsFrame()).toBe(true);
+    coordinator.prepareFrame(1);
+    expect(first.allocations.at(-1)?.memoryBudgetBytes).toBe(1000);
+    expect(coordinator.needsFrame()).toBe(false);
+
+    scheduleRender.mockClear();
+    const second = makeMember();
+    coordinator.register(second);
+    await settle();
+    expect(scheduleRender).toHaveBeenCalledOnce();
+    expect(first.allocations.at(-1)?.memoryBudgetBytes).toBe(1000);
+    coordinator.prepareFrame(2);
+    expect(first.allocations.at(-1)?.memoryBudgetBytes).toBe(500);
+    expect(second.allocations.at(-1)?.memoryBudgetBytes).toBe(500);
+    expect(coordinator.needsFrame()).toBe(false);
+    coordinator.dispose();
+  });
+
+  it("applies a member whose demand follows its own allocation once per frame", async () => {
+    // Given everything it asks for, this member asks for less, and given less
+    // it asks for everything again, reporting each change from a microtask the
+    // way a point controller does. Applying allocations in answer to that
+    // report never settles, and each application queues the next report, so
+    // the page would never leave its microtasks.
+    const coordinator = makeCoordinator({ totalBytes: 1000 });
+    const context = coordinator.context({});
+    const base = makeMember();
+    let applications = 0;
+    const member = {
+      ...base,
+      governorInputs: () => ({
+        ...base.governorInputs(),
+        qualityDemand: base.allocations.at(-1)?.qualityFraction === 1 ? 0.5 : 1,
+      }),
+      applyAllocation: (allocation: Allocation) => {
+        base.applyAllocation(allocation);
+        applications += 1;
+        // Bounded, so a regression fails here rather than hanging the run.
+        if (applications < 1_000) {
+          queueMicrotask(() => context.onWorkChange?.());
+        }
+      },
+    };
+    coordinator.register(member, { qualityManaged: true });
+    await settle();
+    expect(applications).toBe(0);
+    for (let frame = 1; frame <= 6; frame += 1) {
+      coordinator.prepareFrame(frame);
+      expect(applications).toBe(frame);
+      await settle();
+      expect(applications).toBe(frame);
+    }
+    expect(base.allocations.map((a) => a.qualityFraction)).toEqual([
+      1, 0.5, 1, 0.5, 1, 0.5,
+    ]);
+    // It never settles, so each frame owes the next.
+    expect(coordinator.needsFrame()).toBe(true);
+    coordinator.dispose();
+  });
+
+  it("applies allocations once per frame to members reporting work from inside them", async () => {
+    // Two members share one quality budget. Each asks for less once it holds
+    // most of what it asked for, and reports that from inside applyAllocation,
+    // as a 3D Tiles member reports the selection an allocation reran.
+    const coordinator = makeCoordinator({ totalBytes: 1000 });
+    const context = coordinator.context({});
+    const reporting = () => {
+      const base = makeMember();
+      return {
+        ...base,
+        governorInputs: () => ({
+          ...base.governorInputs(),
+          qualityDemand:
+            (base.allocations.at(-1)?.qualityFraction ?? 0) >= 0.5 ? 0.2 : 1,
+        }),
+        applyAllocation: (allocation: Allocation) => {
+          base.applyAllocation(allocation);
+          context.onWorkChange?.();
+        },
+      };
+    };
+    const first = reporting();
+    const second = reporting();
+    coordinator.register(first, { qualityManaged: true });
+    coordinator.register(second, { qualityManaged: true });
+    for (let frame = 1; frame <= 4; frame += 1) {
+      coordinator.prepareFrame(frame);
+      expect(first.allocations).toHaveLength(frame);
+      expect(second.allocations).toHaveLength(frame);
+      await settle();
+      expect(first.allocations).toHaveLength(frame);
+      expect(second.allocations).toHaveLength(frame);
+    }
+    expect(first.allocations.map((a) => a.qualityFraction)).toEqual([
+      1, 0.2, 1, 0.2,
+    ]);
+    coordinator.dispose();
+  });
+
+  it("water-fills normalized quality across managed members only", () => {
+    const coordinator = makeCoordinator();
+    const capped = makeMember({ qualityDemand: 0.1 });
+    const open = makeMember();
+    const fixed = makeMember();
+    coordinator.register(capped, { qualityManaged: true });
+    coordinator.register(open, { qualityManaged: true });
+    coordinator.register(fixed, { qualityManaged: false });
+    coordinator.prepareFrame(1);
+    expect(capped.allocations.at(-1)?.qualityFraction).toBe(0.1);
+    expect(open.allocations.at(-1)?.qualityFraction).toBe(1);
+    expect(fixed.allocations.at(-1)?.qualityFraction).toBe(1);
+  });
+
+  it("holds each member's share while moving until the view fraction changes", () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    const points = makeMember();
+    const pointInputs = points.governorInputs();
+    let pointDemand = 1;
+    const tiles = makeMember();
+    coordinator.register(
+      {
+        ...points,
+        governorInputs: () => ({ ...pointInputs, qualityDemand: pointDemand }),
+      },
+      { qualityManaged: true },
+    );
+    coordinator.register(tiles, { qualityManaged: true });
+    coordinator.beginInteraction();
+    let serial = 0;
+    let now = 0;
+    const slowFrame = (): void => {
+      coordinator.prepareFrame(++serial);
+      coordinator.recordHostFrame({ hostFrameMs: 66, now: (now += 100) });
+      coordinator.prepareFrame(++serial);
+    };
+    slowFrame();
+    const moving = coordinator.stats().viewQualityFraction;
+    expect(moving).toBeLessThan(1);
+    expect(points.allocations.at(-1)?.qualityFraction).toBeCloseTo(moving);
+    expect(tiles.allocations.at(-1)?.qualityFraction).toBeCloseTo(moving);
+
+    pointDemand = moving / 4;
+    coordinator.prepareFrame(++serial);
+    expect(points.allocations.at(-1)?.qualityFraction).toBeCloseTo(moving);
+    expect(tiles.allocations.at(-1)?.qualityFraction).toBeCloseTo(moving);
+
+    slowFrame();
+    const cut = coordinator.stats().viewQualityFraction;
+    expect(cut).toBeLessThan(moving);
+    expect(points.allocations.at(-1)?.qualityFraction).toBeCloseTo(pointDemand);
+    expect(tiles.allocations.at(-1)?.qualityFraction).toBeCloseTo(
+      2 * cut - pointDemand,
+    );
+
+    pointDemand = cut / 4;
+    coordinator.endInteraction();
+    coordinator.prepareFrame(++serial);
+    expect(points.allocations.at(-1)?.qualityFraction).toBeCloseTo(pointDemand);
+    coordinator.dispose();
+  });
+
+  it("reallocates moving quality when a member enters or leaves the view", () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    const first = makeMember();
+    const second = makeMember({ projectedImportance: 0 as Importance });
+    const secondInputs = second.governorInputs();
+    let visible = false;
+    second.governorInputs = () => ({
+      ...secondInputs,
+      projectedImportance: (visible ? 1 : 0) as Importance,
+    });
+    coordinator.register(first, { qualityManaged: true });
+    coordinator.register(second, { qualityManaged: true });
+    coordinator.beginInteraction();
+    coordinator.prepareFrame(1);
+    coordinator.recordHostFrame({ hostFrameMs: 66, now: 100 });
+    coordinator.prepareFrame(2);
+    expect(coordinator.stats().viewQualityFraction).toBe(0.5);
+    expect(first.allocations.at(-1)?.qualityFraction).toBe(1);
+    expect(second.allocations.at(-1)?.qualityFraction).toBe(0);
+
+    visible = true;
+    coordinator.prepareFrame(3);
+    expect(first.allocations.at(-1)?.qualityFraction).toBe(0.5);
+    expect(second.allocations.at(-1)?.qualityFraction).toBe(0.5);
+    visible = false;
+    coordinator.prepareFrame(4);
+    expect(first.allocations.at(-1)?.qualityFraction).toBe(1);
+    expect(second.allocations.at(-1)?.qualityFraction).toBe(0);
+    coordinator.dispose();
+  });
+
+  it.each(["hide", "release", "fixed"])(
+    "recomputes moving shares after a member becomes %s",
+    (action) => {
+      const coordinator = makeCoordinator({
+        governor: { minSamples: 1, cooldownMs: 0 },
+      });
+      const first = makeMember();
+      const second = makeMember({ projectedImportance: 0 as Importance });
+      coordinator.register(first, { qualityManaged: true });
+      const membership = coordinator.register(second, { qualityManaged: true });
+      coordinator.beginInteraction();
+      coordinator.prepareFrame(1);
+      coordinator.recordHostFrame({ hostFrameMs: 66, now: 100 });
+      coordinator.prepareFrame(2);
+      expect(first.allocations.at(-1)?.qualityFraction).toBe(1);
+      if (action === "hide") membership.setActive(false);
+      else if (action === "release") membership.release();
+      else membership.setQualityPolicy(false);
+      coordinator.prepareFrame(3);
+      expect(first.allocations.at(-1)?.qualityFraction).toBe(0.5);
+      if (action === "fixed")
+        expect(second.allocations.at(-1)?.qualityFraction).toBe(1);
+      coordinator.dispose();
+    },
+  );
+
+  it("does not train on the frame that drains the final submission", async () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    let busy = true;
+    const member = makeMember();
+    member.governorInputs = () => ({
+      projectedImportance: 1 as Importance,
+      qualityDemand: 1,
+      work: { operations: busy ? 1 : 0, progressSerial: busy ? 0 : 1 },
+      physicalTileOperations: 0,
+      physicalHierarchyOperations: 0,
+      residentBytes: 0,
+    });
+    member.prepareFrame.mockImplementation(() => {
+      busy = false;
+    });
+    coordinator.register(member, { qualityManaged: true });
+    // The work is known before the frame that drains it.
+    await settle();
+    coordinator.prepareFrame(1);
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 0 });
+    expect(coordinator.stats().viewQualityFraction).toBe(1);
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 1 });
+    expect(coordinator.stats().viewQualityFraction).toBeLessThan(1);
+    coordinator.dispose();
+  });
+
+  it("rejects a submission enqueued and drained between work notifications", () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    coordinator.register(makeMember(), { qualityManaged: true });
+    const run = vi.fn();
+    coordinator.context({} as never).submissions.enqueue({ bytes: 1, run });
+    coordinator.prepareFrame(1);
+    expect(run).toHaveBeenCalledOnce();
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 0 });
+    expect(coordinator.stats().governor.capacitySamples.lastEligible).toBe(
+      false,
+    );
+    expect(coordinator.stats().viewQualityFraction).toBe(1);
+    coordinator.prepareFrame(2);
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 1 });
+    expect(coordinator.stats().viewQualityFraction).toBeLessThan(1);
+    coordinator.dispose();
+  });
+
+  it("keeps completed fixed-member work until a valid presentation report", async () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    coordinator.register(makeMember(), { qualityManaged: true });
+    const fixed = makeMember();
+    let busy = true;
+    fixed.governorInputs = () => ({
+      projectedImportance: 1 as Importance,
+      qualityDemand: 1,
+      work: { operations: 0, progressSerial: 0 },
+      physicalTileOperations: busy ? 1 : 0,
+      physicalHierarchyOperations: 0,
+      residentBytes: 0,
+    });
+    coordinator.register(fixed, { qualityManaged: false });
+    await settle();
+    busy = false;
+    coordinator.context({} as never).onWorkChange?.();
+    await settle();
+    coordinator.recordHostFrame({ hostFrameMs: Number.NaN });
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 0 });
+    expect(coordinator.stats().viewQualityFraction).toBe(1);
+    coordinator.recordHostFrame({ hostFrameMs: 100, now: 1 });
+    expect(coordinator.stats().viewQualityFraction).toBeLessThan(1);
+    coordinator.dispose();
+  });
+
+  it("says how each presented frame was used", () => {
+    const coordinator = makeCoordinator();
+    const unsampled = { sampled: false, eligible: false, regime: "stationary" };
+    coordinator.register(makeMember());
+    coordinator.prepareFrame(1);
+    // A view with nothing adaptive has no quality to train.
+    expect(coordinator.recordHostFrame({ hostFrameMs: 16.7, now: 0 })).toEqual(
+      unsampled,
+    );
+
+    let busy = true;
+    const adaptive = makeMember();
+    const idle = adaptive.governorInputs();
+    adaptive.governorInputs = () => ({
+      ...idle,
+      work: { operations: busy ? 1 : 0, progressSerial: busy ? 0 : 1 },
+    });
+    coordinator.register(adaptive, { qualityManaged: true });
+    coordinator.prepareFrame(2);
+    expect(coordinator.recordHostFrame({ hostFrameMs: 16.7, now: 1 })).toEqual({
+      sampled: true,
+      eligible: false,
+      regime: "stationary",
+    });
+    expect(coordinator.recordHostFrame({ hostFrameMs: Number.NaN })).toEqual(
+      unsampled,
+    );
+
+    busy = false;
+    coordinator.prepareFrame(3);
+    expect(coordinator.recordHostFrame({ hostFrameMs: 16.7, now: 2 })).toEqual({
+      sampled: true,
+      eligible: true,
+      regime: "stationary",
+    });
+    coordinator.beginInteraction();
+    coordinator.prepareFrame(4);
+    expect(coordinator.recordHostFrame({ hostFrameMs: 16.7, now: 3 })).toEqual({
+      sampled: true,
+      eligible: true,
+      regime: "interaction",
+    });
+    coordinator.dispose();
+  });
+
+  it("reads no member and applies nothing when asked for stats", () => {
+    const coordinator = makeCoordinator();
+    const member = makeMember();
+    const inputs = member.governorInputs();
+    let demand = 1;
+    let reads = 0;
+    member.governorInputs = () => {
+      reads += 1;
+      return { ...inputs, qualityDemand: demand };
+    };
+    coordinator.register(member, { qualityManaged: true });
+    coordinator.prepareFrame(1);
+    const readsBefore = reads;
+    const applied = member.allocations.length;
+    demand = 0.25;
+    const stats = coordinator.stats();
+    coordinator.stats();
+    expect(reads).toBe(readsBefore);
+    expect(member.allocations).toHaveLength(applied);
+    expect(stats.members[0]?.governorInputs.qualityDemand).toBe(1);
+    coordinator.dispose();
+  });
+
+  it("keeps a member reporting importance on the wrong scale to its share", () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    // A raw screen-space error in pixels where a [0, 1] weight belongs.
+    const misreporting = makeMember({
+      projectedImportance: 800 as Importance,
+    });
+    const correct = makeMember();
+    coordinator.register(misreporting, { qualityManaged: true });
+    coordinator.register(correct, { qualityManaged: true });
+    coordinator.recordHostFrame({ hostFrameMs: 66, now: 0 });
+    expect(coordinator.stats().viewQualityFraction).toBeCloseTo(0.5);
+    coordinator.prepareFrame(1);
+    expect(misreporting.allocations.at(-1)?.qualityFraction).toBeCloseTo(0.5);
+    expect(correct.allocations.at(-1)?.qualityFraction).toBeCloseTo(0.5);
+  });
+
+  it("allocates no quality to members reporting unusable inputs", () => {
+    const coordinator = makeCoordinator();
+    const noImportance = makeMember({
+      projectedImportance: Number.NaN as Importance,
+    });
+    const noDemand = makeMember({ qualityDemand: Number.NaN });
+    const usable = makeMember();
+    for (const member of [noImportance, noDemand, usable]) {
+      coordinator.register(member, { qualityManaged: true });
+    }
+    coordinator.prepareFrame(1);
+    expect(noImportance.allocations.at(-1)?.qualityFraction).toBe(0);
+    expect(noDemand.allocations.at(-1)?.qualityFraction).toBe(0);
+    expect(usable.allocations.at(-1)?.qualityFraction).toBe(1);
+  });
+
+  it("feeds the governor fraction directly into view allocation", () => {
+    const coordinator = makeCoordinator({
+      governor: { minSamples: 1, cooldownMs: 0 },
+    });
+    const adaptive = makeMember();
+    const fixed = makeMember();
+    coordinator.register(adaptive, { qualityManaged: true });
+    coordinator.register(fixed, { qualityManaged: false });
+    coordinator.recordHostFrame({ hostFrameMs: 66, now: 0 });
+    expect(coordinator.stats().viewQualityFraction).toBeCloseTo(0.5);
+    coordinator.prepareFrame(1);
+    expect(adaptive.allocations.at(-1)?.qualityFraction).toBeCloseTo(0.5);
+    expect(fixed.allocations.at(-1)?.qualityFraction).toBe(1);
+  });
+
+  it("uses the first active adaptive member's targets in stable registry order", () => {
+    const coordinator = makeCoordinator();
+    const first = coordinator.register(makeMember(), {
+      id: "first",
+      qualityManaged: true,
+      qualityTargets: { stationaryTargetMs: 41, interactionTargetMs: 17 },
+    });
+    coordinator.register(makeMember(), {
+      id: "second",
+      qualityManaged: true,
+      qualityTargets: { stationaryTargetMs: 55, interactionTargetMs: 23 },
+    });
+    expect(coordinator.stats()).toMatchObject({
+      targetOverrideMemberId: "first",
+      governor: { targetFrameTimeMs: 41 },
+    });
+    first.setActive(false);
+    expect(coordinator.stats()).toMatchObject({
+      targetOverrideMemberId: "second",
+      governor: { targetFrameTimeMs: 55 },
+    });
+  });
+
+  it("lets the first adaptive point override targets after targetless members", () => {
+    const coordinator = makeCoordinator();
+    coordinator.register(makeMember(), {
+      id: "tiles-first",
+      qualityManaged: true,
+    });
+    coordinator.register(makeMember(), {
+      id: "adaptive-point",
+      qualityManaged: true,
+      qualityTargets: { stationaryTargetMs: 45 },
+    });
+    expect(coordinator.stats()).toMatchObject({
+      targetOverrideMemberId: "adaptive-point",
+      governor: { targetFrameTimeMs: 45 },
+    });
+  });
+
+  it("lets the host own global frame targets", () => {
+    const coordinator = makeCoordinator();
+    coordinator.register(makeMember(), {
+      id: "point",
+      qualityManaged: true,
+      qualityTargets: { stationaryTargetMs: 45, interactionTargetMs: 18 },
+    });
+    coordinator.setQualityTargets({
+      stationaryTargetMs: 27,
+      interactionTargetMs: 12,
+    });
+    expect(coordinator.stats()).toMatchObject({
+      targetOverrideMemberId: null,
+      governor: { targetFrameTimeMs: 27 },
+    });
+    coordinator.beginInteraction();
+    expect(coordinator.stats().governor.targetFrameTimeMs).toBe(12);
+  });
+
+  it("keeps camera/model/DPR/config member-specific and drains shared submissions", () => {
+    const order: string[] = [];
+    const coordinator = makeCoordinator();
+    const member = makeMember();
+    const other = makeMember();
+    member.prepareFrame.mockImplementation(() => order.push("member"));
+    const registration = coordinator.register(member);
+    coordinator.register(other);
+    coordinator.context({}, 1).submissions.enqueue({
+      bytes: 1,
+      run: () => order.push("submission"),
+    });
+    registration.setCamera(VIEW);
+    registration.setCamera({ ...VIEW });
+    registration.setModelMatrix(null);
+    registration.setModelMatrix(null);
+    registration.setDevicePixelRatio(2);
+    registration.setDevicePixelRatio(2);
+    registration.setConfig({ revision: "next" });
+    coordinator.noteRenderedCameras(new Map([["renderer-a", VIEW]]));
+    coordinator.beginInteraction();
+    coordinator.endInteraction();
+    coordinator.prepareFrame(1);
+    coordinator.prepareFrame(1);
+    expect(order).toEqual(["member", "submission"]);
+    expect(member.setCamera).toHaveBeenCalledWith(VIEW);
+    expect(member.setCamera).toHaveBeenCalledOnce();
+    expect(member.setModelMatrix).toHaveBeenCalledWith(null);
+    expect(member.setModelMatrix).toHaveBeenCalledOnce();
+    expect(member.setDevicePixelRatio).toHaveBeenCalledWith(2);
+    expect(member.setDevicePixelRatio).toHaveBeenCalledOnce();
+    expect(member.setConfig).toHaveBeenCalledWith({ revision: "next" });
+    expect(other.setCamera).not.toHaveBeenCalled();
+    expect(other.setModelMatrix).not.toHaveBeenCalled();
+    expect(other.setDevicePixelRatio).not.toHaveBeenCalled();
+    expect(member.beginInteraction).toHaveBeenCalledOnce();
+    expect(member.endInteraction).toHaveBeenCalledOnce();
+    coordinator.dispose();
+    expect(member.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("replays held interaction depth to members registered mid-gesture", () => {
+    const coordinator = makeCoordinator();
+    coordinator.beginInteraction();
+    coordinator.beginInteraction();
+    const member = makeMember();
+    coordinator.register(member, { qualityManaged: true });
+    expect(member.beginInteraction).toHaveBeenCalledTimes(2);
+    expect(member.endInteraction).not.toHaveBeenCalled();
+    coordinator.endInteraction();
+    expect(member.endInteraction).toHaveBeenCalledOnce();
+    coordinator.endInteraction();
+    expect(member.endInteraction).toHaveBeenCalledTimes(2);
+    coordinator.dispose();
+  });
+
+  it("compares camera snapshots rather than aliases restated by the host", () => {
+    const coordinator = makeCoordinator();
+    const member = makeMember();
+    const registration = coordinator.register(member);
+    const mutable = {
+      ...VIEW,
+      position: [...VIEW.position] as [number, number, number],
+      viewProj: Array.from(VIEW.viewProj) as Mat16,
+    };
+    registration.setCamera(mutable);
+    registration.setCamera(mutable);
+    mutable.position[0] = 1;
+    registration.setCamera(mutable);
+    expect(member.setCamera).toHaveBeenCalledTimes(2);
+    coordinator.dispose();
+  });
+
+  it("propagates retry-aware member workPending through the coordinator context", async () => {
+    let workPending = true;
+    const member = makeMember();
+    member.governorInputs = () => ({
+      projectedImportance: 1 as Importance,
+      qualityDemand: 1,
+      work: { operations: workPending ? 1 : 0, progressSerial: 0 },
+      physicalTileOperations: 0,
+      physicalHierarchyOperations: 0,
+      residentBytes: 0,
+    });
+    const coordinator = makeCoordinator();
+    coordinator.register(member, { qualityManaged: true });
+    await settle();
+    expect(coordinator.stats().governor.activity.workPending).toBe(true);
+    workPending = false;
+    coordinator.context({}).onWorkChange?.();
+    await settle();
+    expect(coordinator.stats().governor.activity.workPending).toBe(false);
+    coordinator.dispose();
+  });
+
+  it("includes fixed-member work in adaptive sample eligibility", async () => {
+    const coordinator = makeCoordinator();
+    coordinator.register(makeMember(), { qualityManaged: true });
+    coordinator.register(
+      makeMember({ work: { operations: 1, progressSerial: 0 } }),
+      { qualityManaged: false },
+    );
+    await settle();
+    expect(coordinator.stats().governor.activity).toMatchObject({
+      workPending: true,
+      measurementEligible: false,
+    });
+    coordinator.dispose();
+  });
+
+  it("quarantines a member with unchanged progress without freezing the healthy view", async () => {
+    let now = 0;
+    const hung = makeMember({
+      work: { operations: 1, progressSerial: 7 },
+      physicalTileOperations: 1,
+    });
+    const coordinator = makeCoordinator({ now: () => now });
+    coordinator.register(makeMember(), {
+      id: "healthy",
+      qualityManaged: true,
+    });
+    coordinator.register(hung, { id: "hung", qualityManaged: false });
+    await settle();
+    expect(coordinator.stats().governor.activity.measurementEligible).toBe(
+      false,
+    );
+
+    now = 4_001;
+    coordinator.context({}).onWorkChange?.();
+    await settle();
+    expect(coordinator.stats()).toMatchObject({
+      stalledMembers: ["hung"],
+      governor: { activity: { measurementEligible: true, workPending: false } },
+    });
+    expect(hung.onStall).toHaveBeenCalledOnce();
+
+    coordinator.context({}).onWorkChange?.();
+    await settle();
+    expect(hung.onStall).toHaveBeenCalledOnce();
+    coordinator.dispose();
+  });
+
+  it("shares one page pool across independent view coordinators", () => {
+    const memory = createMemoryPool({ totalBytes: 1_000 });
+    const first = makeCoordinator({ memory });
+    const second = makeCoordinator({ memory });
+    const firstMember = makeMember();
+    const secondMember = makeMember();
+    first.register(firstMember);
+    second.register(secondMember);
+    expect(memory.memberCount()).toBe(2);
+    first.prepareFrame(1);
+    second.prepareFrame(1);
+    expect(firstMember.allocations.at(-1)?.memoryBudgetBytes).toBe(500);
+    expect(secondMember.allocations.at(-1)?.memoryBudgetBytes).toBe(500);
+    first.dispose();
+    second.prepareFrame(2);
+    expect(secondMember.allocations.at(-1)?.memoryBudgetBytes).toBe(1_000);
+    second.dispose();
+  });
+});

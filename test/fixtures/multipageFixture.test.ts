@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { Copc, Getter, type Hierarchy } from "copc";
 import { describe, expect, it } from "vitest";
 
-import { DEFAULT_MIN_POINT_BUDGET } from "../../src/pointCloudMember";
+import { DEFAULT_MIN_POINT_BUDGET } from "../../src/points/pointCloudMember";
 
 const fixture = (name: string): string =>
   fileURLToPath(new URL(name, import.meta.url));

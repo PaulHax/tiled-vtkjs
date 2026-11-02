@@ -22,7 +22,7 @@ import {
   type TelemetrySummary,
   type TelemetryTrace,
 } from "./telemetryRecorder";
-import type { PointCloudMemberStats } from "../../../src/pointCloudMember";
+import type { PointCloudMemberStats } from "../../../src/points/pointCloudMember";
 import type { Tiles3dMemberStats } from "../../../src/tiles3d/memberTypes";
 import type {
   FrameProbe,

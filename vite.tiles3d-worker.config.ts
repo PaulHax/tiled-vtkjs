@@ -65,7 +65,7 @@ export default defineConfig({
   build: {
     emptyOutDir: false,
     lib: {
-      entry: "src/tiles3dDecodeWorker.ts",
+      entry: "src/tiles3d/decodeWorker.ts",
       formats: ["iife"],
       name: "Tiles3dDecodeWorker",
       fileName: () => "tiles3dDecodeWorker.classic.js",

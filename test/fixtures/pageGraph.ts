@@ -26,14 +26,14 @@ import {
   pointSpacing,
   type Cube,
   type VoxelKey,
-} from "../../src/octree";
+} from "../../src/points/octree";
 import type {
   LoadOptions,
   NodeInfo,
   TileData,
   TileSource,
   TileSourceMetadata,
-} from "../../src/tileSource";
+} from "../../src/points/tileSource";
 
 /** Unit cube centred on the origin: every node lands inside the NDC cube. */
 export const ROOT_CUBE: Cube = { center: [0, 0, 0], halfSize: 0.5 };

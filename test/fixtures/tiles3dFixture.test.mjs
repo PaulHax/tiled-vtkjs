@@ -18,7 +18,7 @@ import {
 const execute = promisify(execFile);
 const temporaryRoot = resolve(
   tmpdir(),
-  `pointcloud-lod-tiles3d-${process.pid}-${Date.now()}`,
+  `tiled-vtkjs-tiles3d-${process.pid}-${Date.now()}`,
 );
 
 afterAll(async () => {

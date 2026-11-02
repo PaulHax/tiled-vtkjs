@@ -7,19 +7,18 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
 
+import type { Bounds, CameraView } from "../../../src";
 import {
   ROOT_KEY,
   createCopcWorkerTileSource,
   createLodController,
-  type Bounds,
-  type CameraView,
   type LodController,
   type TileSource,
-} from "../../../src";
+} from "../../../src/points";
 import {
   createRendererAdapter,
   type RendererAdapter,
-} from "../../../src/rendererAdapter";
+} from "../../../src/points/vtk";
 
 const required = <T extends Element>(selector: string): T => {
   const element = document.querySelector<T>(selector);
@@ -38,8 +37,7 @@ const fullScreen = vtkFullScreenRenderWindow.newInstance({
   background: [0.035, 0.055, 0.075],
 });
 const renderer = fullScreen.getRenderer();
-const renderWindow = fullScreen.getRenderWindow();
-const interactor = renderWindow.getInteractor();
+const interactor = fullScreen.getInteractor();
 const camera = renderer.getActiveCamera();
 
 let source: TileSource | null = null;

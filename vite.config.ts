@@ -7,13 +7,14 @@ const stub = (name: string): string =>
 export default defineConfig({
   build: {
     lib: {
-      // Two entries: the core is vtk.js-free, the adapter imports vtk.js at
-      // module scope. Keeping them separate lets core-only consumers install
-      // without the peer.
       entry: {
         index: "src/index.ts",
-        vtk: "src/vtk.ts",
-        copcWorker: "src/copcWorker.ts",
+        core: "src/core/index.ts",
+        points: "src/points/index.ts",
+        "points-vtk": "src/points/vtk.ts",
+        copcWorker: "src/points/copcWorker.ts",
+        tiles3d: "src/tiles3d/index.ts",
+        "tiles3d-vtk": "src/tiles3d/vtk.ts",
       },
       formats: ["es"],
     },
@@ -29,8 +30,7 @@ export default defineConfig({
     // dependency-free unit run.
     exclude: ["**/node_modules/**", "**/dist/**", "test/browser/**"],
     // The adapter's vtk.js deep imports resolve to recording stubs so the
-    // suite runs without the peer installed; real-GL behavior is covered by
-    // downstream integration tests.
+    // suite records adapter calls; the packed consumer browser gate uses VTK.
     alias: {
       "@kitware/vtk.js/Rendering/Core/Actor": stub("vtkActor"),
       "@kitware/vtk.js/Rendering/Core/PointGaussianMapper": stub(

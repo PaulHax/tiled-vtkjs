@@ -1,5 +1,5 @@
 /**
- * pointcloud-lod vtk.js example.
+ * tiled-vtkjs vtk.js example.
  *
  * Streams any COPC dataset through a source worker — a local file through
  * `Blob.slice()` range reads, a remote URL through HTTP Range — using the same
@@ -17,27 +17,31 @@
 
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
+import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
+import type vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 
 import {
-  ROOT_KEY,
-  createCopcWorkerTileSource,
-  createLodController,
   createViewGovernor,
-  keyToString,
   type CameraView,
-  type LodController,
   type MotionReference,
-  type PointPresentation,
-  type TileSource,
   type ViewGovernor,
   type ViewGovernorOptions,
   type ViewGovernorStats,
 } from "../../../src";
-import { DEFAULT_MIN_POINT_BUDGET } from "../../../src/pointCloudMember";
 import {
+  ROOT_KEY,
+  createCopcWorkerTileSource,
+  createLodController,
+  keyToString,
+  type LodController,
+  type PointPresentation,
+  type TileSource,
+} from "../../../src/points";
+import {
+  DEFAULT_MIN_POINT_BUDGET,
   createRendererAdapter,
   type RendererAdapter,
-} from "../../../src/rendererAdapter";
+} from "../../../src/points/vtk";
 import { WORLD_UP, installCameraControls } from "../cameraControls";
 import { createGpuFrameTimer, type GpuTimerResult } from "../gpuTimer";
 import {
@@ -107,8 +111,12 @@ const fullScreen = vtkFullScreenRenderWindow.newInstance({
   background: [0.035, 0.055, 0.075],
 });
 const renderer = fullScreen.getRenderer();
-const renderWindow = fullScreen.getRenderWindow();
-const interactor = renderWindow.getInteractor();
+const interactor = fullScreen.getInteractor();
+const openGLRenderWindow =
+  fullScreen.getApiSpecificRenderWindow() as ReturnType<
+    typeof fullScreen.getApiSpecificRenderWindow
+  > &
+    Pick<vtkOpenGLRenderWindow, "getCanvas" | "get3DContext">;
 const camera = renderer.getActiveCamera();
 
 /** Where loading the current cloud framed it, so the view can go back. */
@@ -122,7 +130,7 @@ const interactorStyle = installCameraControls({
   interactor,
   renderer,
   viewer,
-  canvas: () => fullScreen.getApiSpecificRenderWindow().getCanvas(),
+  canvas: () => openGLRenderWindow.getCanvas(),
   sceneRadius: () => framing?.radius ?? null,
 });
 
@@ -169,7 +177,7 @@ let stationaryQualityFraction = 1;
 
 const telemetryEnvironment = (): TelemetryEnvironment =>
   captureTelemetryEnvironment(
-    fullScreen.getApiSpecificRenderWindow().get3DContext() as
+    openGLRenderWindow.get3DContext() as
       | WebGLRenderingContext
       | WebGL2RenderingContext
       | null,
@@ -179,7 +187,7 @@ const telemetry: TelemetryRecorder = createTelemetryRecorder({
   environment: telemetryEnvironment,
 });
 
-const webGlContext = fullScreen.getApiSpecificRenderWindow().get3DContext() as
+const webGlContext = openGLRenderWindow.get3DContext() as
   | WebGLRenderingContext
   | WebGL2RenderingContext
   | null;
@@ -1709,7 +1717,7 @@ Object.assign(window, {
      */
     scene: () => {
       const actors = renderer.getActors();
-      const first = actors[0];
+      const first = actors[0] as vtkActor | undefined;
       return {
         actors: actors.length,
         pointSizeDevicePx: first

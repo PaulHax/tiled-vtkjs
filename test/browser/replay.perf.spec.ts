@@ -56,26 +56,24 @@ const environmentNumber = (name: string, fallback: number): number => {
 };
 
 const outputDirectory = environmentPath(
-  "POINTCLOUD_LOD_REPLAY_OUT",
+  "TILED_VTKJS_REPLAY_OUT",
   "artifacts/replay",
 );
 const cacheDirectory = environmentPath(
-  "POINTCLOUD_LOD_REPLAY_CACHE_DIR",
+  "TILED_VTKJS_REPLAY_CACHE_DIR",
   "artifacts/replay/cache",
 );
 const networkMode = (
-  process.env.POINTCLOUD_LOD_REPLAY_NETWORK ?? "replay"
+  process.env.TILED_VTKJS_REPLAY_NETWORK ?? "replay"
 ).trim() as CacheMode;
 if (!["live", "record", "replay"].includes(networkMode)) {
-  throw new Error(
-    "POINTCLOUD_LOD_REPLAY_NETWORK must be live, record or replay",
-  );
+  throw new Error("TILED_VTKJS_REPLAY_NETWORK must be live, record or replay");
 }
-const latencyMs = environmentNumber("POINTCLOUD_LOD_REPLAY_LATENCY_MS", 40);
-const mbps = environmentNumber("POINTCLOUD_LOD_REPLAY_MBPS", 80);
+const latencyMs = environmentNumber("TILED_VTKJS_REPLAY_LATENCY_MS", 40);
+const mbps = environmentNumber("TILED_VTKJS_REPLAY_MBPS", 80);
 const repeats = Math.max(
   1,
-  Math.floor(environmentNumber("POINTCLOUD_LOD_REPLAY_REPEATS", 1)),
+  Math.floor(environmentNumber("TILED_VTKJS_REPLAY_REPEATS", 1)),
 );
 /**
  * How long a scene is given to converge before the run is called a failure.
@@ -83,8 +81,8 @@ const repeats = Math.max(
  * converge at all should say so quickly rather than holding a browser open
  * for the default.
  */
-const settleMs = environmentNumber("POINTCLOUD_LOD_REPLAY_SETTLE_MS", 120_000);
-const usingRealGpu = (process.env.POINTCLOUD_LOD_BROWSER_GPU ?? "") !== "";
+const settleMs = environmentNumber("TILED_VTKJS_REPLAY_SETTLE_MS", 120_000);
+const usingRealGpu = (process.env.TILED_VTKJS_BROWSER_GPU ?? "") !== "";
 /**
  * Runs the whole pipeline against a software rasteriser, for checking that the
  * benchmark still works rather than for measuring anything. Every artifact it
@@ -92,13 +90,13 @@ const usingRealGpu = (process.env.POINTCLOUD_LOD_BROWSER_GPU ?? "") !== "";
  * place of a headline number, so such a run cannot be mistaken for evidence.
  */
 const allowSoftware =
-  (process.env.POINTCLOUD_LOD_REPLAY_ALLOW_SOFTWARE ?? "") !== "";
+  (process.env.TILED_VTKJS_REPLAY_ALLOW_SOFTWARE ?? "") !== "";
 /**
  * Writes a V8 CPU profile of the replayed gesture beside each artifact, for
  * `scripts/summarizeProfile.mjs`. The sampler costs frame time, so a profiled
  * run is for finding where time goes, never for its headline numbers.
  */
-const profiling = (process.env.POINTCLOUD_LOD_REPLAY_PROFILE ?? "") !== "";
+const profiling = (process.env.TILED_VTKJS_REPLAY_PROFILE ?? "") !== "";
 
 /**
  * Origins whose traffic the cache owns. Anything else — the local server
@@ -135,7 +133,7 @@ type BenchmarkConfig = {
 const DEFAULT_CONFIGS: readonly BenchmarkConfig[] = [{ name: "baseline" }];
 
 const loadConfigs = async (): Promise<readonly BenchmarkConfig[]> => {
-  const raw = process.env.POINTCLOUD_LOD_REPLAY_CONFIGS?.trim();
+  const raw = process.env.TILED_VTKJS_REPLAY_CONFIGS?.trim();
   if (raw === undefined || raw === "") return DEFAULT_CONFIGS;
   const path = isAbsolute(raw) ? raw : resolve(process.cwd(), raw);
   const parsed = JSON.parse(await readFile(path, "utf8")) as {
@@ -148,7 +146,7 @@ const loadConfigs = async (): Promise<readonly BenchmarkConfig[]> => {
 };
 
 const listRecordings = async (): Promise<string[]> => {
-  const named = (process.env.POINTCLOUD_LOD_REPLAY_RECORDINGS ?? "")
+  const named = (process.env.TILED_VTKJS_REPLAY_RECORDINGS ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
@@ -370,9 +368,9 @@ describe("recorded-gesture replay benchmark", { tags: ["perf"] }, () => {
           async () => {
             if (!usingRealGpu && !allowSoftware) {
               throw new Error(
-                "the replay benchmark requires POINTCLOUD_LOD_BROWSER_GPU=1: " +
+                "the replay benchmark requires TILED_VTKJS_BROWSER_GPU=1: " +
                   "frame times under a software rasterizer describe the " +
-                  "rasterizer. Set POINTCLOUD_LOD_REPLAY_ALLOW_SOFTWARE=1 to " +
+                  "rasterizer. Set TILED_VTKJS_REPLAY_ALLOW_SOFTWARE=1 to " +
                   "exercise the pipeline without measuring anything.",
               );
             }

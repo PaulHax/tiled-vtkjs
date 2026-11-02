@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "recordedAt": "2026-08-19T20:29:02.260Z",
-  "label": "pointcloud-lod combined explorer",
+  "label": "tiled-vtkjs combined explorer",
   "href": "http://localhost:5173/combined/?record=1&data=tiles-place%3ARotterdam+%E2%80%94+Kop+van+Zuid&data=points-place%3ARotterdam+%E2%80%94+Kop+van+Zuid",
   "viewer": {
     "widthCssPx": 1172,

@@ -19,9 +19,9 @@ import { afterAll, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { ADAPTIVE_QUALITY_DEFAULTS } from "../../src/adaptiveBudget";
-import { DEFAULT_MIN_POINT_BUDGET } from "../../src/pointCloudMember";
-import { MIN_VIEW_QUALITY_FRACTION } from "../../src/viewBudget";
+import { ADAPTIVE_QUALITY_DEFAULTS } from "../../src/core/adaptiveBudget";
+import { DEFAULT_MIN_POINT_BUDGET } from "../../src/points/pointCloudMember";
+import { MIN_VIEW_QUALITY_FRACTION } from "../../src/core/viewBudget";
 import {
   ADAPTIVE_CLOUD,
   closeBrowser,

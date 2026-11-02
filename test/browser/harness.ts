@@ -32,10 +32,10 @@ import {
 // is erased under `verbatimModuleSyntax`, so nothing here loads vtk.js in Node.
 // `RendererAdapterStats` comes from its own module: index.ts deliberately does
 // not re-export it.
-import type { LodControllerStats } from "../../src/controller";
-import type { PointPickResult } from "../../src/picking";
-import type { RendererAdapterStats } from "../../src/rendererAdapter";
-import type { ViewGovernorStats } from "../../src/viewGovernor";
+import type { LodControllerStats } from "../../src/points/controller";
+import type { PointPickResult } from "../../src/points/picking";
+import type { RendererAdapterStats } from "../../src/points/rendererAdapter";
+import type { ViewGovernorStats } from "../../src/core/viewGovernor";
 import type {
   TelemetryEnvironment,
   TelemetrySummary,
@@ -66,11 +66,11 @@ const ADAPTIVE_URL_PATH = "/fixtures/adaptive.copc.laz";
 
 /**
  * Extra clouds to run the matrix against, as a path list in
- * `POINTCLOUD_LOD_BROWSER_CLOUDS`. Deliberately not named or defaulted here:
+ * `TILED_VTKJS_BROWSER_CLOUDS`. Deliberately not named or defaulted here:
  * the datasets a deployment cares about are not this repository's to know.
  */
 const extraClouds = (): string[] =>
-  (process.env.POINTCLOUD_LOD_BROWSER_CLOUDS ?? "")
+  (process.env.TILED_VTKJS_BROWSER_CLOUDS ?? "")
     .split(":")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
@@ -323,7 +323,7 @@ export const hierarchyPagesServed = async (
 };
 
 /**
- * True when `POINTCLOUD_LOD_BROWSER_GPU` asks for the machine's real GPU
+ * True when `TILED_VTKJS_BROWSER_GPU` asks for the machine's real GPU
  * instead of SwiftShader. The stress matrix never needs it — nothing there
  * asserts wall-clock speed — but a measurement run does: frame times taken
  * under a software rasteriser describe SwiftShader, not the library.

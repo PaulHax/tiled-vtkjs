@@ -104,7 +104,7 @@ export type OverlayTelemetry = {
  * from one stamp is what lets a pair be recognised later as one session.
  */
 const captureBasename = (recorder: InputRecorder): string =>
-  `pointcloud-capture-${filenameTimestamp(
+  `tiled-vtkjs-capture-${filenameTimestamp(
     new Date(recorder.recording().recordedAt),
   )}`;
 

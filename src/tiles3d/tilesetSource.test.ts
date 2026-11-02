@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { IDENTITY } from "../mat4";
+import { IDENTITY } from "../core/mat4";
 import {
   TilesetFetchError,
   TilesetUnsupportedError,

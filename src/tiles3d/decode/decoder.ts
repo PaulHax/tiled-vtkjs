@@ -4,7 +4,7 @@ import { BasisLoader } from "@loaders.gl/textures";
 import { loadLibrary } from "@loaders.gl/worker-utils";
 import { read as readKtx2 } from "ktx-parse";
 
-import { IDENTITY, type Mat4 } from "../../mat4";
+import { IDENTITY, type Mat4 } from "../../core/mat4";
 import {
   flattenPrimitiveToRtc,
   multiplyMat4,

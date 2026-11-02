@@ -536,7 +536,8 @@ export const createTelemetryRecorder = (options: {
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download =
-        filename ?? `pointcloud-telemetry-${filenameTimestamp(wallNow())}.json`;
+        filename ??
+        `tiled-vtkjs-telemetry-${filenameTimestamp(wallNow())}.json`;
       anchor.hidden = true;
       document.body.append(anchor);
       anchor.click();

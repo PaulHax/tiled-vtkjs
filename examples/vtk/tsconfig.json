@@ -1,5 +1,4 @@
 {
   "extends": "../../tsconfig.json",
-  "include": ["."],
-  "files": ["../../src/vtkPeer.d.ts"]
+  "include": ["."]
 }

@@ -79,7 +79,7 @@ describe("local performance telemetry", () => {
         session.page.locator("#telemetry-download").click(),
       ]);
       expect(download.suggestedFilename()).toMatch(
-        /^pointcloud-telemetry-.*\.json$/,
+        /^tiled-vtkjs-telemetry-.*\.json$/,
       );
       expect(
         await session.page.locator("#telemetry-status").textContent(),

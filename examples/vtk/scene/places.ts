@@ -8,7 +8,7 @@
  * only way two members can share a camera.
  */
 
-import type { Mat4 } from "../../../src/mat4";
+import type { Mat4 } from "../../../src/core/mat4";
 import { createEcefToEnuTransform } from "../../../src/tiles3d/rtc";
 import { PLACE_LABELS } from "./sceneCatalog";
 

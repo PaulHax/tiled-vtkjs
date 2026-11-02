@@ -5,15 +5,15 @@ import {
   projectedBoundsAabbCssPx,
   projectPointToCssPx,
   type CameraView,
-} from "../camera";
-import { IDENTITY, transformPoint, type Mat16 } from "../mat4";
+} from "../core/camera";
+import { IDENTITY, transformPoint, type Mat16 } from "../core/mat4";
 import {
   occlusionFromPick,
   type MemberPickResult,
   type OcclusionResult,
-} from "../streamedMember";
-import type { Bounds } from "../octree";
-import { scenePoint as makeScenePoint } from "../frames";
+} from "../core/streamedMember";
+import type { Bounds } from "../core/geometry";
+import { scenePoint as makeScenePoint } from "../core/frames";
 import type { DecodedPrimitive, SerializableSampler } from "./decode";
 
 export type PickAlphaTexture = {

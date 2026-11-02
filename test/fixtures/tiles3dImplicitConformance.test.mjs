@@ -13,7 +13,7 @@ const fixtureRoot = fileURLToPath(
   new URL("./tiles3d-implicit/", import.meta.url),
 );
 const temporaryRoot = await mkdtemp(
-  resolve(tmpdir(), `pointcloud-lod-implicit-${process.pid}-`),
+  resolve(tmpdir(), `tiled-vtkjs-implicit-${process.pid}-`),
 );
 
 afterAll(async () => {

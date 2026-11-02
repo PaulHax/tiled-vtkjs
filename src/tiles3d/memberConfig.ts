@@ -1,5 +1,5 @@
-import { validateAffineMatrix } from "../mat4";
-import { integerAtLeast } from "../numeric";
+import { validateAffineMatrix } from "../core/mat4";
+import { integerAtLeast } from "../core/numeric";
 import {
   DEFAULT_MAXIMUM_SCREEN_SPACE_ERROR_PX,
   DEFAULT_TILES3D_CACHE_BYTES,

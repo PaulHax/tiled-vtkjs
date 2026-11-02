@@ -1,7 +1,11 @@
 import type { TilesetFetch } from "./tilesetSource";
 import type { ContentQueueFetch } from "./contentQueue";
-import type { DecodeWasmUrls } from "./decode";
-import type { Allocation } from "../streamedMember";
+import type {
+  DecodeWasmUrls,
+  DecodeWorkerPoolHandle,
+  TextureCapabilities,
+} from "./decode";
+import type { Allocation } from "../core/streamedMember";
 import type { MeshAdapterStats } from "./meshAdapter";
 
 export const DEFAULT_MAXIMUM_SCREEN_SPACE_ERROR_PX = 16;
@@ -34,6 +38,13 @@ export type ContentQueueStats = {
 };
 
 export type GeometricErrorScale = "maximum" | "horizontal";
+
+/** Format services shared by the host; members cancel their own jobs on disposal. */
+export type Tiles3dMemberServices = {
+  /** Caller-owned pool. Dispose it after disposing every member that uses it. */
+  readonly workers: DecodeWorkerPoolHandle;
+  readonly textureCapabilities: TextureCapabilities;
+};
 
 export type Tiles3dMemberConfig = {
   readonly endpoint: string;

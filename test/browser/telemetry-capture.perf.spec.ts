@@ -18,12 +18,10 @@ import {
 } from "./harness";
 import { ensureReplayCloud, REPLAY_URL_PATH } from "./networkReplay";
 
-const captureUrl = (process.env.POINTCLOUD_LOD_TELEMETRY_URL ?? "").trim();
+const captureUrl = (process.env.TILED_VTKJS_TELEMETRY_URL ?? "").trim();
 const INPUT_INTERVAL_MS = 12;
-const configuredOutput = (
-  process.env.POINTCLOUD_LOD_TELEMETRY_OUT ?? ""
-).trim();
-const defaultName = `pointcloud-trace-${new Date()
+const configuredOutput = (process.env.TILED_VTKJS_TELEMETRY_OUT ?? "").trim();
+const defaultName = `tiled-vtkjs-trace-${new Date()
   .toISOString()
   .replaceAll(":", "-")
   .replaceAll(".", "-")}.json`;
@@ -34,11 +32,11 @@ const outputPath = configuredOutput
   : resolve(process.cwd(), "artifacts/telemetry", defaultName);
 
 const networkMode = (
-  process.env.POINTCLOUD_LOD_TELEMETRY_NETWORK ?? "replay"
+  process.env.TILED_VTKJS_TELEMETRY_NETWORK ?? "replay"
 ).trim();
 if (networkMode !== "replay" && networkMode !== "live") {
   throw new Error(
-    "POINTCLOUD_LOD_TELEMETRY_NETWORK must be either replay or live",
+    "TILED_VTKJS_TELEMETRY_NETWORK must be either replay or live",
   );
 }
 
@@ -56,40 +54,40 @@ const finiteEnvironmentNumber = (
 };
 
 const replayLatencyMs = finiteEnvironmentNumber(
-  "POINTCLOUD_LOD_TELEMETRY_LATENCY_MS",
+  "TILED_VTKJS_TELEMETRY_LATENCY_MS",
   40,
   0,
 );
 const replayMbps = finiteEnvironmentNumber(
-  "POINTCLOUD_LOD_TELEMETRY_MBPS",
+  "TILED_VTKJS_TELEMETRY_MBPS",
   80,
   Number.MIN_VALUE,
 );
 const replayCacheDirectory = resolve(
-  process.env.POINTCLOUD_LOD_TELEMETRY_CACHE_DIR?.trim() ||
+  process.env.TILED_VTKJS_TELEMETRY_CACHE_DIR?.trim() ||
     "artifacts/telemetry/cache",
 );
 const budgetMode = (
-  process.env.POINTCLOUD_LOD_TELEMETRY_BUDGET_MODE ?? "adaptive"
+  process.env.TILED_VTKJS_TELEMETRY_BUDGET_MODE ?? "adaptive"
 ).trim();
 if (budgetMode !== "adaptive" && budgetMode !== "fixed") {
   throw new Error(
-    "POINTCLOUD_LOD_TELEMETRY_BUDGET_MODE must be either adaptive or fixed",
+    "TILED_VTKJS_TELEMETRY_BUDGET_MODE must be either adaptive or fixed",
   );
 }
 const fixedPointBudget = finiteEnvironmentNumber(
-  "POINTCLOUD_LOD_TELEMETRY_POINT_BUDGET",
+  "TILED_VTKJS_TELEMETRY_POINT_BUDGET",
   2_000_000,
   1,
 );
 const fixedInteractionDensity = finiteEnvironmentNumber(
-  "POINTCLOUD_LOD_TELEMETRY_INTERACTION_DENSITY",
+  "TILED_VTKJS_TELEMETRY_INTERACTION_DENSITY",
   1,
   0,
 );
 if (fixedInteractionDensity > 1) {
   throw new Error(
-    "POINTCLOUD_LOD_TELEMETRY_INTERACTION_DENSITY must be at most 1",
+    "TILED_VTKJS_TELEMETRY_INTERACTION_DENSITY must be at most 1",
   );
 }
 
@@ -100,7 +98,7 @@ const captureSource = async (): Promise<Parameters<typeof openExample>[0]> => {
   const file = await ensureReplayCloud(
     captureUrl,
     replayCacheDirectory,
-    (process.env.POINTCLOUD_LOD_TELEMETRY_REFRESH ?? "") !== "",
+    (process.env.TILED_VTKJS_TELEMETRY_REFRESH ?? "") !== "",
   );
   return {
     cloud: REPLAY_URL_PATH,
@@ -279,9 +277,7 @@ describe("hardware telemetry capture", { tags: ["perf"] }, () => {
     "captures overview, ROI zoom, close orbit, horizontal pan, and return",
     async () => {
       if (!usingRealGpu()) {
-        throw new Error(
-          "telemetry capture requires POINTCLOUD_LOD_BROWSER_GPU=1",
-        );
+        throw new Error("telemetry capture requires TILED_VTKJS_BROWSER_GPU=1");
       }
 
       const session = await openExample(await captureSource());

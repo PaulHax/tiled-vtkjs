@@ -1,13 +1,17 @@
 /** StreamedMember implementation for the constrained 3D Tiles profile. */
 
-import { copyCameraView, sameCameraView, type CameraView } from "../camera";
+import {
+  copyCameraView,
+  sameCameraView,
+  type CameraView,
+} from "../core/camera";
 import {
   multiply,
   sameMatrix,
   validateAffineMatrix,
   type Mat16,
-} from "../mat4";
-import { safeCall } from "../observers";
+} from "../core/mat4";
+import { safeCall } from "../core/observers";
 import {
   CULLED,
   importanceFromRootSseCssPx,
@@ -15,7 +19,7 @@ import {
   type GovernorInputs,
   type StreamedMember,
   type StreamedMemberContext,
-} from "../streamedMember";
+} from "../core/streamedMember";
 import {
   createContentQueue,
   type ContentQueue,
@@ -29,6 +33,7 @@ import {
   DEFAULT_TILES3D_SUBTREE_CACHE_BYTES,
   type Tiles3dMemberConfig,
   type Tiles3dMemberStats,
+  type Tiles3dMemberServices,
 } from "./memberTypes";
 import {
   validateTiles3dMemberConfig,
@@ -106,6 +111,7 @@ const contentRequests = (
 export const createTiles3dMember = (
   context: StreamedMemberContext,
   initialConfig: Tiles3dMemberConfig,
+  services: Tiles3dMemberServices,
 ): StreamedMember => {
   let traverseTileset = createTilesetTraversal();
   let config = validateTiles3dMemberConfig(initialConfig);
@@ -692,14 +698,14 @@ export const createTiles3dMember = (
       decode: async (bytes, request, decodeContext) => {
         const tile = materializedTileById.get(request.id);
         if (!tile) throw new Error(`unknown 3D tile ${request.id}`);
-        const job = context.workers.decode({
+        const job = services.workers.decode({
           content: bytes,
           contentUrl: workerUrl(request.url),
           dependencyRootUrl: workerUrl(`${config.endpoint}/`),
           revision: decodeContext.revision,
           accumulatedTransform: [...tile.worldTransform] as any,
           tilesetToScene: [...config.tilesetToScene] as any,
-          textureCapabilities: context.textureCapabilities,
+          textureCapabilities: services.textureCapabilities,
           wasm: config.wasm,
         });
         const abort = () => job.cancel();
@@ -1096,7 +1102,7 @@ export const createTiles3dMember = (
         sourceState,
         irreducibleBudget,
         revision: config.revision,
-        capabilityKey: context.textureCapabilities.capabilityKey,
+        capabilityKey: services.textureCapabilities.capabilityKey,
         devicePixelRatio,
         interactionDepth,
         configGeneration,
@@ -1116,7 +1122,7 @@ export const createTiles3dMember = (
         lastError,
         queue: queueSnapshot,
         subtrees: subtreeSnapshot,
-        decode: context.workers.stats?.() ?? null,
+        decode: services.workers.stats?.() ?? null,
         renderer: adapter.stats(),
         submissions: {
           queuedJobs: submissions.queuedJobs,

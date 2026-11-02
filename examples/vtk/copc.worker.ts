@@ -1,3 +1,3 @@
-import { serveCopcTileSourceWorker } from "../../src/copcWorker";
+import { serveCopcTileSourceWorker } from "../../src/points/copcWorker";
 
 serveCopcTileSourceWorker();

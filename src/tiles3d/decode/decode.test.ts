@@ -30,7 +30,7 @@ import {
 let fixtureDirectory = "";
 
 beforeAll(async () => {
-  fixtureDirectory = await mkdtemp(resolve(tmpdir(), "pointcloud-lod-decode-"));
+  fixtureDirectory = await mkdtemp(resolve(tmpdir(), "tiled-vtkjs-decode-"));
   await generateTiles3dFixture(fixtureDirectory);
 }, 30_000);
 

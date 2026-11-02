@@ -402,7 +402,7 @@ export const createInputRecorder = (options: {
       anchor.href = url;
       anchor.download =
         filename ??
-        `pointcloud-input-${filenameTimestamp(startedAtWall ?? wallNow())}.json`;
+        `tiled-vtkjs-input-${filenameTimestamp(startedAtWall ?? wallNow())}.json`;
       anchor.hidden = true;
       document.body.append(anchor);
       anchor.click();

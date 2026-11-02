@@ -2,17 +2,21 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 
 import { perspectiveView } from "../../test/helpers";
-import { IDENTITY } from "../mat4";
-import { createMemoryPool } from "../memoryPool";
-import { createSubmissionScheduler } from "../submissionScheduler";
-import type { StreamedMemberContext } from "../streamedMember";
+import { IDENTITY } from "../core/mat4";
+import { createMemoryPool } from "../core/memoryPool";
+import { createSubmissionScheduler } from "../core/submissionScheduler";
+import type { StreamedMemberContext } from "../core/streamedMember";
 import {
   TileUnsupportedExtensionError,
   type DecodeTileRequest,
   type DecodedTileContent,
 } from "./decode";
 import { createTiles3dMember } from "./member";
-import type { Tiles3dMemberConfig, Tiles3dMemberStats } from "./memberTypes";
+import type {
+  Tiles3dMemberConfig,
+  Tiles3dMemberStats,
+  Tiles3dMemberServices,
+} from "./memberTypes";
 import { actorInstances, resetStubs } from "../../test/stubs/vtkStub";
 
 const view = perspectiveView({ position: [0, 0, -1] });
@@ -93,6 +97,10 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
     scheduleRender,
     memory,
     submissions,
+    devicePixelRatio: 1,
+    onWorkChange: vi.fn(),
+  };
+  const services: Tiles3dMemberServices = {
     textureCapabilities: {
       capabilityKey: "compressed-texture-v1:astc-4x4",
       compressedFormats: ["astc-4x4"],
@@ -103,8 +111,6 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
         return { promise: Promise.resolve(decoded()), cancel: vi.fn() };
       },
     },
-    devicePixelRatio: 1,
-    onWorkChange: vi.fn(),
   };
   const config: Tiles3dMemberConfig = {
     endpoint: "/tiles",
@@ -130,6 +136,7 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
   };
   return {
     context,
+    services,
     config,
     renderer,
     memory,
@@ -146,7 +153,7 @@ describe("createTiles3dMember", () => {
     "recovers mixed pooled and GPU-evicted children within a %i-byte budget",
     async (budget) => {
       const h = harness(true, 1024);
-      const member = createTiles3dMember(h.context, h.config);
+      const member = createTiles3dMember(h.context, h.config, h.services);
       const drain = async () => {
         for (let i = 0; i < 15; i++) {
           await settle();
@@ -198,10 +205,14 @@ describe("createTiles3dMember", () => {
 
   it("restores resident tiles without fetching after the decoded cache evicts", async () => {
     const h = harness(true);
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      cacheBytes: 0,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        cacheBytes: 0,
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -242,15 +253,19 @@ describe("createTiles3dMember", () => {
         Array.from({ length: 24 }, (_, i) => tile(`${i}.glb`, 0)),
       ),
     };
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => manifest,
-      }),
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => manifest,
+        }),
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -309,16 +324,20 @@ describe("createTiles3dMember", () => {
           subtreeBytes.byteOffset + subtreeBytes.byteLength,
         ),
     }));
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => manifest,
-      }),
-      fetchSubtree: subtreeFetch,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => manifest,
+        }),
+        fetchSubtree: subtreeFetch,
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -358,10 +377,14 @@ describe("createTiles3dMember", () => {
     // water-filled down to the quality floor beneath a point cloud reporting
     // raw pixels.
     const h = harness(true);
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      maximumScreenSpaceErrorPx: 16,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maximumScreenSpaceErrorPx: 16,
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -381,26 +404,30 @@ describe("createTiles3dMember", () => {
   it("ignores restatements of an unchanged camera and anchor matrix", async () => {
     const h = harness(true);
     let traversals = 0;
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => {
-        return {
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          json: async () => document(true),
-        };
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: async () => document(true),
+          };
+        },
+        fetchContent: async () => {
+          traversals += 1;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            arrayBuffer: async () => new ArrayBuffer(8),
+          };
+        },
       },
-      fetchContent: async () => {
-        traversals += 1;
-        return {
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          arrayBuffer: async () => new ArrayBuffer(8),
-        };
-      },
-    });
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -430,7 +457,7 @@ describe("createTiles3dMember", () => {
 
   it("reselects when the host mutates its reused camera matrix", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -459,7 +486,8 @@ describe("createTiles3dMember", () => {
 
   it("implements the streamed member lifecycle without a second memory owner", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, h.config);
+    h.services.workers.dispose = vi.fn();
+    const member = createTiles3dMember(h.context, h.config, h.services);
     expect(h.memory.memberCount()).toBe(0);
     member.applyAllocation({
       qualityFraction: 1,
@@ -477,7 +505,7 @@ describe("createTiles3dMember", () => {
     });
     expect(h.decodedRequests[0]).toMatchObject({
       revision: "r1",
-      textureCapabilities: h.context.textureCapabilities,
+      textureCapabilities: h.services.textureCapabilities,
       contentUrl: "http://localhost/tiles/root.glb",
       dependencyRootUrl: "http://localhost/tiles/",
     });
@@ -517,11 +545,12 @@ describe("createTiles3dMember", () => {
     member.dispose();
     expect(actorInstances[0]?.deleted).toBe(true);
     expect((member.stats() as Tiles3dMemberStats).sourceState).toBe("disposed");
+    expect(h.services.workers.dispose).not.toHaveBeenCalled();
   });
 
   it("keeps exact submitted picking after the decoded CPU cache evicts", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -557,14 +586,18 @@ describe("createTiles3dMember", () => {
 
   it("preserves nested decode causes in public diagnostics", async () => {
     const h = harness(false);
-    h.context.workers.decode = () => ({
+    h.services.workers.decode = () => ({
       promise: Promise.reject(new Error("codec unavailable")),
       cancel: vi.fn(),
     });
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      maxAttempts: 1,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maxAttempts: 1,
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -580,7 +613,7 @@ describe("createTiles3dMember", () => {
 
   it("holds a submitted parent until every child crosses paced admission", async () => {
     const h = harness(true, 128);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -611,15 +644,19 @@ describe("createTiles3dMember", () => {
       geometricError: 8,
       root: contentlessTile(0, [tile("left.glb", 0), tile("right.glb", 0)]),
     };
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => rootContentless,
-      }),
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => rootContentless,
+        }),
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -652,15 +689,19 @@ describe("createTiles3dMember", () => {
         contentlessTile(0, [tile("left.glb", 0), tile("right.glb", 0)]),
       ]),
     };
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => intermediateContentless,
-      }),
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => intermediateContentless,
+        }),
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -690,7 +731,7 @@ describe("createTiles3dMember", () => {
 
   it("cancels selection work and partial submissions without stale callbacks", async () => {
     const h = harness(false, 16);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -710,13 +751,17 @@ describe("createTiles3dMember", () => {
   it("maps quality to SSE and contains source errors", async () => {
     const h = harness();
     const onError = vi.fn();
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      fetchTileset: async () => {
-        throw new Error("offline");
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => {
+          throw new Error("offline");
+        },
+        onError,
       },
-      onError,
-    });
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 0.25,
       memoryBudgetBytes: 2048,
@@ -738,7 +783,7 @@ describe("createTiles3dMember", () => {
   it("surfaces typed decode failures through queue and member telemetry", async () => {
     const h = harness();
     const onError = vi.fn();
-    h.context.workers.decode = () => ({
+    h.services.workers.decode = () => ({
       promise: Promise.reject(
         new TileUnsupportedExtensionError(
           "/tiles/root.glb",
@@ -747,11 +792,15 @@ describe("createTiles3dMember", () => {
       ),
       cancel: vi.fn(),
     });
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      maxAttempts: 1,
-      onError,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maxAttempts: 1,
+        onError,
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -779,10 +828,14 @@ describe("createTiles3dMember", () => {
     "retries blocked content with cache %s when its GPU allocation grows",
     async (cacheBytes) => {
       const h = harness();
-      const member = createTiles3dMember(h.context, {
-        ...h.config,
-        cacheBytes,
-      });
+      const member = createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          cacheBytes,
+        },
+        h.services,
+      );
       member.applyAllocation({
         qualityFraction: 1,
         memoryBudgetBytes: 1,
@@ -826,7 +879,7 @@ describe("createTiles3dMember", () => {
 
   it("swaps submitted descendants for a fitting parent before enforcing a smaller byte share", async () => {
     const h = harness(true, 128);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -866,7 +919,7 @@ describe("createTiles3dMember", () => {
 
   it("keeps its drawn detail when a smaller byte share still fits it", async () => {
     const h = harness(true, 1024);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     const drain = async () => {
       for (let round = 0; round < 15; round += 1) {
         await settle();
@@ -940,20 +993,14 @@ describe("createTiles3dMember", () => {
         primitives: [...content.primitives, ...content.primitives],
       };
     };
+    h.services.workers.decode = (request) => ({
+      promise: Promise.resolve(
+        request.contentUrl.endsWith("root.glb") ? twoTriangles() : decoded(),
+      ),
+      cancel: vi.fn(),
+    });
     const member = createTiles3dMember(
-      {
-        ...h.context,
-        workers: {
-          decode: (request) => ({
-            promise: Promise.resolve(
-              request.contentUrl.endsWith("root.glb")
-                ? twoTriangles()
-                : decoded(),
-            ),
-            cancel: vi.fn(),
-          }),
-        },
-      },
+      h.context,
       {
         ...h.config,
         maxAttempts: 1,
@@ -970,6 +1017,7 @@ describe("createTiles3dMember", () => {
         }),
         ...(fetchContent ? { fetchContent } : {}),
       },
+      h.services,
     );
     const drain = async () => {
       for (let round = 0; round < 15; round += 1) {
@@ -1048,7 +1096,7 @@ describe("createTiles3dMember", () => {
 
   it("credits a submitted parent when the complete child frontier fits without the transient peak", async () => {
     const h = harness(true, 88);
-    (h.context.workers as any).decode = (request: DecodeTileRequest) => {
+    h.services.workers.decode = (request: DecodeTileRequest) => {
       h.decodedRequests.push(request);
       const value = decoded();
       if (request.contentUrl.endsWith("/root.glb")) {
@@ -1058,7 +1106,7 @@ describe("createTiles3dMember", () => {
       }
       return { promise: Promise.resolve(value), cancel: vi.fn() };
     };
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       // The parent retains 88 bytes and each child 52. Neither child can
@@ -1109,7 +1157,7 @@ describe("createTiles3dMember", () => {
 
   it("retries a memory-constrained member when the camera changes its desired frontier", async () => {
     const h = harness(true, 128);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 60,
@@ -1142,7 +1190,7 @@ describe("createTiles3dMember", () => {
   it("surfaces permanent adapter rejection once without retrying forever", async () => {
     // Geometry can be split into triangles, but one triangle is indivisible.
     const h = harness(false, 16);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1171,7 +1219,7 @@ describe("createTiles3dMember", () => {
 
   it("drops old submitted/pick currency before revision, endpoint, or placement reload", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1203,12 +1251,16 @@ describe("createTiles3dMember", () => {
     const tilesetToScene = [
       0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0, 0.25, 0.5, 0.25, 1,
     ];
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      tilesetToScene,
-      verticalExaggeration: 2,
-      verticalPivotZ: 0.5,
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        tilesetToScene,
+        verticalExaggeration: 2,
+        verticalPivotZ: 0.5,
+      },
+      h.services,
+    );
     const anchor = [0, 1, 0, 0, -1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1] as const;
     member.setModelMatrix(anchor);
     member.applyAllocation({
@@ -1264,10 +1316,14 @@ describe("createTiles3dMember", () => {
       basis: { encoderUrl: "/basis.js", wasmUrl: "/basis.wasm" },
     });
     const h = harness();
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      wasm: wasmUrls(),
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        wasm: wasmUrls(),
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1299,10 +1355,14 @@ describe("createTiles3dMember", () => {
 
   it("reloads when the wasm URLs a tile decodes with actually change", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      wasm: { draco: { wrapperUrl: "/draco.js", wasmUrl: "/draco.wasm" } },
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        wasm: { draco: { wrapperUrl: "/draco.js", wasmUrl: "/draco.wasm" } },
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1328,7 +1388,7 @@ describe("createTiles3dMember", () => {
 
   it("retries a requested decoded tile after allocation shrink cancels partial admission", async () => {
     const h = harness(false, 64);
-    const member = createTiles3dMember(h.context, h.config);
+    const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1368,16 +1428,24 @@ describe("createTiles3dMember", () => {
   it("rejects non-affine and singular ECEF transforms at the factory boundary", () => {
     const h = harness();
     expect(() =>
-      createTiles3dMember(h.context, {
-        ...h.config,
-        tilesetToScene: [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-      }),
+      createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          tilesetToScene: [1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        },
+        h.services,
+      ),
     ).toThrow(/affine/);
     expect(() =>
-      createTiles3dMember(h.context, {
-        ...h.config,
-        tilesetToScene: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-      }),
+      createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          tilesetToScene: [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        },
+        h.services,
+      ),
     ).toThrow(/invertible/);
   });
 
@@ -1391,38 +1459,58 @@ describe("createTiles3dMember", () => {
   ] as const)("rejects invalid %s values", (field, value) => {
     const h = harness();
     expect(() =>
-      createTiles3dMember(h.context, { ...h.config, [field]: value }),
+      createTiles3dMember(
+        h.context,
+        { ...h.config, [field]: value },
+        h.services,
+      ),
     ).toThrow(new RegExp(field));
   });
 
   it("rejects non-number vertical configuration at the runtime boundary", () => {
     const h = harness();
     expect(() =>
-      createTiles3dMember(h.context, {
-        ...h.config,
-        verticalExaggeration: true as unknown as number,
-      }),
+      createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          verticalExaggeration: true as unknown as number,
+        },
+        h.services,
+      ),
     ).toThrow(/verticalExaggeration/);
     expect(() =>
-      createTiles3dMember(h.context, {
-        ...h.config,
-        verticalPivotZ: "0" as unknown as number,
-      }),
+      createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          verticalPivotZ: "0" as unknown as number,
+        },
+        h.services,
+      ),
     ).toThrow(/verticalPivotZ/);
     expect(() =>
-      createTiles3dMember(h.context, {
-        ...h.config,
-        verticalExaggeration: null as unknown as number,
-      }),
+      createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          verticalExaggeration: null as unknown as number,
+        },
+        h.services,
+      ),
     ).toThrow(/verticalExaggeration/);
   });
 
   it("composes anchor after tilesetToScene for traversal while decode keeps anchor live", async () => {
     const h = harness();
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      tilesetToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 0, 0, 1],
-    });
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        tilesetToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 0, 0, 1],
+      },
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1442,7 +1530,7 @@ describe("createTiles3dMember", () => {
     const h = harness();
     const releases = new Map<string, () => void>();
     const originalFetch = h.config.fetchContent!;
-    h.context.workers.decode = (request) => {
+    h.services.workers.decode = (request) => {
       h.decodedRequests.push(request);
       const content = decoded();
       if (request.contentUrl.endsWith("/right-fine.glb")) {
@@ -1451,27 +1539,33 @@ describe("createTiles3dMember", () => {
       }
       return { promise: Promise.resolve(content), cancel: vi.fn() };
     };
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      concurrency: 5,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => ({
-          ...document(),
-          root: contentlessTile(16, [
-            tile("left.glb", 8, [tile("left-fine.glb", 0)]),
-            tile("right.glb", 8, [tile("right-fine.glb", 0)]),
-          ]),
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        concurrency: 5,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            ...document(),
+            root: contentlessTile(16, [
+              tile("left.glb", 8, [tile("left-fine.glb", 0)]),
+              tile("right.glb", 8, [tile("right-fine.glb", 0)]),
+            ]),
+          }),
         }),
-      }),
-      fetchContent: async (...args) => {
-        if (!args[0].endsWith("/left-fine.glb"))
-          await new Promise<void>((resolve) => releases.set(args[0], resolve));
-        return originalFetch(...args);
+        fetchContent: async (...args) => {
+          if (!args[0].endsWith("/left-fine.glb"))
+            await new Promise<void>((resolve) =>
+              releases.set(args[0], resolve),
+            );
+          return originalFetch(...args);
+        },
       },
-    });
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 104,
@@ -1516,7 +1610,7 @@ describe("createTiles3dMember", () => {
       const releases = new Map<string, () => void>();
       const released = new Set<string>();
       const originalFetch = h.config.fetchContent!;
-      h.context.workers.decode = (request) => {
+      h.services.workers.decode = (request) => {
         h.decodedRequests.push(request);
         const content = decoded();
         if (request.contentUrl.endsWith("/root.glb")) {
@@ -1525,34 +1619,38 @@ describe("createTiles3dMember", () => {
         }
         return { promise: Promise.resolve(content), cancel: vi.fn() };
       };
-      const member = createTiles3dMember(h.context, {
-        ...h.config,
-        concurrency: 5,
-        cacheBytes,
-        fetchTileset: async () => ({
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          json: async () => ({
-            ...document(),
-            root: tile(
-              "root.glb",
-              8,
-              [0, 1, 2, 3].map((i) => tile(`child${i}.glb`, 0)),
-            ),
+      const member = createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          concurrency: 5,
+          cacheBytes,
+          fetchTileset: async () => ({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: async () => ({
+              ...document(),
+              root: tile(
+                "root.glb",
+                8,
+                [0, 1, 2, 3].map((i) => tile(`child${i}.glb`, 0)),
+              ),
+            }),
           }),
-        }),
-        fetchContent: async (...args) => {
-          if (!args[0].endsWith("/root.glb") && !released.has(args[0]))
-            await new Promise<void>((resolve) =>
-              releases.set(args[0], () => {
-                released.add(args[0]);
-                resolve();
-              }),
-            );
-          return originalFetch(...args);
+          fetchContent: async (...args) => {
+            if (!args[0].endsWith("/root.glb") && !released.has(args[0]))
+              await new Promise<void>((resolve) =>
+                releases.set(args[0], () => {
+                  released.add(args[0]);
+                  resolve();
+                }),
+              );
+            return originalFetch(...args);
+          },
         },
-      });
+        h.services,
+      );
       member.applyAllocation({
         qualityFraction: 1,
         memoryBudgetBytes: budget,
@@ -1613,7 +1711,7 @@ describe("createTiles3dMember", () => {
         releaseLarge = resolve;
       });
       const fetchContent = h.config.fetchContent!;
-      h.context.workers.decode = (request) => {
+      h.services.workers.decode = (request) => {
         const value = decoded();
         if (request.contentUrl.endsWith("/large.glb")) {
           for (let i = 1; i < 4; i++)
@@ -1622,27 +1720,31 @@ describe("createTiles3dMember", () => {
         }
         return { promise: Promise.resolve(value), cancel: vi.fn() };
       };
-      const member = createTiles3dMember(h.context, {
-        ...h.config,
-        concurrency: 3,
-        fetchTileset: async () => ({
-          ok: true,
-          status: 200,
-          statusText: "OK",
-          json: async () => ({
-            ...document(),
-            root: tile("root.glb", 8, [
-              tile("small.glb", 0),
-              tile("large.glb", 0),
-            ]),
+      const member = createTiles3dMember(
+        h.context,
+        {
+          ...h.config,
+          concurrency: 3,
+          fetchTileset: async () => ({
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: async () => ({
+              ...document(),
+              root: tile("root.glb", 8, [
+                tile("small.glb", 0),
+                tile("large.glb", 0),
+              ]),
+            }),
           }),
-        }),
-        fetchContent: async (...args) => {
-          if (!args[0].endsWith("/root.glb")) await childrenReady;
-          if (args[0].endsWith("/large.glb")) await largeReady;
-          return fetchContent(...args);
+          fetchContent: async (...args) => {
+            if (!args[0].endsWith("/root.glb")) await childrenReady;
+            if (args[0].endsWith("/large.glb")) await largeReady;
+            return fetchContent(...args);
+          },
         },
-      });
+        h.services,
+      );
       member.applyAllocation({
         qualityFraction: 1,
         memoryBudgetBytes: 180,
@@ -1680,7 +1782,7 @@ describe("createTiles3dMember", () => {
       releaseLeaf = resolve;
     });
     const fetchContent = h.config.fetchContent!;
-    h.context.workers.decode = (request) => {
+    h.services.workers.decode = (request) => {
       const content = decoded();
       const count = request.contentUrl.endsWith("/root.glb")
         ? 3
@@ -1692,28 +1794,32 @@ describe("createTiles3dMember", () => {
       content.byteEstimate = { geometry: 42 * count, textures: 0 };
       return { promise: Promise.resolve(content), cancel: vi.fn() };
     };
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      concurrency: 5,
-      fetchTileset: async () => ({
-        ok: true,
-        status: 200,
-        statusText: "OK",
-        json: async () => ({
-          ...document(),
-          root: tile("root.glb", 16, [
-            tile("a.glb", 0),
-            tile("b.glb", 0),
-            tile("c.glb", 8, [tile("expensive.glb", 0)]),
-          ]),
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        concurrency: 5,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            ...document(),
+            root: tile("root.glb", 16, [
+              tile("a.glb", 0),
+              tile("b.glb", 0),
+              tile("c.glb", 8, [tile("expensive.glb", 0)]),
+            ]),
+          }),
         }),
-      }),
-      fetchContent: async (...args) => {
-        if (!args[0].endsWith("/root.glb")) await branchesReady;
-        if (args[0].endsWith("/expensive.glb")) await leafReady;
-        return fetchContent(...args);
+        fetchContent: async (...args) => {
+          if (!args[0].endsWith("/root.glb")) await branchesReady;
+          if (args[0].endsWith("/expensive.glb")) await leafReady;
+          return fetchContent(...args);
+        },
       },
-    });
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 180,
@@ -1747,7 +1853,7 @@ describe("createTiles3dMember", () => {
 
   it("stops refining only the branch whose replacement group cannot fit", async () => {
     const h = harness(true, 4096);
-    (h.context.workers as any).decode = (request: DecodeTileRequest) => {
+    h.services.workers.decode = (request: DecodeTileRequest) => {
       h.decodedRequests.push(request);
       const value = decoded();
       if (/\/l[ab]\.glb$/.test(request.contentUrl)) {
@@ -1763,14 +1869,19 @@ describe("createTiles3dMember", () => {
       }
       return { promise: Promise.resolve(value), cancel: vi.fn() };
     };
+    let releaseLeaves!: () => void;
+    const leavesReady = new Promise<void>((resolve) => {
+      releaseLeaves = resolve;
+    });
     const fetchContent = h.config.fetchContent!;
-    const member = createTiles3dMember(h.context, {
-      ...h.config,
-      cacheBytes: 1 << 20,
-      // Two sibling branches under one root. The left branch's children are
-      // far too big for the allowance; the right branch's are ordinary.
-      fetchTileset: async () =>
-        ({
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        cacheBytes: 1 << 20,
+        // Two sibling branches under one root. The left branch's children are
+        // far too big for the allowance; the right branch's are ordinary.
+        fetchTileset: async () => ({
           ok: true,
           status: 200,
           statusText: "OK",
@@ -1782,17 +1893,17 @@ describe("createTiles3dMember", () => {
               tile("right.glb", 8, [tile("ra.glb", 0), tile("rb.glb", 0)]),
             ]),
           }),
-        }) as any,
-      // Leaf content arrives after its parent has been presented, which is
-      // what puts a submitted ancestor above the pair and so makes them a
-      // replacement group rather than two unrelated tiles.
-      fetchContent: async (...args) => {
-        if (/\/[lr][ab]\.glb$/.test(args[0])) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-        return fetchContent(...args);
+        }),
+        // Hold leaf responses until both submitted parents provide replacement coverage.
+        fetchContent: async (...args) => {
+          if (/\/[lr][ab]\.glb$/.test(args[0])) {
+            await leavesReady;
+          }
+          return fetchContent(...args);
+        },
       },
-    });
+      h.services,
+    );
     member.applyAllocation({
       qualityFraction: 1,
       // Room for the root and both branch frontiers at the ordinary size, and
@@ -1800,14 +1911,40 @@ describe("createTiles3dMember", () => {
       memoryBudgetBytes: 600,
       regime: "stationary",
     });
+    let observe = (): void => {};
+    let inspectionQueued = false;
+    const inspect = (): void => {
+      inspectionQueued = false;
+      while (h.submissions.hasPending()) h.submissions.prepareFrame();
+      observe();
+    };
+    const requestInspection = (): void => {
+      if (inspectionQueued) return;
+      inspectionQueued = true;
+      queueMicrotask(inspect);
+    };
+    vi.mocked(h.context.scheduleRender).mockImplementation(requestInspection);
+    vi.mocked(h.context.onWorkChange!).mockImplementation(requestInspection);
+    const waitForState = (predicate: () => boolean): Promise<void> =>
+      new Promise((resolve) => {
+        observe = () => {
+          if (!predicate()) return;
+          observe = () => {};
+          resolve();
+        };
+        requestInspection();
+      });
+
     member.setCamera(view);
-    for (let pass = 0; pass < 40; pass += 1) {
-      await settle();
-      while (h.submissions.hasPending()) h.submissions.prepareFrame();
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      while (h.submissions.hasPending()) h.submissions.prepareFrame();
-      if (member.governorInputs().work.operations === 0) break;
-    }
+    await waitForState(() => {
+      const { drawnTileIds } = (member.stats() as Tiles3dMemberStats).renderer;
+      return drawnTileIds.includes("root/0") && drawnTileIds.includes("root/1");
+    });
+    expect(
+      (member.stats() as Tiles3dMemberStats).renderer.drawnTileIds,
+    ).toEqual(["root/0", "root/1"]);
+    releaseLeaves();
+    await waitForState(() => member.governorInputs().work.operations === 0);
 
     const stats = member.stats() as Tiles3dMemberStats;
     expect(stats).toMatchObject({

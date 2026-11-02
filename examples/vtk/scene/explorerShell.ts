@@ -5,18 +5,18 @@ const copy = (
 ): { title: string; description: string } =>
   preset === "points"
     ? {
-        title: "pointcloud-lod · point cloud",
+        title: "tiled-vtkjs · point cloud",
         description:
           "Stream point clouds and 3D Tiles into one governed vtk.js view. Each dataset keeps its own rendering controls.",
       }
     : preset === "tiles"
       ? {
-          title: "pointcloud-lod · 3D Tiles",
+          title: "tiled-vtkjs · 3D Tiles",
           description:
             "Explore streamed 3D Tiles, then add point clouds or more tilesets to the same governed vtk.js view.",
         }
       : {
-          title: "pointcloud-lod · combined",
+          title: "tiled-vtkjs · combined",
           description:
             "AHN4 lidar and 3DBAG buildings share one memory pool, submission scheduler, frame target, and camera.",
         };

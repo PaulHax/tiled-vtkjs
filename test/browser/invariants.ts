@@ -18,7 +18,7 @@ import { expect } from "vitest";
 import {
   MAX_VIEW_QUALITY_FRACTION,
   MIN_VIEW_QUALITY_FRACTION,
-} from "../../src/viewBudget";
+} from "../../src/core/viewBudget";
 
 // Both tiers report the whole sample, so a failure names the state it saw;
 // `shown` is the suite's one pretty-printer.

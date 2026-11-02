@@ -5,8 +5,13 @@ import {
   type CameraView,
   type Plane,
   type PreparedView,
-} from "../camera";
-import { IDENTITY, multiply, transformPoint, transformVector } from "../mat4";
+} from "../core/camera";
+import {
+  IDENTITY,
+  multiply,
+  transformPoint,
+  transformVector,
+} from "../core/mat4";
 import {
   substituteImplicitTemplate,
   type ImplicitTileAddress,

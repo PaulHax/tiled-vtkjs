@@ -9,7 +9,7 @@ name: CI
 # workflow's GitHub identity via the id-token permission (needs
 # @semantic-release/npm >= 13.1.0 and npm >= 11.5.1), and provenance is
 # automatic. GITHUB_TOKEN is provided by Actions. Configure the trusted
-# publisher on the npm package (repo: PaulHax/pointcloud-lod, workflow:
+# publisher on the npm package (repo: PaulHax/tiled-vtkjs, workflow:
 # publish.yml) before the first CI release.
 
 on:
@@ -37,7 +37,8 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild
       - name: Lint pull request commits
         if: github.event_name == 'pull_request'
         env:
@@ -53,7 +54,6 @@ jobs:
         run: npm run commitlint -- --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
       - run: npm run lint
       - run: npm run format:check
-      - run: npm run typecheck
       - run: npm test
       - uses: actions/setup-python@v5
         if: inputs.terrane_producer_ref != ''
@@ -86,12 +86,9 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Prove implicit refinement and quadrant identity in CesiumJS
         run: npx vitest run --config vitest.browser.config.ts test/browser/cesiumImplicit.spec.ts
-      - run: npm run build
 
-  # The adapter's mapper exists in no released vtk.js, so the only proof that
-  # the shipped code can still render is building the example against the exact
-  # fork commit vtkjs-fork.env pins and asserting the mapper, its OpenGL
-  # override and the Geometry profile survived into the bundle.
+  # Qualify the adapters and packed consumer against the exact required fork.
+  # Native VTK declarations are installed before the package's prepare script.
   example-chain:
     runs-on: ubuntu-latest
     steps:
@@ -100,37 +97,20 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-
-      - name: Read the pinned vtk.js commit
-        run: |
-          set -a
-          . ./vtkjs-fork.env
-          set +a
-          {
-            echo "VTKJS_FORK_REPO=$VTKJS_FORK_REPO"
-            echo "VTKJS_FORK_COMMIT=$VTKJS_FORK_COMMIT"
-            echo "VTK_JS_DIR=$RUNNER_TEMP/vtk-js/dist/esm"
-          } >> "$GITHUB_ENV"
-
-      - name: Build vtk.js at the pinned commit
-        # A shallow clone by branch cannot express "this exact commit", so fetch
-        # the sha itself and refuse to build anything else.
-        run: |
-          git init "$RUNNER_TEMP/vtk-js"
-          git -C "$RUNNER_TEMP/vtk-js" remote add origin "$VTKJS_FORK_REPO"
-          git -C "$RUNNER_TEMP/vtk-js" fetch --depth 1 origin "$VTKJS_FORK_COMMIT"
-          git -C "$RUNNER_TEMP/vtk-js" checkout --detach FETCH_HEAD
-          head="$(git -C "$RUNNER_TEMP/vtk-js" rev-parse HEAD)"
-          if [ "$head" != "$VTKJS_FORK_COMMIT" ]; then
-            echo "::error::vtk.js HEAD $head does not match the pinned $VTKJS_FORK_COMMIT"
-            exit 1
-          fi
-          (cd "$RUNNER_TEMP/vtk-js" && npm ci && npm run build:esm)
-
-      - run: npm ci
-      - run: npm run build
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild
+      - uses: ./.github/actions/setup-vtk
+      - run: npm run prepare
+      - run: npm run typecheck
+      - run: npm run verify:boundaries
       - run: npm run example:build
       - run: npm run verify:chain
+      - name: Install Chromium for packed-package rendering
+        run: npx playwright install --with-deps chromium
+      - name: Verify packed imports, workers and real VTK rendering
+        run: npm run verify:package
+      - name: Verify texture realization and decoder codecs in Chromium
+        run: npx vitest run --config vitest.browser.config.ts test/browser/meshAlpha.spec.ts test/browser/tiles3dDecodeWorker.spec.ts
 
   release:
     needs: [test, example-chain]
@@ -152,7 +132,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
       - name: Upgrade npm (trusted publishing needs >= 11.5.1)
         run: npm install -g npm@latest
-      - run: npm ci
+      - run: npm ci --ignore-scripts
+      - run: npm rebuild
+      - uses: ./.github/actions/setup-vtk
+      - run: npm run prepare
       - name: Release
         run: npx semantic-release
         env:

@@ -1,6 +1,6 @@
-# pointcloud-lod
+# tiled-vtkjs
 
-Governed point-cloud and 3D Tiles streaming for
+Adaptive level of detail for large 3D datasets in
 [vtk.js](https://kitware.github.io/vtk-js/).
 
 **Status: early development.** APIs are provisional and will change without
@@ -8,62 +8,87 @@ notice.
 
 ## What it is
 
-A standalone library that streams large point clouds and explicit or implicit
-3D Tiles 1.1 trees into vtk.js scenes. A shared scene coordinator governs frame time, memory,
+A standalone LOD runtime for large point clouds and supported explicit or implicit
+3D Tiles 1.1 trees in vtk.js scenes. A shared scene coordinator governs frame time, memory,
 submission work, interaction, and cross-member quality while each format owns
 its traversal and renderer adapter. Only content relevant to the current camera
 is fetched, decoded, and submitted. Decoded CPU payloads, renderer/GPU
 residency, and active draw are separate lifecycle states.
 
+Previously published as `pointcloud-lod`; this release uses the `tiled-vtkjs`
+identity and format-specific entry points.
+
 ## Install
 
 ```bash
-npm install pointcloud-lod
+npm install tiled-vtkjs
 ```
 
-To track unreleased work, install from GitHub instead — the `prepare` script
-builds `dist/` on install, so a git reference works with no extra steps:
+### Modules and renderer requirements
+
+This is one package with three internal modules. `core` owns neutral scene
+contracts, coordination, quality, memory, submission scheduling and geometry.
+`points` owns point traversal, progressive prefixes, picking and PCT1/COPC.
+`tiles3d` owns replacement traversal, subtree/content queues and glTF decoding.
+Each format keeps its own VTK adapter and workers. Core imports neither format
+nor vtk.js. Points and tiles3d depend on core and never import each other.
+
+| Import                              | Public API                                                                                                     |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `tiled-vtkjs` or `tiled-vtkjs/core` | Geometry/camera contracts, member registry/coordinator, quality governor, memory pool and submission scheduler |
+| `tiled-vtkjs/points`                | Point sources, controller, progressive ordering and picking contracts                                          |
+| `tiled-vtkjs/points/vtk`            | Point member and renderer adapter                                                                              |
+| `tiled-vtkjs/points/copc-worker`    | COPC module-worker endpoint                                                                                    |
+| `tiled-vtkjs/tiles3d`               | Supported tileset profile/configuration, decoder pool/types and coordinate helpers                             |
+| `tiled-vtkjs/tiles3d/vtk`           | Tiles member and mesh adapter                                                                                  |
+| `tiled-vtkjs/tiles3d/decode-worker` | Executable classic decoder worker artifact                                                                     |
+| `tiled-vtkjs/tiles3d/codecs/*`      | Draco and Basis JavaScript/WASM assets                                                                         |
+
+These subpaths isolate browser bundles. A core bundle has no format, codec or
+VTK imports; each format's neutral entry excludes VTK and the other format.
+Installation still includes both formats' dependencies. This initial layout
+uses one version and release unit, rather than three independently published
+packages. Examples, fixtures and replay tooling stay in the repository; the
+published package excludes executable tooling and examples. The checked source
+contract fixture remains included for consumer validation.
+
+The VTK entries require `vtkPointGaussianMapper` and compressed-texture support
+from [the fork](https://github.com/PaulHax/vtk-js) at the exact revision in
+[`vtkjs-fork.env`](./vtkjs-fork.env). Build it and make its ESM package and native
+declarations available as `@kitware/vtk.js` in the consuming project:
 
 ```bash
-npm install github:PaulHax/pointcloud-lod#<commit-sha>
+source ./vtkjs-fork.env
+# In a separate checkout of VTKJS_FORK_REPO at VTKJS_FORK_COMMIT:
+npm ci && npm run build:esm
+# In the consumer:
+mkdir -p node_modules/@kitware
+ln -s /absolute/path/to/vtk-js/dist/esm node_modules/@kitware/vtk.js
 ```
 
-### Requirements
+No npm vtk.js range is declared: registry releases cannot satisfy this fork
+contract. Neutral entry points need no VTK runtime or declarations. Adapter
+consumers use the fork's actual types, including its point mapper and texture
+extensions.
 
-The core, vtk.js adapters, and optional worker endpoints have separate entry points:
+For a source checkout, install tooling with `npm ci --ignore-scripts` followed
+by `npm rebuild` to run dependency install scripts. Link the built pinned VTK
+package as above, then run `npm run prepare`. Declaration
+emission uses its native types, so a Git install without that setup is not a
+supported shortcut.
 
-- **`pointcloud-lod`** — tile sources, LOD controller, and camera math. No
-  vtk.js dependency; runs standalone (e.g. in a worker or a test).
-- **`pointcloud-lod/vtk`** — the renderer adapter. This requires
-  `vtkPointGaussianMapper`, which is **not present in any released
-  `@kitware/vtk.js`**. Until it lands upstream you must build vtk.js from
-  [the fork](https://github.com/PaulHax/vtk-js) at the exact commit in
-  [`vtkjs-fork.env`](./vtkjs-fork.env) — the one commit this package's CI
-  builds and tests the example against:
-
-  ```bash
-  source ./vtkjs-fork.env
-  git clone "$VTKJS_FORK_REPO" vtk-js && cd vtk-js
-  git checkout "$VTKJS_FORK_COMMIT"
-  npm ci && npm run build:esm
-  ```
-
-- **`pointcloud-lod/copc-worker`** — the optional COPC worker endpoint. Pair it
-  with `createCopcWorkerTileSource` to keep range reads, LAZ decoding, and
-  point extraction off the interaction/render thread.
-- **`pointcloud-lod/tiles3d-decode-worker`** — the optional classic worker
-  endpoint for 3D Tiles decoding. The 3D Tiles member and mesh adapter are
-  exported from `pointcloud-lod/vtk` and use the same vtk.js fork.
-
-vtk.js is deliberately not declared as a peer dependency: no published version
-satisfies the adapter, so any semver range would be false.
+The old combined `/vtk`, `/copc-worker` and `/tiles3d-decode-worker` exports are
+removed. Point symbols formerly at the package root now come from `/points`;
+mesh configuration and decoder symbols now come from `/tiles3d`. See
+[the module and worker contracts](./docs/modules.md) for migration and service
+ownership.
 
 ## Usage
 
 ```js
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
-import { createCopcTileSource, createLodController } from "pointcloud-lod";
-import { createRendererAdapter } from "pointcloud-lod/vtk";
+import { createCopcTileSource, createLodController } from "tiled-vtkjs/points";
+import { createRendererAdapter } from "tiled-vtkjs/points/vtk";
 
 // A coalescing render request the host owns (must not render synchronously
 // more than once per event-loop turn).
@@ -98,7 +123,7 @@ const controller = createLodController({
 });
 
 // Feed the controller a plain camera description on every camera change. The
-// projection mode is explicit — an orthographic view carries `parallelScale`
+// projection mode is explicit; an orthographic view carries `parallelScale`
 // (the world-space half-height of the viewport) instead of `fovY`:
 controller.setCamera({
   projection: "perspective",
@@ -134,7 +159,7 @@ worker entry:
 
 ```js
 // copc.worker.js
-import { serveCopcTileSourceWorker } from "pointcloud-lod/copc-worker";
+import { serveCopcTileSourceWorker } from "tiled-vtkjs/points/copc-worker";
 
 serveCopcTileSourceWorker();
 ```
@@ -143,7 +168,7 @@ Then create the source from the main thread (serve `laz-perf.wasm` at the URL
 you provide):
 
 ```js
-import { createCopcWorkerTileSource } from "pointcloud-lod";
+import { createCopcWorkerTileSource } from "tiled-vtkjs/points";
 
 const source = await createCopcWorkerTileSource({
   source: "https://host/cloud.copc.laz", // Blob/File also works
@@ -361,8 +386,8 @@ needs:
   fixed/adaptive presentation, custom point-cloud camera interaction, local
   telemetry, and the diagnostic hooks exercised by the browser suite.
 
-Three more use the member API — `createStreamedSceneCoordinator` with
-`createTiles3dMember` and `createPointCloudMember` — which is what a scene of
+Three more use the member API; `createStreamedSceneCoordinator` with
+`createTiles3dMember` and `createPointCloudMember`; which is what a scene of
 more than one streamed dataset needs, and are the reference for it:
 
 - **Explorer** (`/`) is the page a visitor lands on: add any number of point
@@ -396,15 +421,16 @@ The mesh member deliberately accepts a narrow, typed 3D Tiles 1.1 profile:
 - `REPLACE` refinement, affine transforms, oriented `box` bounding volumes,
   and one glTF/GLB content per tile;
 - explicit trees, including contentless structural ancestors;
-- implicit `QUADTREE` roots with four subtree levels, relative same-root URI
+- implicit `QUADTREE` roots with four subtree levels, 1 to 31 available levels, relative same-root URI
   templates containing exactly one `{level}`, `{x}`, and `{y}` placeholder;
 - binary subtree version 1 with inline availability bitstreams and one
   tileset-schema property table supplying a required 12-component
   `TILE_BOUNDING_BOX` for every available tile. Metadata bounds override
   subdivision-derived bounds; missing or malformed bounds are errors;
 - glTF required extensions `KHR_draco_mesh_compression`, `KHR_texture_basisu`,
-  `KHR_materials_unlit`, and `KHR_mesh_quantization`. Other required extensions
+  `KHR_materials_unlit`, `KHR_mesh_quantization`, and `EXT_meshopt_compression`. Other required extensions
   fail as `TileUnsupportedExtensionError` with tile URI and decode stage.
+- glTF `TRIANGLES` and `TRIANGLE_STRIP` primitive modes; other primitive modes fail explicitly.
 
 Retired mesh resources stay attached but invisible while pooled, preserving vtk
 render nodes and GPU buffers/textures across reuse. They are excluded from draws
@@ -447,16 +473,16 @@ Fixed CSS-pixel diameter when comparing presentation policies.
 
 Its controls are all runtime, so one build loads any dataset:
 
-- **Point budget** — `Adaptive` gives the number to a `ViewGovernor`; `Fixed`
+- **Point budget**; `Adaptive` gives the number to a `ViewGovernor`; `Fixed`
   gives it straight to `setPointBudget`.
-- **Point size** — `Fixed` directly controls the CSS-pixel diameter; `Auto`
+- **Point size**; `Fixed` directly controls the CSS-pixel diameter; `Auto`
   controls the density-derived diameter's scale and defaults to `0.5×`.
-- **Moving / settled target** — the two regimes' frame-time targets. Changing
+- **Moving / settled target**; the two regimes' frame-time targets. Changing
   either replaces the governor, since the library fixes its options at
   construction.
-- **Maximum budget** — the optional configured maximum. Blank leaves the
+- **Maximum budget**; the optional configured maximum. Blank leaves the
   memory-derived ceiling as the only upper bound.
-- **Projection** — perspective or orthographic, preserving the world height the
+- **Projection**; perspective or orthographic, preserving the world height the
   viewport covers, so the only thing a toggle changes is the law selection
   refines by (an orthographic zoom moves `parallelScale`, not the eye).
 
@@ -465,7 +491,7 @@ regime and what is holding it, explicit versus inferred motion, target frame
 time, median interval and late-frame share, sample count, adaptive track budget, configured
 maximum, memory ceiling, aggregate view budget, this cloud's share, the last
 adjustment and its reason, the binding constraint, and the physical tile and
-hierarchy work counts — next to the controller's selection, decoded-memory,
+hierarchy work counts; next to the controller's selection, decoded-memory,
 GPU-residency and frame-time statistics. The current moving, settling, or
 settled status is the first row of that budget chain.
 
@@ -480,7 +506,7 @@ timing is unavailable. The page repaints while `needsFrame()` is true.
 `setBudgetMode()` and `dispose()` for browser tests.
 
 Install a vtk.js build containing `vtkPointGaussianMapper` as described in
-[Requirements](#requirements), then run:
+[renderer requirements](#modules-and-renderer-requirements), then run:
 
 ```bash
 npm run example
@@ -525,7 +551,7 @@ benchmarks. On a WSLg machine with GPU forwarding, run the telemetry check in a
 headed hardware browser with:
 
 ```bash
-POINTCLOUD_LOD_BROWSER_GPU=1 npm run test:browser -- test/browser/telemetry.spec.ts
+TILED_VTKJS_BROWSER_GPU=1 npm run test:browser -- test/browser/telemetry.spec.ts
 ```
 
 That mode asserts the reported renderer is not software, so a silent fallback
@@ -536,8 +562,8 @@ orbit sweep, near-horizontal local pan, and return to overview, supply a cloud U
 and optional artifact path:
 
 ```bash
-POINTCLOUD_LOD_TELEMETRY_URL='https://example.test/cloud.copc.laz' \
-POINTCLOUD_LOD_TELEMETRY_OUT='artifacts/telemetry/cloud.json' \
+TILED_VTKJS_TELEMETRY_URL='https://example.test/cloud.copc.laz' \
+TILED_VTKJS_TELEMETRY_OUT='artifacts/telemetry/cloud.json' \
 VTK_JS_DIR=/path/to/vtk-js/dist/esm \
 npm run telemetry:capture
 ```
@@ -549,18 +575,18 @@ By default, the first run caches the complete COPC under
 local file with deterministic 40 ms request latency and an 80 Mbps per-request
 transfer rate. This removes changing WAN conditions while preserving range
 traffic, concurrency, cancellation, decoding, and rendering. Adjust the replay
-with `POINTCLOUD_LOD_TELEMETRY_LATENCY_MS` and
-`POINTCLOUD_LOD_TELEMETRY_MBPS`, force a new download with
-`POINTCLOUD_LOD_TELEMETRY_REFRESH=1`, or select the original remote behavior
-with `POINTCLOUD_LOD_TELEMETRY_NETWORK=live`.
+with `TILED_VTKJS_TELEMETRY_LATENCY_MS` and
+`TILED_VTKJS_TELEMETRY_MBPS`, force a new download with
+`TILED_VTKJS_TELEMETRY_REFRESH=1`, or select the original remote behavior
+with `TILED_VTKJS_TELEMETRY_NETWORK=live`.
 
 The same scenario can compare the optional governor with the conventional
 fixed-budget policy:
 
 ```bash
-POINTCLOUD_LOD_TELEMETRY_BUDGET_MODE=fixed \
-POINTCLOUD_LOD_TELEMETRY_POINT_BUDGET=5000000 \
-POINTCLOUD_LOD_TELEMETRY_INTERACTION_DENSITY=0.6 \
+TILED_VTKJS_TELEMETRY_BUDGET_MODE=fixed \
+TILED_VTKJS_TELEMETRY_POINT_BUDGET=5000000 \
+TILED_VTKJS_TELEMETRY_INTERACTION_DENSITY=0.6 \
 npm run telemetry:capture
 ```
 
@@ -575,8 +601,8 @@ the opt-in `test:perf`/`telemetry:capture` commands, and is excluded from normal
 unit and browser test runs. If no URL is supplied, the capture skips.
 
 Remote URLs must allow cross-origin `Range` requests. Raw LAS/LAZ is not
-streamable by the COPC source; convert it with a proven native COPC writer —
-PDAL's `writers.copc` or `untwine` — which is also what server-side preparation
+streamable by the COPC source; convert it with a proven native COPC writer
+PDAL's `writers.copc` or `untwine`; which is also what server-side preparation
 pipelines should run. No JavaScript/browser COPC writer is used or accepted
 here, not even as a development dependency: the one evaluated preserved the
 point count but silently rewrote RGB point format 7 as non-RGB format 6.
@@ -659,11 +685,8 @@ moving and expresses the interaction allocation as parent-closed per-tile
 prefixes.
 
 ```js
-import {
-  createMemoryPool,
-  createStreamedSceneCoordinator,
-} from "pointcloud-lod";
-import { createPointCloudMember } from "pointcloud-lod/vtk";
+import { createMemoryPool, createStreamedSceneCoordinator } from "tiled-vtkjs";
+import { createPointCloudMember } from "tiled-vtkjs/points/vtk";
 
 const coordinator = createStreamedSceneCoordinator({
   scheduleRender,
@@ -686,13 +709,13 @@ coordinator.beginInteraction();
 // ...camera moves...
 coordinator.endInteraction();
 
-// Motion the host cannot announce — playback, scrubbing, programmatic
-// animation — is classified by the governor. Hand it the camera each view
+// Motion the host cannot announce; playback, scrubbing, programmatic
+// animation; is classified by the governor. Hand it the camera each view
 // actually rendered, once per rendered frame, keyed by anything stable:
 coordinator.noteRenderedCameras(new Map([[renderer, view]]));
 // It owns the jitter epsilon, ignores the clip-z row a host rewrites when
 // tiles arrive, holds one inferred motion reference for the whole burst, and
-// releases it after the debounce — asking for one frame back, because the
+// releases it after the debounce; asking for one frame back, because the
 // settled regime cannot refine quality it never measures. A scene change with
 // an unchanged camera is not motion.
 
@@ -721,14 +744,14 @@ accounting but bypass normalized quality allocation.
 
 `coordinator.stats()` reports the normalized view fraction, target-override
 member, governor motion/samples, byte allocations, and each member's neutral
-inputs. Point-specific diagnostics—including configured point ceiling and
-effective full point ceiling—live on `PointCloudMember.stats()`.
+inputs. Point-specific diagnostics including configured point ceiling and
+effective full point ceiling live on `PointCloudMember.stats()`.
 
 ## Picking
 
 `controller.pickPoint(view, cursorXCssPx, cursorYCssPx)` resolves a cursor to
 a point **on the cursor ray** at the support depth of the frontmost rendered
-sample near the cursor — it never snaps to the vertex itself. The query runs
+sample near the cursor; it never snaps to the vertex itself. The query runs
 only over the tile set last submitted to the renderer (WYSIWYG: what is not
 drawn cannot be picked), and answers
 
@@ -736,7 +759,7 @@ drawn cannot be picked), and answers
 - `{ status: "miss" }` for a valid sweep that found no sample within any
   pick bucket, or
 - `null` when the query is unavailable (inactive/disposed controller, invalid
-  camera or viewport, singular view-projection, non-finite cursor) — never to
+  camera or viewport, singular view-projection, non-finite cursor); never to
   be conflated with a miss.
 
 Candidates gather in escalating css-pixel buckets around the cursor; the
@@ -757,7 +780,7 @@ TileSource  ──▶  LOD controller  ──▶  renderer adapter
                   budget, LRU)
 ```
 
-- **TileSource** — abstract interface over an octree tile store: dataset
+- **TileSource**; abstract interface over an octree tile store: dataset
   metadata, hierarchy pages with conservative render-space bounds and effective
   spacing for every node, and per-node point payloads. Two
   implementations ship:
@@ -771,7 +794,7 @@ TileSource  ──▶  LOD controller  ──▶  renderer adapter
     HTTP protocol with a compact binary tile format (`PCT1`: Float64 tile
     origin + tile-local Float32 positions + Uint8 RGB) for servers that
     reproject or transform points per tile.
-- **LOD controller** (`createLodController`) — decides which nodes are
+- **LOD controller** (`createLodController`); decides which nodes are
   resident: frustum culling, 3D centre-ray cone priority with projected-detail
   tie-breaking, and a visible-point budget with a parent-closed selection
   invariant (COPC hierarchies are
@@ -793,16 +816,17 @@ TileSource  ──▶  LOD controller  ──▶  renderer adapter
   branches. Auto sizing follows each terminal's effective prefix density, and
   CPU picking examines the same per-tile plan the renderer draws. Two CSS
   pixels is the seed before any selected frontier exists. Tiles arrive already
-  in progressive order — every source shuffles a tile once, deterministically,
-  as it decodes it, which for the worker-backed source is off the main thread —
+  in progressive order; every source shuffles a tile once, deterministically,
+  as it decodes it, which for the worker-backed source is off the main thread,
   keeping arbitrary COPC record order from biasing early prefixes.
-- **Renderer adapter** (`createRendererAdapter`) — turns tile batches into
+- **Renderer adapter** (`createRendererAdapter`); turns tile batches into
   vtk.js actors, one `vtkPolyData` + `vtkPointGaussianMapper` per tile
   (one gl.POINTS vertex per point, no cell topology), with an anchor base
-  matrix composed onto each tile's origin translation. Both point and mesh
-  adapters import `@kitware/vtk.js` through the separate
-  `pointcloud-lod/vtk` entry point. The `vtkPointGaussianMapper` it uses is
-  not yet in a released vtk.js — see [Requirements](#requirements).
+  matrix composed onto each tile's origin translation. The point adapter is
+  exported from `tiled-vtkjs/points/vtk`; the mesh adapter is exported from
+  `tiled-vtkjs/tiles3d/vtk`. Both import the pinned `@kitware/vtk.js` fork.
+  The `vtkPointGaussianMapper` the point adapter uses is
+  not yet in a released vtk.js; see [renderer requirements](#modules-and-renderer-requirements).
   CSS diameter stays separate from framebuffer density: the adapter applies
   device pixel ratio through the mapper at the final rendering boundary.
   `applyDrawPlan` changes each mapper's draw count while its complete
@@ -812,7 +836,7 @@ TileSource  ──▶  LOD controller  ──▶  renderer adapter
   a draw switch that keeps every actor alive (batches still apply while
   hidden, so showing again restores exactly the submitted set), while
   releasing a hidden cloud's tiles is the controller's `setActive(false)`.
-- **View governor** (`createViewGovernor`) — one format-neutral normalized
+- **View governor** (`createViewGovernor`); one format-neutral normalized
   fraction per adaptive view. It owns frame-time learning, motion, capacity
   eligibility, and nothing point- or memory-specific. The streamed-scene
   coordinator demand-caps and water-fills that fraction across members while

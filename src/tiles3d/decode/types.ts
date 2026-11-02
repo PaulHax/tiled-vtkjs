@@ -1,4 +1,4 @@
-import type { Mat4 } from "../../mat4";
+import type { Mat4 } from "../../core/mat4";
 
 export type CompressedTextureFormat =
   | "astc-4x4"

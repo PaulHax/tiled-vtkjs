@@ -12,7 +12,7 @@
  */
 
 import type { Browser, BrowserContext, Page } from "playwright";
-import type { StreamedSceneCoordinatorStats } from "../../src/streamedSceneCoordinator";
+import type { StreamedSceneCoordinatorStats } from "../../src/core/streamedSceneCoordinator";
 import { sceneConverged } from "../../scripts/sceneConvergence.mjs";
 
 import {

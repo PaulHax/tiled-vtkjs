@@ -11,8 +11,8 @@
  * Run over every cloud under test, like the rest of the matrix. The committed
  * fixtures are selected whole, so on them the projection arithmetic is all
  * that can be proved; a deep cloud supplied through
- * POINTCLOUD_LOD_BROWSER_CLOUDS is what makes refinement-on-zoom — the branch
- * this file is named for — actually run.
+ * TILED_VTKJS_BROWSER_CLOUDS is what makes the refinement-on-zoom branch
+ * actually run.
  */
 
 import { afterAll, describe, expect, it } from "vitest";
@@ -75,7 +75,7 @@ describe("an orthographic camera in a real projection", () => {
       // but only a cloud holding more detail than the coarse view selected has
       // anywhere to descend to, so the committed fixtures prove the projection
       // arithmetic above and nothing here. A cloud supplied through
-      // POINTCLOUD_LOD_BROWSER_CLOUDS proves both.
+      // TILED_VTKJS_BROWSER_CLOUDS proves both.
       //
       // Note the point count is NOT monotonic in zoom, and no check here may
       // assume it is: halving the parallel scale halves the world height the

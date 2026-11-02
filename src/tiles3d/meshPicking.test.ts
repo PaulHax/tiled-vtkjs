@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { CameraView } from "../camera";
+import type { CameraView } from "../core/camera";
 import {
   createMeshPickSet,
   pickSubmittedTriangles,

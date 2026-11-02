@@ -1,0 +1,52 @@
+name: Set up pinned vtk.js
+description: Build and link the exact vtk.js runtime and declarations required by the adapters
+
+runs:
+  using: composite
+  steps:
+    - name: Read the pinned vtk.js commit
+      shell: bash
+      run: |
+        set -euo pipefail
+        set -a
+        . ./vtkjs-fork.env
+        set +a
+        if [[ ! "$VTKJS_FORK_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "::error::VTKJS_FORK_COMMIT must be a full commit SHA"
+          exit 1
+        fi
+        {
+          echo "VTKJS_FORK_REPO=$VTKJS_FORK_REPO"
+          echo "VTKJS_FORK_COMMIT=$VTKJS_FORK_COMMIT"
+          echo "VTK_JS_DIR=$RUNNER_TEMP/vtk-js/dist/esm"
+        } >> "$GITHUB_ENV"
+
+    - name: Fetch the exact vtk.js source
+      shell: bash
+      run: |
+        set -euo pipefail
+        git init "$RUNNER_TEMP/vtk-js"
+        git -C "$RUNNER_TEMP/vtk-js" remote add origin "$VTKJS_FORK_REPO"
+        git -C "$RUNNER_TEMP/vtk-js" fetch --depth 1 origin "$VTKJS_FORK_COMMIT"
+        git -C "$RUNNER_TEMP/vtk-js" checkout --detach FETCH_HEAD
+        resolved_commit="$(git -C "$RUNNER_TEMP/vtk-js" rev-parse HEAD)"
+        if [ "$resolved_commit" != "$VTKJS_FORK_COMMIT" ]; then
+          echo "::error::vtk.js HEAD $resolved_commit does not match $VTKJS_FORK_COMMIT"
+          exit 1
+        fi
+
+    - name: Build vtk.js and its native declarations
+      shell: bash
+      working-directory: ${{ runner.temp }}/vtk-js
+      run: |
+        npm ci
+        npm run build:esm
+
+    - name: Link the pinned adapter dependency
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -s "$VTK_JS_DIR/Rendering/Core/PointGaussianMapper.d.ts"
+        test -s "$VTK_JS_DIR/Rendering/Core/Texture.d.ts"
+        mkdir -p node_modules/@kitware
+        ln -s "$VTK_JS_DIR" node_modules/@kitware/vtk.js

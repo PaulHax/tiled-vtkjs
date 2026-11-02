@@ -14,7 +14,7 @@
  * datasets change while the harness is attached stays described by it.
  */
 
-import type { PointCloudMemberStats } from "../../../src/pointCloudMember";
+import type { PointCloudMemberStats } from "../../../src/points/pointCloudMember";
 import type { Tiles3dMemberStats } from "../../../src/tiles3d/memberTypes";
 import type { SceneHost } from "../scene/host";
 

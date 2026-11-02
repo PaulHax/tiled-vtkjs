@@ -17,6 +17,8 @@
 
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
+import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
+import type { Bounds as VtkBounds } from "@kitware/vtk.js/types";
 import { getCompressedTextureCapabilities } from "@kitware/vtk.js/Rendering/OpenGL/Texture/compressedFormats";
 
 import {
@@ -24,8 +26,9 @@ import {
   createStreamedSceneCoordinator,
   type CameraView,
   type StreamedSceneCoordinator,
-  type TextureCapabilities,
 } from "../../../src";
+import type { TextureCapabilities } from "../../../src/tiles3d/decode";
+import type { Tiles3dMemberServices } from "../../../src/tiles3d/memberTypes";
 import { WORLD_UP, installCameraControls } from "../cameraControls";
 import { createGpuFrameTimer, type GpuFrameTimer } from "../gpuTimer";
 import { isSoftwareRenderer } from "../softwareRenderer";
@@ -74,7 +77,7 @@ export type SceneHost = {
   readonly coordinator: StreamedSceneCoordinator;
   readonly renderer: unknown;
   readonly camera: any;
-  readonly textureCapabilities: TextureCapabilities;
+  readonly tiles3dServices: Tiles3dMemberServices;
   readonly rendererName: string;
   /** The live WebGL context, for callers that report on the machine drawing. */
   glContext(): WebGL2RenderingContext | null;
@@ -162,9 +165,14 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
     background: [0.08, 0.09, 0.11],
   });
   const renderer = fullScreen.getRenderer();
-  const renderWindow = fullScreen.getRenderWindow();
-  const openGlRenderWindow = fullScreen.getApiSpecificRenderWindow();
-  const interactor = renderWindow.getInteractor();
+  const openGlRenderWindow =
+    fullScreen.getApiSpecificRenderWindow() as ReturnType<
+      typeof fullScreen.getApiSpecificRenderWindow
+    > &
+      Pick<vtkOpenGLRenderWindow, "getCanvas"> & {
+        getContext(): WebGL2RenderingContext | null;
+      };
+  const interactor = fullScreen.getInteractor();
   const camera = renderer.getActiveCamera();
 
   /**
@@ -192,12 +200,16 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
     interactor,
     renderer,
     viewer: container,
-    canvas: () => openGlRenderWindow.getCanvas(),
+    canvas: () => {
+      const canvas = openGlRenderWindow.getCanvas();
+      if (!canvas) throw new Error("The render window has no canvas");
+      return canvas;
+    },
     sceneRadius,
   });
 
   const { capabilities, rendererName } = probeTextureCapabilities(
-    openGlRenderWindow.getContext?.() ?? null,
+    openGlRenderWindow.getContext(),
   );
 
   let currentDevicePixelRatio = window.devicePixelRatio;
@@ -256,7 +268,7 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
         );
       }
     }
-    renderer.resetCameraClippingRange(bounds);
+    renderer.resetCameraClippingRange(bounds as VtkBounds);
   };
   const refreshClippingRange = (): void => {
     visibleBounds = sceneIsEmpty()
@@ -281,7 +293,7 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
   const gpuGroupByQuery = new Map<number, number>();
 
   const gpuTimer: GpuFrameTimer = createGpuFrameTimer(
-    openGlRenderWindow.getContext?.() ?? null,
+    openGlRenderWindow.getContext(),
     {
       onResult: (result) => {
         const groupId = gpuGroupByQuery.get(result.id);
@@ -330,11 +342,14 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
     });
   };
 
+  const tiles3dServices: Tiles3dMemberServices = {
+    workers: createDecodeWorkers(),
+    textureCapabilities: capabilities,
+  };
+
   const coordinator = createStreamedSceneCoordinator({
     scheduleRender,
     memory: createMemoryPool(),
-    workers: createDecodeWorkers(),
-    textureCapabilities: capabilities,
     devicePixelRatio: currentDevicePixelRatio,
   });
 
@@ -468,9 +483,9 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
     coordinator,
     renderer,
     camera,
-    textureCapabilities: capabilities,
+    tiles3dServices,
     rendererName,
-    glContext: () => openGlRenderWindow.getContext?.() ?? null,
+    glContext: () => openGlRenderWindow.getContext(),
     scheduleRender,
     cameraView,
     onBeforeFrame: (listener) => beforeFrameListeners.push(listener),

@@ -1,6 +1,6 @@
 // @ts-check
 
-/** @typedef {Pick<import('../src/streamedSceneCoordinator').StreamedSceneCoordinatorStats, 'governor' | 'members' | 'submissions'>} Coordinator */
+/** @typedef {Pick<import('../src/core/streamedSceneCoordinator').StreamedSceneCoordinatorStats, 'governor' | 'members' | 'submissions'>} Coordinator */
 
 /**
  * Shared by the live replay wait and the offline settle-marker check.

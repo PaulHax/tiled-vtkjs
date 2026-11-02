@@ -1,17 +1,26 @@
 /** vtk.js-only realization of renderer-neutral decoded mesh tiles. */
 
 import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
-import vtkPolyData from "@kitware/vtk.js/Common/DataModel/PolyData";
-import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
-import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
-import vtkTexture from "@kitware/vtk.js/Rendering/Core/Texture";
+import vtkPolyData, {
+  type vtkPolyData as VtkPolyData,
+} from "@kitware/vtk.js/Common/DataModel/PolyData";
+import vtkActor, {
+  type vtkActor as VtkActor,
+} from "@kitware/vtk.js/Rendering/Core/Actor";
+import vtkMapper, {
+  type vtkMapper as VtkMapper,
+} from "@kitware/vtk.js/Rendering/Core/Mapper";
+import vtkTexture, {
+  type vtkTexture as VtkTexture,
+  type TextureSampler,
+} from "@kitware/vtk.js/Rendering/Core/Texture";
 
 import {
   type Submission,
   type SubmissionScheduler,
-} from "../submissionScheduler";
-import { IDENTITY, translatedMatrix, type Mat16 } from "../mat4";
-import { safeCall } from "../observers";
+} from "../core/submissionScheduler";
+import { IDENTITY, translatedMatrix, type Mat16 } from "../core/mat4";
+import { safeCall } from "../core/observers";
 import type {
   DecodedPrimitive,
   DecodedTexture,
@@ -131,9 +140,9 @@ export type MeshAdapter = {
 };
 
 type PrimitiveResources = {
-  readonly actor: any;
-  readonly mapper: any;
-  readonly polyData: any;
+  readonly actor: VtkActor;
+  readonly mapper: VtkMapper;
+  readonly polyData: VtkPolyData;
   /** Exact charged position/index arrays submitted to VTK and used for picks. */
   readonly primitive: SubmittedMeshPrimitive;
 };
@@ -145,7 +154,7 @@ type TileResources = {
   bounds?: { min: [number, number, number]; max: [number, number, number] };
   readonly primitiveCount: number;
   readonly primitives: PrimitiveResources[];
-  readonly textures: Set<any>;
+  readonly textures: Set<VtkTexture>;
   readonly geometryBytes: number;
   readonly textureBytes: number;
   readonly formats: Set<string>;
@@ -243,7 +252,7 @@ const VTK_WRAP_MODES = {
   10497: "repeat",
 } as const;
 
-const vtkSampler = (sampler: DecodedTexture["sampler"]) => ({
+const vtkSampler = (sampler: DecodedTexture["sampler"]): TextureSampler => ({
   magFilter: sampler.magFilter === 9728 ? "nearest" : "linear",
   minFilter: VTK_MIN_FILTERS[sampler.minFilter],
   wrapS: VTK_WRAP_MODES[sampler.wrapS],
@@ -507,7 +516,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     tile.attached = false;
   };
 
-  const createTexture = (decoded: DecodedTexture): any => {
+  const createTexture = (decoded: DecodedTexture): VtkTexture => {
     const texture = vtkTexture.newInstance();
     try {
       texture.setSampler(vtkSampler(decoded.sampler));
@@ -525,7 +534,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           // hardware than in a software-GL run. Both paths stay linear until
           // the fork owns a real sRGB workflow end to end.
           srgb: false,
-          levels: decoded.levels,
+          levels: [...decoded.levels],
         });
       } else {
         texture.setJsImageData(rgbaImageData(decoded));
@@ -541,12 +550,12 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   const createPrimitive = (
     tile: TileResources,
     primitive: DecodedPrimitive,
-    textures: Map<DecodedTexture, any>,
+    textures: Map<DecodedTexture, VtkTexture>,
     pickAlphaTextures: Map<DecodedTexture, PickAlphaTexture>,
   ): void => {
-    let polyData: any;
-    let mapper: any;
-    let actor: any;
+    let polyData: VtkPolyData | undefined;
+    let mapper: VtkMapper | undefined;
+    let actor: VtkActor | undefined;
     try {
       polyData = vtkPolyData.newInstance();
       polyData.getPoints().setData(primitive.positions, 3);
@@ -717,7 +726,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   };
 
   const attach = (tile: TileResources): void => {
-    const added: any[] = [];
+    const added: VtkActor[] = [];
     try {
       for (const primitive of tile.primitives) {
         setActorState(tile, primitive);
@@ -866,7 +875,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     holdPending(entry);
     for (const replacementId of normalizedReplacements)
       replacementClaims.set(replacementId, id);
-    const textures = new Map<DecodedTexture, any>();
+    const textures = new Map<DecodedTexture, VtkTexture>();
     const pickAlphaTextures = new Map<DecodedTexture, PickAlphaTexture>();
     const enqueue = (bytes: number, run: () => void, atomic = false): void => {
       entry.remainingJobs += 1;

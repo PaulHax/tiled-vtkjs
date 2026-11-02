@@ -35,7 +35,7 @@ export type RenderMode = "software" | "gpu";
 
 /** The mode a run asked for, as the environment states it. */
 export const requestedRenderMode = (): RenderMode =>
-  (process.env.POINTCLOUD_LOD_BROWSER_GPU ?? "") !== "" ? "gpu" : "software";
+  (process.env.TILED_VTKJS_BROWSER_GPU ?? "") !== "" ? "gpu" : "software";
 
 const browsers = new Map<RenderMode, Browser>();
 

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "recordedAt": "2026-08-19T20:27:55.157Z",
-  "label": "pointcloud-lod 3D Tiles explorer",
+  "label": "tiled-vtkjs 3D Tiles explorer",
   "href": "http://localhost:5173/mesh/?record=1&place=Rotterdam+%E2%80%94+Kop+van+Zuid",
   "viewer": {
     "widthCssPx": 1172,

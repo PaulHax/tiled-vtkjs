@@ -1,4 +1,4 @@
-import { affineProblem, multiply, type Mat4 } from "../mat4";
+import { affineProblem, multiply, type Mat4 } from "../core/mat4";
 
 export type Vec3 = [number, number, number];
 

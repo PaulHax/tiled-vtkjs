@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { IDENTITY, transformPoint, type Mat4 } from "../mat4";
+import { IDENTITY, transformPoint, type Mat4 } from "../core/mat4";
 import {
   createEcefToEnuTransform,
   createVerticalExaggerationTransform,

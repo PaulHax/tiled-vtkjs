@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { transformPoint, type Mat4 } from "../../../src/mat4";
+import { transformPoint, type Mat4 } from "../../../src/core/mat4";
 import { wgs84ToEcef } from "../../../src/tiles3d/rtc";
 import { PLACES, ecefToEnu, rdToScene } from "./places";
 

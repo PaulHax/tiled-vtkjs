@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "recordedAt": "2026-08-19T20:26:38.205Z",
-  "label": "pointcloud-lod dataset explorer",
+  "label": "tiled-vtkjs dataset explorer",
   "href": "http://localhost:5173/?record=1&url=https%3A%2F%2Fopen-lidar-data.s3.eu-central-1.amazonaws.com%2Fdata%2FLU%2FGouvernement_LUX%2FLidar_2019%2Fcopc%2FLIDAR2019_NdP_54500_98500_EPSG2169.copc.laz",
   "viewer": {
     "widthCssPx": 1172,

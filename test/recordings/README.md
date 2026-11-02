@@ -73,7 +73,7 @@ network could not answer.
 
 ### Choosing what to compare
 
-`POINTCLOUD_LOD_REPLAY_CONFIGS` points at a JSON file of setting sweeps.
+`TILED_VTKJS_REPLAY_CONFIGS` points at a JSON file of setting sweeps.
 Sections left out keep the page's own defaults, and each is applied through the
 same control a hand would use:
 
@@ -96,12 +96,12 @@ same control a hand would use:
 Streaming decisions exist to hide latency, so the network is part of the
 measurement rather than something to eliminate:
 
-- `POINTCLOUD_LOD_REPLAY_NETWORK=live` — the real internet, real conditions,
+- `TILED_VTKJS_REPLAY_NETWORK=live`: the real internet, real conditions,
   and a different set of them every run.
 - `=record` — the real internet, keeping every response under
-  `POINTCLOUD_LOD_REPLAY_CACHE_DIR`.
+  `TILED_VTKJS_REPLAY_CACHE_DIR`.
 - `=replay` (default) — serve what was recorded, at
-  `POINTCLOUD_LOD_REPLAY_LATENCY_MS` and `POINTCLOUD_LOD_REPLAY_MBPS`. A
+  `TILED_VTKJS_REPLAY_LATENCY_MS` and `TILED_VTKJS_REPLAY_MBPS`. A
   request nothing recorded fails the run rather than quietly reaching for the
   network mid-measurement.
 
@@ -151,7 +151,7 @@ along exactly the same route. That lateness is the thing being measured.
 
 ### Without a GPU
 
-`POINTCLOUD_LOD_REPLAY_ALLOW_SOFTWARE=1` runs the whole pipeline headless on a
+`TILED_VTKJS_REPLAY_ALLOW_SOFTWARE=1` runs the whole pipeline headless on a
 software rasteriser. It is for checking that the benchmark still works, never
 for measuring: every artifact it writes records `softwareRenderer: true` and
 the analysis prints that in place of a headline number.

@@ -1,7 +1,7 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkGenericRenderWindow from "@kitware/vtk.js/Rendering/Misc/GenericRenderWindow";
 
-import { createSubmissionScheduler } from "../../src/submissionScheduler";
+import { createSubmissionScheduler } from "../../src/core/submissionScheduler";
 import { createMeshAdapter } from "../../src/tiles3d/meshAdapter";
 import { createMeshPickSet } from "../../src/tiles3d/meshPicking";
 

@@ -1,31 +1,34 @@
 {
-  "name": "pointcloud-lod",
+  "name": "tiled-vtkjs",
   "version": "0.0.0-development",
-  "description": "Governed point-cloud and 3D Tiles streaming for vtk.js",
+  "description": "Adaptive level of detail for large 3D datasets in vtk.js",
   "keywords": [
     "3d-tiles",
     "copc",
+    "level-of-detail",
     "lod",
     "octree",
     "point-cloud",
     "streaming",
+    "tiling",
     "vtk",
     "vtk.js",
     "webgl"
   ],
-  "homepage": "https://github.com/PaulHax/pointcloud-lod#readme",
+  "homepage": "https://github.com/PaulHax/tiled-vtkjs#readme",
   "bugs": {
-    "url": "https://github.com/PaulHax/pointcloud-lod/issues"
+    "url": "https://github.com/PaulHax/tiled-vtkjs/issues"
   },
   "license": "MIT",
   "author": "Paul Elliott",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PaulHax/pointcloud-lod.git"
+    "url": "git+https://github.com/PaulHax/tiled-vtkjs.git"
   },
   "files": [
     "dist",
     "src",
+    "docs",
     "!src/**/*.test.ts",
     "test/fixtures/tiles3d-source-contract.json",
     "vtkjs-fork.env"
@@ -37,16 +40,35 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./vtk": {
-      "types": "./dist/vtk.d.ts",
-      "import": "./dist/vtk.js"
+    "./core": {
+      "types": "./dist/core/index.d.ts",
+      "import": "./dist/core.js"
     },
-    "./copc-worker": {
-      "types": "./dist/copcWorker.d.ts",
+    "./points": {
+      "types": "./dist/points/index.d.ts",
+      "import": "./dist/points.js"
+    },
+    "./points/vtk": {
+      "types": "./dist/points/vtk.d.ts",
+      "import": "./dist/points-vtk.js"
+    },
+    "./points/copc-worker": {
+      "types": "./dist/points/copcWorker.d.ts",
       "import": "./dist/copcWorker.js"
     },
-    "./tiles3d-decode-worker": {
+    "./tiles3d": {
+      "types": "./dist/tiles3d/index.d.ts",
+      "import": "./dist/tiles3d.js"
+    },
+    "./tiles3d/vtk": {
+      "types": "./dist/tiles3d/vtk.d.ts",
+      "import": "./dist/tiles3d-vtk.js"
+    },
+    "./tiles3d/decode-worker": {
       "default": "./dist/tiles3dDecodeWorker.classic.js"
+    },
+    "./tiles3d/codecs/*": {
+      "default": "./dist/tiles3d-codecs/*"
     }
   },
   "scripts": {
@@ -61,14 +83,16 @@
     "example:build": "vite build --config examples/vtk/vite.config.ts",
     "test:browser": "npm run build && npm run example:build && vitest run --config vitest.browser.config.ts",
     "test:perf": "npm run example:build && vitest run --config vitest.perf.config.ts",
-    "telemetry:capture": "POINTCLOUD_LOD_BROWSER_GPU=1 npm run test:perf -- test/browser/telemetry-capture.perf.spec.ts",
-    "bench:replay": "npm run build && npm run example:build && POINTCLOUD_LOD_BROWSER_GPU=1 vitest run --config vitest.perf.config.ts test/browser/replay.perf.spec.ts",
+    "telemetry:capture": "TILED_VTKJS_BROWSER_GPU=1 npm run test:perf -- test/browser/telemetry-capture.perf.spec.ts",
+    "bench:replay": "npm run build && npm run example:build && TILED_VTKJS_BROWSER_GPU=1 vitest run --config vitest.perf.config.ts test/browser/replay.perf.spec.ts",
     "bench:analyze": "node scripts/analyzeReplay.mjs",
     "trace:analyze": "node scripts/analyzeTrace.mjs",
     "fixture:tiles3d": "node scripts/generateTiles3dFixture.mjs",
     "fixture:meshopt": "node scripts/generateMeshoptFixtures.mjs",
     "verify:chain": "node scripts/verifyChain.mjs",
-    "prepare": "npm run build && node .husky/install.mjs"
+    "prepare": "npm run build && node .husky/install.mjs",
+    "verify:boundaries": "node scripts/checkBoundaries.mjs",
+    "verify:package": "node scripts/verifyPackage.mjs"
   },
   "dependencies": {
     "@loaders.gl/core": "4.4.4",
@@ -76,6 +100,7 @@
     "@loaders.gl/gltf": "4.4.4",
     "@loaders.gl/textures": "4.4.4",
     "@loaders.gl/worker-utils": "4.4.4",
+    "@types/emscripten": "1.41.6",
     "copc": "^0.0.8",
     "ktx-parse": "0.7.1",
     "laz-perf": "^0.0.7"

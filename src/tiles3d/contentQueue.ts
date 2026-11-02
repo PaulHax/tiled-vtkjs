@@ -1,7 +1,7 @@
 /** Bounded, revision-safe fetch/decode queue for renderer-neutral tile content. */
 
-import { finiteAtLeast, integerAtLeast } from "../numeric";
-import { safeCall } from "../observers";
+import { finiteAtLeast, integerAtLeast } from "../core/numeric";
+import { safeCall } from "../core/observers";
 
 const MAX_EVICTION_HISTORY = 4_096;
 

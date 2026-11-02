@@ -1,6 +1,6 @@
 /**
  * The matrix runs over whatever clouds this machine has: the committed fixture
- * always, plus anything `POINTCLOUD_LOD_BROWSER_CLOUDS` supplies. That makes
+ * always, plus anything `TILED_VTKJS_BROWSER_CLOUDS` supplies. That makes
  * the harness's own reach a thing worth checking first — a scenario failing
  * because a supplied cloud never opened would otherwise read as a library
  * defect.

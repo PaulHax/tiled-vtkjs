@@ -662,7 +662,7 @@ describe("a projection toggled under a moving camera", () => {
 
           // The committed fixture is small enough that every framing selects it
           // whole, so here this proves the churn lost, duplicated and stranded
-          // nothing; a cloud supplied through POINTCLOUD_LOD_BROWSER_CLOUDS has
+          // nothing; a cloud supplied through TILED_VTKJS_BROWSER_CLOUDS has
           // a frontier that can come back different, and proves the law.
           expect(
             (await session.keys()).controller!.submitted,

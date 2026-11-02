@@ -3,7 +3,12 @@
  * by the streamed-scene mesh member.
  */
 
-import { IDENTITY, affineProblem, linearDeterminant, multiply } from "../mat4";
+import {
+  IDENTITY,
+  affineProblem,
+  linearDeterminant,
+  multiply,
+} from "../core/mat4";
 
 export type TilesetFetchResponse = {
   readonly ok: boolean;

@@ -46,18 +46,7 @@ export type CameraControlsOptions = {
 
 type Position = { x: number; y: number };
 
-// vtk.js exposes this helper at runtime but omits it from the module's public
-// declaration, even though its own manipulators call the same implementation.
-const vtkDollyToPosition = (
-  vtkInteractorStyleManipulator as typeof vtkInteractorStyleManipulator & {
-    dollyToPosition(
-      factor: number,
-      position: Position,
-      renderer: any,
-      interactor: any,
-    ): void;
-  }
-).dollyToPosition;
+const vtkDollyToPosition = vtkInteractorStyleManipulator.dollyToPosition;
 
 /**
  * Pan on the camera's projected focal plane at the point where the button

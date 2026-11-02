@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createSubmissionScheduler } from "../submissionScheduler";
-import type { CameraView } from "../camera";
+import { createSubmissionScheduler } from "../core/submissionScheduler";
+import type { CameraView } from "../core/camera";
 import type { DecodedTexture, DecodedTileContent } from "./decode";
 import { createMeshAdapter } from "./meshAdapter";
 import { pickSubmittedTriangles } from "./meshPicking";

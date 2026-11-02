@@ -97,7 +97,7 @@ const main = async () => {
   binary.set(compressedIndices, indexOffset);
 
   const json = (fallbackOffsets) => ({
-    asset: { version: "2.0", generator: "pointcloud-lod fixture generator" },
+    asset: { version: "2.0", generator: "tiled-vtkjs fixture generator" },
     extensionsUsed: ["EXT_meshopt_compression"],
     extensionsRequired: ["EXT_meshopt_compression"],
     scene: 0,

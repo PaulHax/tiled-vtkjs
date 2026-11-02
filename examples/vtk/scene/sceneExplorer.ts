@@ -1,21 +1,22 @@
 import { createFreemanSource, FREEMAN_URL } from "./freeman";
+import type { StreamedMemberRegistration } from "../../../src";
 import {
   createCopcWorkerTileSource,
-  wgs84ToEcef,
   type PointPresentation,
-  type StreamedMemberRegistration,
   type TileSource,
-} from "../../../src";
-import { createPointCloudMember, createTiles3dMember } from "../../../src/vtk";
+} from "../../../src/points";
+import { wgs84ToEcef } from "../../../src/tiles3d";
+import { createPointCloudMember } from "../../../src/points/vtk";
+import { createTiles3dMember } from "../../../src/tiles3d/vtk";
 import type {
   PointCloudMemberConfig,
   PointCloudMemberStats,
-} from "../../../src/pointCloudMember";
+} from "../../../src/points/pointCloudMember";
 import type {
   Tiles3dMemberConfig,
   Tiles3dMemberStats,
 } from "../../../src/tiles3d/memberTypes";
-import { IDENTITY } from "../../../src/mat4";
+import { IDENTITY } from "../../../src/core/mat4";
 import { createBag3dTilesetFetch } from "./bag3d";
 import { decodeWasmUrls } from "./decodeAssets";
 import { renderDiagnostics, type MemberRow } from "./diagnostics";
@@ -717,6 +718,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     const member = createTiles3dMember(
       host.coordinator.context(host.renderer),
       config,
+      host.tiles3dServices,
     );
     const registration = host.coordinator.register(member, {
       id,
@@ -850,7 +852,9 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
         rows,
         frameMs: host.lastFrameMs(),
         rendererName: host.rendererName,
-        textureFormat: host.textureCapabilities.compressedFormats[0] ?? "rgba",
+        textureFormat:
+          host.tiles3dServices.textureCapabilities.compressedFormats[0] ??
+          "rgba",
       },
       Object.fromEntries(
         datasets.map((dataset) => [dataset.id, dataset.statsElement]),

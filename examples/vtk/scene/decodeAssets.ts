@@ -11,7 +11,7 @@
  * from the loaders.gl codec libraries.
  */
 
-import { DecodeWorkerPool } from "../../../src";
+import { DecodeWorkerPool } from "../../../src/tiles3d";
 import type { DecodeWasmUrls } from "../../../src/tiles3d/decode/types";
 
 const absolute = (path: string): string =>
