@@ -20,17 +20,9 @@ identity and format-specific entry points.
 
 ## Install
 
-The `tiled-vtkjs` npm package has not been released. Build from this source
-repository:
-
 ```bash
-git clone https://github.com/PaulHax/tiled-vtkjs.git
-cd tiled-vtkjs
-npm ci --ignore-scripts
-npm rebuild
+npm install tiled-vtkjs
 ```
-
-Build and link the pinned vtk.js package below, then run `npm run prepare`.
 
 ### Modules and renderer requirements
 
