@@ -15,6 +15,7 @@ export default defineConfig({
         copcWorker: "src/points/copcWorker.ts",
         tiles3d: "src/tiles3d/index.ts",
         "tiles3d-vtk": "src/tiles3d/vtk.ts",
+        gaussianSortWorker: "src/tiles3d/gaussianSort.worker.ts",
       },
       formats: ["es"],
     },

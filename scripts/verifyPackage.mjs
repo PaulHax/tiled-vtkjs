@@ -41,6 +41,7 @@ const entrypoints = [
   "./tiles3d",
   "./tiles3d/vtk",
   "./tiles3d/decode-worker",
+  "./tiles3d/gaussian-sort-worker",
 ];
 
 const run = (command, args, cwd) =>
@@ -536,7 +537,7 @@ export const verifyPackedPackage = async ({
         'assert.throws(() => import.meta.resolve("@kitware/vtk.js"), { code: "ERR_MODULE_NOT_FOUND" });',
         'for (const old of ["vtk", "copc-worker", "tiles3d-decode-worker"]) assert.throws(() => import.meta.resolve(`${name}/${old}`), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });',
         "for (const entry of [name, `${name}/core`, `${name}/points`, `${name}/tiles3d`]) await import(entry);",
-        `const assets = ["tiles3d/decode-worker", ...${JSON.stringify(codecs)}.map((file) => "tiles3d/codecs/" + file)];`,
+        `const assets = ["tiles3d/decode-worker", "tiles3d/gaussian-sort-worker", ...${JSON.stringify(codecs)}.map((file) => "tiles3d/codecs/" + file)];`,
         "const resolved = [];",
         'for (const asset of assets) { const path = fileURLToPath(import.meta.resolve(`${name}/${asset}`)); await stat(path); resolved.push({ asset, filename: path.split("/").at(-1) }); }',
         "console.log(JSON.stringify(resolved));",

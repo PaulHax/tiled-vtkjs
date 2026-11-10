@@ -9,7 +9,7 @@ import type { StreamedMemberContext } from "../core/streamedMember";
 import {
   TileUnsupportedExtensionError,
   type DecodeTileRequest,
-  type DecodedTileContent,
+  type DecodedMeshTileContent,
 } from "./decode";
 import { createTiles3dMember } from "./member";
 import type {
@@ -50,10 +50,11 @@ const document = (withChildren = false) => ({
   ),
 });
 
-const decoded = (z = 0): DecodedTileContent => ({
+const decoded = (z = 0): DecodedMeshTileContent => ({
   origin: [0, 0, z],
   primitives: [
     {
+      kind: "mesh",
       positions: new Float32Array([-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0]),
       indices: new Uint16Array([0, 1, 2]),
       material: {
@@ -1010,7 +1011,7 @@ describe("createTiles3dMember", () => {
           : {}),
       })),
     };
-    const twoTriangles = (): DecodedTileContent => {
+    const twoTriangles = (): DecodedMeshTileContent => {
       const content = decoded();
       return {
         ...content,

@@ -198,6 +198,27 @@ describe("DecodeWorkerPool", () => {
     });
   });
 
+  it("preserves the unsupported Gaussian profile property across the worker boundary", async () => {
+    const worker = new FakeWorker();
+    const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });
+    const active = pool.decode(decodeRequest());
+    worker.fail(0, {
+      name: "TileUnsupportedGaussianProfileError",
+      message: "unsupported KHR_gaussian_splatting sortingMethod",
+      tileUri: "https://fixture.invalid/tile.glb",
+      stage: "profile",
+      property: "sortingMethod",
+      value: "viewDepth",
+    });
+    await expect(active.promise).rejects.toMatchObject({
+      name: "TileUnsupportedGaussianProfileError",
+      tileUri: "https://fixture.invalid/tile.glb",
+      stage: "profile",
+      property: "sortingMethod",
+      value: "viewDepth",
+    });
+  });
+
   it("aggregates runtime cost and retains bounded per-target transcode samples", async () => {
     const worker = new FakeWorker();
     const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });

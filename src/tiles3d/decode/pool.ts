@@ -12,6 +12,7 @@ import {
 import {
   TileDecodeError,
   TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
   type TileDecodeStage,
 } from "./types";
 
@@ -60,6 +61,8 @@ type DecodeWorkerErrorMessage = {
     readonly requestedBytes?: number;
     readonly limitBytes?: number;
     readonly retryable?: boolean;
+    readonly property?: string;
+    readonly value?: unknown;
   };
 };
 
@@ -386,6 +389,14 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
               ? new TileUnsupportedExtensionError(
                   payload.tileUri,
                   payload.extension,
+                )
+            : payload?.name === "TileUnsupportedGaussianProfileError" &&
+                typeof payload.tileUri === "string" &&
+                typeof payload.property === "string"
+              ? new TileUnsupportedGaussianProfileError(
+                  payload.tileUri,
+                  payload.property,
+                  payload.value,
                 )
               : payload?.name === "TileDecodeError" &&
                   typeof payload.tileUri === "string" &&

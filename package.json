@@ -67,6 +67,9 @@
     "./tiles3d/decode-worker": {
       "default": "./dist/tiles3dDecodeWorker.classic.js"
     },
+    "./tiles3d/gaussian-sort-worker": {
+      "default": "./dist/gaussianSortWorker.js"
+    },
     "./tiles3d/codecs/*": {
       "default": "./dist/tiles3d-codecs/*"
     }
