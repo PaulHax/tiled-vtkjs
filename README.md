@@ -33,16 +33,17 @@ contracts, coordination, quality, memory, submission scheduling and geometry.
 Each format keeps its own VTK adapter and workers. Core imports neither format
 nor vtk.js. Points and tiles3d depend on core and never import each other.
 
-| Import                              | Public API                                                                                                     |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `tiled-vtkjs` or `tiled-vtkjs/core` | Geometry/camera contracts, member registry/coordinator, quality governor, memory pool and submission scheduler |
-| `tiled-vtkjs/points`                | Point sources, controller, progressive ordering and picking contracts                                          |
-| `tiled-vtkjs/points/vtk`            | Point member and renderer adapter                                                                              |
-| `tiled-vtkjs/points/copc-worker`    | COPC module-worker endpoint                                                                                    |
-| `tiled-vtkjs/tiles3d`               | Supported tileset profile/configuration, decoder pool/types and coordinate helpers                             |
-| `tiled-vtkjs/tiles3d/vtk`           | Tiles member and mesh adapter                                                                                  |
-| `tiled-vtkjs/tiles3d/decode-worker` | Executable classic decoder worker artifact                                                                     |
-| `tiled-vtkjs/tiles3d/codecs/*`      | Draco and Basis JavaScript/WASM assets                                                                         |
+| Import                                     | Public API                                                                                                     |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `tiled-vtkjs` or `tiled-vtkjs/core`        | Geometry/camera contracts, member registry/coordinator, quality governor, memory pool and submission scheduler |
+| `tiled-vtkjs/points`                       | Point sources, controller, progressive ordering and picking contracts                                          |
+| `tiled-vtkjs/points/vtk`                   | Point member and renderer adapter                                                                              |
+| `tiled-vtkjs/points/copc-worker`           | COPC module-worker endpoint                                                                                    |
+| `tiled-vtkjs/tiles3d`                      | Supported tileset profile/configuration, decoder pool/types and coordinate helpers                             |
+| `tiled-vtkjs/tiles3d/vtk`                  | Tiles member, mesh and shared Gaussian adapters                                                                |
+| `tiled-vtkjs/tiles3d/gaussian-sort-worker` | Executable Gaussian module sort worker artifact                                                                |
+| `tiled-vtkjs/tiles3d/decode-worker`        | Executable classic decoder worker artifact                                                                     |
+| `tiled-vtkjs/tiles3d/codecs/*`             | Draco and Basis JavaScript/WASM assets                                                                         |
 
 These subpaths isolate browser bundles. A core bundle has no format, codec or
 VTK imports; each format's neutral entry excludes VTK and the other format.
@@ -52,7 +53,7 @@ packages. Examples, fixtures and replay tooling stay in the repository; the
 published package excludes executable tooling and examples. The checked source
 contract fixture remains included for consumer validation.
 
-The VTK entries require `vtkPointGaussianMapper` and compressed-texture support
+The VTK entries require `vtkPointSpriteMapper`, `vtkPointGaussianMapper` and compressed-texture support
 from [the fork](https://github.com/PaulHax/vtk-js) at the exact revision in
 [`vtkjs-fork.env`](./vtkjs-fork.env). Build it and make its ESM package and native
 declarations available as `@kitware/vtk.js` in the consuming project:
@@ -373,7 +374,7 @@ removed.
 
 ### vtk.js examples
 
-The runnable app in [`examples/vtk`](./examples/vtk/) contains five examples.
+The runnable app in [`examples/vtk`](./examples/vtk/) contains six examples.
 Two use `createLodController` directly, which is all a single point cloud
 needs:
 
@@ -386,7 +387,7 @@ needs:
   fixed/adaptive presentation, custom point-cloud camera interaction, local
   telemetry, and the diagnostic hooks exercised by the browser suite.
 
-Three more use the member API; `createStreamedSceneCoordinator` with
+Four more use the member API; `createStreamedSceneCoordinator` with
 `createTiles3dMember` and `createPointCloudMember`; which is what a scene of
 more than one streamed dataset needs, and are the reference for it:
 
@@ -400,6 +401,13 @@ more than one streamed dataset needs, and are the reference for it:
   sharing one memory pool, one submission scheduler and one view governor. Its
   panel shows each member's claimed share of the view beside the quality the
   governor gave it back, which is the only place that negotiation is visible.
+
+- **Gaussian Tiles** (`/gaussian-tiles/`) streams an existing Jastrzębia Góra
+  reconstruction with 103.5 million retained splats, 8,784 tiles and 13 hierarchy
+  levels. It uses one shared Gaussian renderer, camera-distance ordering and
+  supplied replacement LOD. [Data attribution and hosting](./examples/vtk/gaussian-tiles/DATA.md)
+  describe the source license and the local proxy. [Gaussian integration](./docs/gaussian-splats.md)
+  describes the supported content profile and resource accounting.
 
 Both meet in a local ENU frame whose Z is NAP: the mesh arrives in ECEF and is
 placed by `tilesetToScene`, the lidar arrives in RD New (EPSG:28992) and is placed

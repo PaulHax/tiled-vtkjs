@@ -1,8 +1,11 @@
-# Gaussian content foundations
+# Gaussian 3D Tiles
 
-The decoder accepts uncompressed `KHR_gaussian_splatting` ellipse primitives
-alongside triangle meshes. This is a decoding and sorting API, not yet a complete
-Gaussian renderer for streamed tiles.
+The tiles member accepts Gaussian glTF content alongside triangle meshes.
+`createGaussianContentAdapterFactory` supplies one shared Gaussian presentation
+per VTK renderer, using the existing tile hierarchy, queues and residency
+governor. The [Gaussian Tiles example](../examples/vtk/gaussian-tiles/) streams an
+existing city reconstruction; its [data record](../examples/vtk/gaussian-tiles/DATA.md)
+documents the source, supplied placement, license record and hosting.
 
 ## Decoded content
 
@@ -19,16 +22,22 @@ Accepting both color spaces for decoding does not establish a policy for blendin
 them together. Unsupported required extensions and appearance properties produce
 named errors, including across the decode worker boundary.
 
-The initial accessor profile is non-indexed POINTS with non-sparse attributes.
-Skinning and morph targets are rejected. Gaussian compression extensions are not
-implemented. The existing document-wide codec checks still require codec URLs
+The uncompressed accessor profile is non-indexed POINTS with non-sparse
+attributes. Skinning and morph targets are rejected. The selected city's draft
+`KHR_gaussian_splatting_compression_spz_2` profile is also supported through
+`@adobe/spz`, including SPZ version 3 and the producer's optional
+`EXT_splat_opacity` power kernel. The codec contains its WASM and requires no
+external codec URL. These draft compressed inputs are distinct from ratified
+uncompressed Gaussian attributes.
+
+The existing document-wide codec checks still require codec URLs
 when Draco or Basis extensions are declared, including declarations associated
 with an ignored Gaussian fallback material.
 
 The decoded geometry estimate includes all owned Gaussian attribute buffers and
-the placement matrix. Transfers deduplicate backing buffers. This estimate does
-not include peak parser allocations, worker clones, sort workspace or future GPU
-storage; it is not an end-to-end memory bound.
+the placement matrix. Transfers deduplicate backing buffers. The decoded cache
+is bounded separately from renderer residency. Neither estimate measures peak
+parser allocations, the codec runtime heap or driver overhead.
 
 ## Distance ordering
 
@@ -47,8 +56,7 @@ Use `createGaussianSortWorkerBackend` with a module worker resolved from
 `tiled-vtkjs/tiles3d/gaussian-sort-worker`. The backend owns and terminates that
 worker. Scene attributes are cloned once per scene revision; subsequent camera
 jobs send only the camera position. Position arrays are borrowed and must remain
-immutable until all jobs referring to them complete. Range generations identify
-their lifetime but do not allocate or retire GPU storage.
+immutable until all jobs referring to them complete.
 
 ## Tile realization
 
@@ -58,13 +66,52 @@ can coordinate multiple members through this factory. The contract carries
 camera, placement, visibility, admission, replacement groups and disposal.
 `pickableMeshTiles()` exposes only triangles to mesh picking.
 
-The default `createMeshContentAdapter` rejects a Gaussian tile or replacement
-group with `TileContentRealizationError` before admitting partial mesh content.
-It preserves an already displayed parent when its replacement cannot be
-realized. Gaussian rendering still requires shared GPU range storage,
-appearance evaluation, host depth and blending integration, resource budgets,
-and coherent presentation swaps. The Python host must keep Gaussian admission
-disabled until those parts are available.
+The default `createMeshContentAdapter` rejects Gaussian content. Opt in by
+passing the same `createGaussianContentAdapterFactory` to the members sharing a
+view. It supports sRGB reconstruction, complete SH degrees 0 through 3, affine
+covariance transformation and explicit XYZW-to-mapper quaternion conversion.
+The renderer rejects linear reconstruction color space until a corresponding
+resolve/composition policy is available. Gaussian picking remains disabled.
+
+Install `createGaussianAlphaPass` as the host ForwardPass's translucent pass.
+Opaque geometry populates depth first; the shared Gaussian actor then uses
+premultiplied alpha and depth testing without depth writes. General translucent
+triangle interleaving is not supported by this pass.
+
+Attributes occupy stable, reusable ranges in persistent capacity arrays and GPU
+textures. Tile admission and placement changes update affected ranges; camera
+movement changes only order for degree-zero content. Directional SH also updates
+color ranges. Capacity growth and context restoration require full uploads.
+Retired ranges become reusable only after a coherent presentation swap. Parent
+and child representations do not draw together during replacement.
+
+`maximumVisibleSplats` and `resourceBudgetBytes` constrain complete
+representations. The selector retains a coarser representation when a replacement
+cannot fit. Diagnostics separate source/staging attributes, GPU attributes,
+worker attributes, sort workspace and replacement storage. Texture row padding
+and runtime allocations can add overhead beyond logical payload estimates.
+
+The sort endpoint is an ES module with shared module dependencies. Hosts bundling
+the library must stage its complete emitted module graph at the worker URL, or
+provide `createSortBackend` using their bundler's worker support. The example uses
+Vite's module worker entry so those dependencies are emitted together.
+
+## Running the city example
+
+Build and link the exact renderer in `vtkjs-fork.env`, then run:
+
+```sh
+npm run build
+npm run example -- --host 127.0.0.1 --port 5194
+```
+
+Open `/gaussian-tiles/`. The city preset uses the example server's fixed
+same-origin proxy because its upstream redirect does not support browser CORS.
+Other URLs need a CORS-enabled endpoint. Query options `memory` (MiB), `splats`
+(visible limit), and `sse` (pixels) set the example's resource and quality controls.
+Custom tilesets stay in local coordinates unless `ecef=1` explicitly identifies
+their supplied Earth-centered placement. The application bridge and map view
+are separate integrations and are not enabled by this standalone example.
 
 The tiny test GLB is synthetic and unlocated. It verifies standard attribute and
 worker handling, not independent geographic alignment or producer compatibility.

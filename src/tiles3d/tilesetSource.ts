@@ -193,6 +193,19 @@ const determinant3 = (m: readonly number[]): number =>
   m[3]! * (m[1]! * m[8]! - m[7]! * m[2]!) +
   m[6]! * (m[1]! * m[5]! - m[4]! * m[2]!);
 
+/** Test linear independence without imposing a minimum box size in meters. */
+export const boxAxesSpanVolume = (axes: readonly number[]): boolean => {
+  const lengths = [0, 3, 6].map((offset) =>
+    Math.hypot(axes[offset]!, axes[offset + 1]!, axes[offset + 2]!),
+  );
+  if (lengths.some((length) => !Number.isFinite(length) || length === 0))
+    return false;
+  const normalized = axes.map(
+    (value, index) => value / lengths[Math.floor(index / 3)]!,
+  );
+  return Math.abs(determinant3(normalized)) > Number.EPSILON;
+};
+
 const affineMatrix = (value: unknown, path: string): readonly number[] => {
   if (value === undefined) return IDENTITY;
   const matrix = finiteArray(value, 16, path);
@@ -320,7 +333,7 @@ const boundingBox = (value: unknown, path: string): TilesetBox => {
   }
   const raw = finiteArray(volume.box, 12, `${path}.box`);
   const halfAxes = raw.slice(3);
-  if (Math.abs(determinant3(halfAxes)) <= Number.EPSILON) {
+  if (!boxAxesSpanVolume(halfAxes)) {
     throw new TilesetValidationError(
       `${path}.box`,
       "box half axes must span a volume",

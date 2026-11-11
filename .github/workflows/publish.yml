@@ -111,7 +111,7 @@ jobs:
       - name: Verify packed imports, workers and real VTK rendering
         run: npm run verify:package
       - name: Verify memory policy, texture realization and decoder codecs in Chromium
-        run: npx vitest run --config vitest.browser.config.ts test/browser/memoryPolicy.spec.ts test/browser/meshAlpha.spec.ts test/browser/tiles3dDecodeWorker.spec.ts
+        run: npx vitest run --config vitest.browser.config.ts test/browser/memoryPolicy.spec.ts test/browser/meshAlpha.spec.ts test/browser/tiles3dDecodeWorker.spec.ts test/browser/gaussianWorkers.spec.ts test/browser/gaussianTiles.spec.ts test/browser/gaussianAdapter.spec.ts
 
   release:
     needs: [test, example-chain]

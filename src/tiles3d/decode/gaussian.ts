@@ -31,7 +31,7 @@ const UNSIGNED_NORMALIZED = [
   { componentType: 5123, normalized: true },
 ];
 
-const profileFor = (
+export const gaussianProfileFor = (
   input: unknown,
   tileUri: string,
 ): GaussianAppearanceProfile => {
@@ -83,7 +83,7 @@ const harmonicSemantic = (degree: number, coefficient: number): string =>
 export const decodeGaussian = (
   input: GaussianInput,
 ): DecodedGaussianPrimitive => {
-  const profile = profileFor(input.extension, input.tileUri);
+  const profile = gaussianProfileFor(input.extension, input.tileUri);
   const fail = (reason: string): never => {
     throw new TileDecodeError(
       input.tileUri,

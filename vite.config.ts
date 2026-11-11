@@ -34,8 +34,8 @@ export default defineConfig({
     // suite records adapter calls; the packed consumer browser gate uses VTK.
     alias: {
       "@kitware/vtk.js/Rendering/Core/Actor": stub("vtkActor"),
-      "@kitware/vtk.js/Rendering/Core/PointGaussianMapper": stub(
-        "vtkPointGaussianMapper",
+      "@kitware/vtk.js/Rendering/Core/PointSpriteMapper": stub(
+        "vtkPointSpriteMapper",
       ),
       "@kitware/vtk.js/Common/DataModel/PolyData": stub("vtkPolyData"),
       "@kitware/vtk.js/Common/Core/DataArray": stub("vtkDataArray"),

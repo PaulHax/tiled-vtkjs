@@ -1,6 +1,6 @@
 /**
  * vtk.js renderer adapter: consumes controller tile batches and manages one
- * vtkPolyData + vtkPointGaussianMapper + vtkActor per submitted tile.
+ * vtkPolyData + vtkPointSpriteMapper + vtkActor per submitted tile.
  *
  * The format adapter owns its vtk.js imports.
  * The mapper renders each point as one gl.POINTS vertex (no cell topology),
@@ -30,9 +30,9 @@ import vtkPolyData, {
 import vtkActor, {
   type vtkActor as VtkActor,
 } from "@kitware/vtk.js/Rendering/Core/Actor";
-import vtkPointGaussianMapper, {
-  type vtkPointGaussianMapper as VtkPointGaussianMapper,
-} from "@kitware/vtk.js/Rendering/Core/PointGaussianMapper";
+import vtkPointSpriteMapper, {
+  type vtkPointSpriteMapper as VtkPointSpriteMapper,
+} from "@kitware/vtk.js/Rendering/Core/PointSpriteMapper";
 
 import type { TileDrawPlan } from "./controller";
 import type { TileBatch } from "./payloadResidency";
@@ -181,7 +181,7 @@ export type RendererAdapterStats = {
 type TileActors = {
   memory?: MemoryLease;
   actor: VtkActor;
-  mapper: VtkPointGaussianMapper;
+  mapper: VtkPointSpriteMapper;
   polyData: VtkPolyData;
   tile: TileData;
   resourceBytes: number;
@@ -327,7 +327,7 @@ export const createRendererAdapter = (
     builtTiles += 1;
     let polyData: ReturnType<typeof vtkPolyData.newInstance> | undefined;
     let mapper:
-      | ReturnType<typeof vtkPointGaussianMapper.newInstance>
+      | ReturnType<typeof vtkPointSpriteMapper.newInstance>
       | undefined;
     let actor: ReturnType<typeof vtkActor.newInstance> | undefined;
     try {
@@ -342,7 +342,7 @@ export const createRendererAdapter = (
           }),
         );
       }
-      mapper = vtkPointGaussianMapper.newInstance({ scaleFactor: 0 });
+      mapper = vtkPointSpriteMapper.newInstance({ scaleFactor: 0 });
       mapper.setInputData(polyData);
       mapper.setStatic?.(true);
       actor = vtkActor.newInstance();

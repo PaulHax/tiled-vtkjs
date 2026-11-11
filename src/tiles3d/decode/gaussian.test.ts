@@ -236,14 +236,14 @@ describe("Gaussian glTF content decoding", () => {
         request({
           mutate: (json) => {
             json.extensionsRequired.push(
-              "KHR_gaussian_splatting_compression_spz_2",
+              "KHR_gaussian_splatting_compression_unknown",
             );
           },
         }),
       ),
     ).rejects.toMatchObject({
       name: "TileUnsupportedExtensionError",
-      extension: "KHR_gaussian_splatting_compression_spz_2",
+      extension: "KHR_gaussian_splatting_compression_unknown",
     });
   });
 });

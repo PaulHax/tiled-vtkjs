@@ -14,7 +14,7 @@ import {
   copyFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright";
@@ -176,6 +176,44 @@ const checkBrowser = async (
     join(installed, manifest.exports["./tiles3d/decode-worker"].default),
     join(output, "tiles3dDecodeWorker.classic.js"),
   );
+  const workerRoot = resolve(installed, "dist");
+  const workerModules = new Set();
+  await build({
+    configFile: false,
+    root: consumer,
+    logLevel: "silent",
+    plugins: [
+      {
+        name: "record-packed-worker-imports",
+        moduleParsed(info) {
+          workerModules.add(info.id);
+        },
+      },
+    ],
+    build: {
+      write: false,
+      minify: false,
+      lib: {
+        entry: join(
+          installed,
+          manifest.exports["./tiles3d/gaussian-sort-worker"].default,
+        ),
+        formats: ["es"],
+      },
+    },
+  });
+  const sortWorkerAssets = [];
+  for (const module of workerModules) {
+    assert(
+      module.startsWith(workerRoot + sep),
+      `packed Gaussian worker dependency must be shipped in dist: ${module}`,
+    );
+    const asset = relative(workerRoot, module);
+    const destination = join(output, asset);
+    await mkdir(dirname(destination), { recursive: true });
+    await copyFile(module, destination);
+    sortWorkerAssets.push(asset.replaceAll(sep, "/"));
+  }
   await mkdir(join(output, "tiles3d-codecs"));
   for (const codec of codecs)
     await copyFile(
@@ -196,6 +234,13 @@ const checkBrowser = async (
     });
     const errors = [];
     const requests = [];
+    const sortWorkerClosures = [];
+    page.on("worker", (worker) => {
+      if (worker.url().endsWith("/gaussianSortWorker.js"))
+        sortWorkerClosures.push(
+          new Promise((done) => worker.once("close", done)),
+        );
+    });
     page.on("pageerror", (error) => errors.push(error.message));
     page.on("console", (message) => {
       if (message.type() === "error") errors.push(message.text());
@@ -406,6 +451,46 @@ const checkBrowser = async (
       requests.some((url) => url.endsWith("/tiles3dDecodeWorker.classic.js")),
       "default worker URL must reach the staged packed worker",
     );
+    const gaussian = await call("gaussian");
+    assert.equal(gaussian.ready.displayedSplats, 3);
+    assert(gaussian.ready.sortCount > 0);
+    assert.equal(gaussian.ready.pendingSort, false);
+    assert(gaussian.ready.orderUploadBytes > 0);
+    assert(gaussian.pixels.sorted[2] > gaussian.pixels.sorted[0] * 1.5);
+    assert(gaussian.pixels.sorted[0] > 20);
+    assert.deepEqual(gaussian.pixels.occluded, [0, 255, 0, 255]);
+    assert(gaussian.reversed.stats.sortCount > gaussian.ready.sortCount);
+    assert(
+      gaussian.reversed.stats.orderUploadBytes >
+        gaussian.ready.orderUploadBytes,
+    );
+    assert(gaussian.reversed.pixel[0] > gaussian.reversed.pixel[2] * 1.5);
+    assert(gaussian.reversed.pixel[2] > 20);
+    assert.equal(gaussian.disposed.actors, 0);
+    assert.equal(gaussian.disposed.stats, null);
+    assert.equal(gaussian.disposed.queuedJobs, 0);
+    assert.deepEqual(gaussian.disposed.pixel, [0, 0, 0, 255]);
+    assert.equal(sortWorkerClosures.length, 1);
+    let closeTimer;
+    try {
+      await Promise.race([
+        Promise.all(sortWorkerClosures),
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(
+            () =>
+              reject(new Error("packed Gaussian sort worker did not close")),
+            30_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(closeTimer);
+    }
+    for (const asset of sortWorkerAssets)
+      assert(
+        requests.some((url) => url === `${server.origin}/${asset}`),
+        `default Gaussian worker must load packed module ${asset}`,
+      );
     assert.deepEqual(errors, []);
     return {
       root: rootState,
@@ -415,6 +500,8 @@ const checkBrowser = async (
       released,
       disposed,
       codecResults,
+      gaussian,
+      sortWorkerAssets,
       requests,
     };
   } finally {
@@ -501,10 +588,10 @@ export const verifyPackedPackage = async ({
         `import { createPointCloudMember } from ${JSON.stringify(name + "/points/vtk")};`,
         `import { serveCopcTileSourceWorker } from ${JSON.stringify(name + "/points/copc-worker")};`,
         `import { DecodeWorkerPool, type Tiles3dMemberServices } from ${JSON.stringify(name + "/tiles3d")};`,
-        `import { createTiles3dMember } from ${JSON.stringify(name + "/tiles3d/vtk")};`,
+        `import { createGaussianContentAdapterFactory, createTiles3dMember } from ${JSON.stringify(name + "/tiles3d/vtk")};`,
         `const vector: Vec3 = [0, 0, 0]; const bounds: Bounds = { min: vector, max: vector };`,
         `const source: TileSource | null = null; const services: Tiles3dMemberServices | null = null;`,
-        `void [createMemoryPool, createStreamedSceneCoordinator, bounds, source, services, createHttpTileSource, createPointCloudMember, serveCopcTileSourceWorker, DecodeWorkerPool, createTiles3dMember];`,
+        `void [createMemoryPool, createStreamedSceneCoordinator, bounds, source, services, createHttpTileSource, createPointCloudMember, serveCopcTileSourceWorker, DecodeWorkerPool, createGaussianContentAdapterFactory, createTiles3dMember];`,
       ].join("\n"),
     );
     await writeFile(

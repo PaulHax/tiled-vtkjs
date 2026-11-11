@@ -6,6 +6,7 @@ import { chromium, type Browser } from "playwright";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { gaussianGlb } from "../fixtures/gaussianGlb";
+import { spzGlb } from "../fixtures/spzGlb";
 import { startStaticServer, type StaticServer } from "./server";
 
 let browser: Browser;
@@ -21,6 +22,10 @@ beforeAll(async () => {
   await writeFile(
     resolve(directory, "standard.glb"),
     new Uint8Array(gaussianGlb({ degree: 3, mixed: true })),
+  );
+  await writeFile(
+    resolve(directory, "compressed.glb"),
+    new Uint8Array(await spzGlb({ degree: 3, opacity: true })),
   );
   await writeFile(
     resolve(directory, "unsupported.glb"),
@@ -42,6 +47,68 @@ afterAll(async () => {
 });
 
 describe("packaged Gaussian workers", () => {
+  it("decodes SPZ and its opacity profile in the classic worker without external codec requests", async () => {
+    const page = await browser.newPage();
+    const requests: string[] = [];
+    page.on("request", (request) => requests.push(request.url()));
+    try {
+      await page.goto(`${server.origin}/fixture/index.html`);
+      await page.waitForFunction(() => "gaussianApi" in globalThis);
+      const result = await page.evaluate(async (origin) => {
+        const api = (
+          globalThis as unknown as {
+            gaussianApi: typeof import("../../src/tiles3d/index");
+          }
+        ).gaussianApi;
+        const pool = new api.DecodeWorkerPool({
+          size: 1,
+          workerUrl: `${origin}/dist/tiles3dDecodeWorker.classic.js`,
+        });
+        try {
+          const decoded = await pool.decode({
+            content: await (
+              await fetch(`${origin}/fixture/compressed.glb`)
+            ).arrayBuffer(),
+            contentUrl: `${origin}/fixture/compressed.glb`,
+            revision: "synthetic-compressed",
+            accumulatedTransform: [
+              1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+            ],
+            tilesetToScene: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+            textureCapabilities: {
+              capabilityKey: "rgba",
+              compressedFormats: [],
+            },
+          }).promise;
+          const primitive = decoded.primitives[0];
+          if (primitive?.kind !== "gaussian")
+            throw new Error("Expected Gaussian content");
+          return {
+            positions: Array.from(primitive.positions),
+            degree: primitive.harmonicDegree,
+            opacityKernel: primitive.opacityKernel,
+            alpha: primitive.opacities[1],
+            harmonics: primitive.sphericalHarmonics.length,
+          };
+        } finally {
+          pool.dispose();
+        }
+      }, server.origin);
+      expect(result).toMatchObject({
+        positions: [1, 2, 3, 4, 5, 6],
+        degree: 3,
+        opacityKernel: "power",
+        harmonics: 96,
+      });
+      expect(result.alpha).toBeGreaterThan(1);
+      expect(requests.every((url) => url.startsWith(`${server.origin}/`))).toBe(
+        true,
+      );
+    } finally {
+      await page.close();
+    }
+  });
+
   it("decodes mixed standard GLB through the classic pool, preserving harmonics and precision", async () => {
     const page = await browser.newPage();
     try {

@@ -16,6 +16,11 @@ import { repairMeshoptFallbackOffsets } from "./meshoptFallback";
 import { collectContentBuffers } from "./transfer";
 import { ResourcePolicyError } from "../../core/memoryResources";
 import { decodeGaussian, GAUSSIAN_EXTENSION } from "./gaussian";
+import {
+  decodeSpzGaussian,
+  SPZ_EXTENSION,
+  SPLAT_OPACITY_EXTENSION,
+} from "./spz";
 import type {
   CompressedTextureFormat,
   DecodeTextureTarget,
@@ -152,6 +157,7 @@ const REQUIRED_EXTENSION_ALLOWLIST = new Set([
   "KHR_mesh_quantization",
   "EXT_meshopt_compression",
   "KHR_gaussian_splatting",
+  SPZ_EXTENSION,
 ]);
 
 const validateRequiredExtensions = (json: GltfJson, tileUri: string): void => {
@@ -1096,12 +1102,12 @@ const vertexColors = (
   return colors;
 };
 
-const applySceneRtc = (
+const applySceneRtc = async (
   gltf: ParsedGltf,
   authored: GltfJson,
   sceneTransform: Mat4,
   tileUri: string,
-): PendingPrimitive[] => {
+): Promise<PendingPrimitive[]> => {
   const scene = requireIndex(
     gltf.json.scenes,
     gltf.json.scene ?? 0,
@@ -1109,7 +1115,10 @@ const applySceneRtc = (
   );
   const pending: PendingPrimitive[] = [];
   const visiting = new Set<number>();
-  const visit = (nodeIndex: number, parent: readonly number[]): void => {
+  const visit = async (
+    nodeIndex: number,
+    parent: readonly number[],
+  ): Promise<void> => {
     if (visiting.has(nodeIndex))
       throw new Error("glTF node graph contains a cycle");
     const node = requireIndex(gltf.json.nodes, nodeIndex, "node");
@@ -1132,6 +1141,147 @@ const applySceneRtc = (
               "profile",
               `${GAUSSIAN_EXTENSION}: skinning and morph targets are not supported`,
             );
+          }
+          const extension = gaussianExtension as Record<string, unknown>;
+          const nested = extension?.extensions as
+            | Record<string, unknown>
+            | undefined;
+          if (nested?.[SPZ_EXTENSION] !== undefined) {
+            if (primitive.mode !== 0 || primitive.indices !== undefined) {
+              throw new TileDecodeError(
+                tileUri,
+                "profile",
+                `${SPZ_EXTENSION} requires non-indexed POINTS`,
+              );
+            }
+            const compressed = nested[SPZ_EXTENSION] as {
+              bufferView?: unknown;
+            };
+            if (
+              !compressed ||
+              !Number.isSafeInteger(compressed.bufferView) ||
+              (compressed.bufferView as number) < 0
+            ) {
+              throw new TileDecodeError(
+                tileUri,
+                "decode",
+                `${SPZ_EXTENSION} requires a valid bufferView`,
+              );
+            }
+            const view = requireIndex(
+              gltf.json.bufferViews,
+              compressed.bufferView as number,
+              "SPZ bufferView",
+            );
+            const buffer = requireIndex(
+              gltf.buffers,
+              view.buffer,
+              "SPZ buffer",
+            );
+            const offset = buffer.byteOffset + (view.byteOffset ?? 0);
+            if (
+              !Number.isSafeInteger(offset) ||
+              !Number.isSafeInteger(view.byteLength) ||
+              offset < buffer.byteOffset ||
+              view.byteLength <= 0 ||
+              offset + view.byteLength >
+                buffer.byteOffset + buffer.byteLength ||
+              offset + view.byteLength > buffer.arrayBuffer.byteLength
+            ) {
+              throw new TileDecodeError(
+                tileUri,
+                "decode",
+                `${SPZ_EXTENSION} bufferView exceeds its buffer`,
+              );
+            }
+            const positionIndex = authoredPrimitive?.attributes.POSITION;
+            if (typeof positionIndex !== "number")
+              throw new Error(`${SPZ_EXTENSION}: missing POSITION accessor`);
+            const position = requireIndex(
+              authored.accessors,
+              positionIndex,
+              "SPZ POSITION",
+            );
+            for (const reference of Object.values(
+              authoredPrimitive!.attributes,
+            )) {
+              if (
+                typeof reference !== "number" ||
+                requireIndex(authored.accessors, reference, "SPZ attribute")
+                  .count !== position.count
+              ) {
+                throw new Error(
+                  `${SPZ_EXTENSION}: inconsistent attribute counts`,
+                );
+              }
+            }
+            const opacity = nested[SPLAT_OPACITY_EXTENSION];
+            pending.push(
+              await decodeSpzGaussian({
+                bytes: new Uint8Array(
+                  buffer.arrayBuffer,
+                  offset,
+                  view.byteLength,
+                ),
+                extension,
+                count: position.count,
+                modelToScene: multiplyMat4(sceneTransform, world),
+                tileUri,
+                ...(opacity && typeof opacity === "object"
+                  ? {
+                      opacity: {
+                        extension: opacity as Record<string, unknown>,
+                        readAccessor(index, encoding) {
+                          const descriptor = requireIndex(
+                            authored.accessors,
+                            index,
+                            "splat opacity accessor",
+                          );
+                          const normalized = encoding === "unorm16";
+                          if (
+                            descriptor.type !== "SCALAR" ||
+                            descriptor.sparse ||
+                            descriptor.componentType !==
+                              (encoding === "float32" ? 5126 : 5123) ||
+                            (descriptor.normalized === true) !== normalized ||
+                            descriptor.count !== position.count
+                          ) {
+                            throw new Error(
+                              "invalid EXT_splat_opacity accessor",
+                            );
+                          }
+                          const values = accessorFloats(
+                            index,
+                            "SCALAR",
+                            gltf,
+                            normalized,
+                          );
+                          if (!values)
+                            throw new Error(
+                              "missing EXT_splat_opacity accessor",
+                            );
+                          if (encoding !== "float16") return values;
+                          return Float32Array.from(values, (bits) => {
+                            const sign = bits & 0x8000 ? -1 : 1;
+                            const exponent = (bits >> 10) & 31;
+                            const fraction = bits & 1023;
+                            return exponent === 31
+                              ? fraction
+                                ? NaN
+                                : sign * Infinity
+                              : sign *
+                                  (exponent === 0
+                                    ? fraction * 2 ** -24
+                                    : (1 + fraction / 1024) *
+                                      2 ** (exponent - 15));
+                          });
+                        },
+                      },
+                    }
+                  : {}),
+              }),
+            );
+            continue;
           }
           pending.push(
             decodeGaussian({
@@ -1286,10 +1436,10 @@ const applySceneRtc = (
         });
       }
     }
-    for (const child of node.children ?? []) visit(child, world);
+    for (const child of node.children ?? []) await visit(child, world);
     visiting.delete(nodeIndex);
   };
-  for (const root of scene.nodes ?? []) visit(root, IDENTITY);
+  for (const root of scene.nodes ?? []) await visit(root, IDENTITY);
   if (pending.length === 0)
     throw new Error("active glTF scene has no primitives");
   return pending;
@@ -1933,7 +2083,7 @@ const decodeTileContentInner = async (
     multiplyMat4(request.tilesetToScene, request.accumulatedTransform),
     Y_UP_TO_Z_UP,
   );
-  const pending = applySceneRtc(
+  const pending = await applySceneRtc(
     parsed,
     originalJson,
     sceneTransform,

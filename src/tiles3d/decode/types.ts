@@ -171,6 +171,8 @@ export type DecodedGaussianPrimitive = {
   /** Linear standard deviations, without logarithmic activation. */
   scales: Float32Array;
   opacities: Float32Array;
+  /** EXT_splat_opacity uses a power kernel for semantic opacity above one. */
+  opacityKernel?: "power";
   /** Splat-major, then coefficient in degree/order sequence, then RGB. */
   sphericalHarmonics: Float32Array;
   harmonicDegree: 0 | 1 | 2 | 3;

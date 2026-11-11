@@ -33,6 +33,7 @@ export const renderExplorerShell = (preset: ExplorerPreset): void => {
       </header>
 
       <p class="description">${description}</p>
+      <p class="description"><a href="/gaussian-tiles/">Explore Gaussian 3D Tiles</a></p>
       <section id="frame-rate" class="frame-rate-card" aria-label="Frame rate"></section>
 
       <details class="dataset-card global-card" open>

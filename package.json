@@ -98,6 +98,7 @@
     "verify:package": "node scripts/verifyPackage.mjs"
   },
   "dependencies": {
+    "@adobe/spz": "0.2.3",
     "@loaders.gl/core": "4.4.4",
     "@loaders.gl/draco": "4.4.4",
     "@loaders.gl/gltf": "4.4.4",
