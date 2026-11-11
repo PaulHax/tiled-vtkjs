@@ -58,6 +58,7 @@ type Fixture = {
     cpuReservedBytes: number;
     workReservedBytes: number;
     activeOperations: number;
+    queuedOperations: number;
     owners: number;
   };
   refusals(): string[];
@@ -83,7 +84,7 @@ type Fixture = {
   raiseDemand(bytes: number): void;
   admitGroup(): Promise<string>;
   selectMixed(): void;
-  moveMixed(): void;
+  moveMixed(x?: number): void;
   hideMixed(): void;
   showMixed(): void;
   clearMixed(): void;
@@ -98,6 +99,9 @@ type Fixture = {
   dispose(): void;
   errors(): string[];
   pending(): number;
+  blockWork(): Promise<void>;
+  releaseWork(): void;
+  releaseNext(): void;
   hold(): void;
   release(): void;
   setCamera(position: number[]): void;
@@ -439,6 +443,50 @@ describe("coherent mixed presentations and ownership", () => {
       expect(accepted.placement[12]).toBe(0.6);
       expect(accepted.hit?.status).toBe("miss");
       expect((await pixels(page)).data).not.toEqual(before.data);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("presents the latest mixed scene with the first sort admitted after held work", async () => {
+    const page = await open("gaussian-only");
+    try {
+      await api(page, "setupMixed");
+      const before = await pixels(page);
+      await api(page, "blockWork");
+      await api(page, "moveMixed", 0.6);
+      await expect
+        .poll(async () => (await api(page, "ledger")).queuedOperations)
+        .toBe(1);
+      await api(page, "moveMixed", -0.6);
+      await api(page, "selectMixed");
+      expect((await pixels(page)).data).toEqual(before.data);
+      expect((await api(page, "presentation")).picks).toEqual(["parent"]);
+      await api(page, "releaseWork");
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      await api(page, "releaseNext");
+      await page.waitForFunction(
+        () => {
+          const fixture = (
+            globalThis as unknown as { gaussianFixture: Fixture }
+          ).gaussianFixture;
+          return fixture.presentation().placement[12] === -0.6;
+        },
+        null,
+        { timeout: 10000 },
+      );
+      await api(page, "settle");
+      const accepted = await api(page, "presentation");
+      expect(accepted.picks).toEqual(["child"]);
+      expect(accepted.stats.drawnTileIds).toEqual(["child"]);
+      const green = pixel(await pixels(page), 64, 128);
+      expect(green[1]).toBeGreaterThan(green[0]! * 1.8);
+      expect(green[1]).toBeGreaterThan(green[2]! * 1.8);
+      const ledger = await api(page, "ledger");
+      expect(ledger.activeOperations).toBe(0);
+      expect(ledger.queuedOperations).toBe(0);
+      expect(ledger.workReservedBytes).toBe(0);
+      expect(await api(page, "errors")).toEqual([]);
     } finally {
       await page.close();
     }

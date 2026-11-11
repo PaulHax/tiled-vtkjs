@@ -54,6 +54,8 @@ const memoryOwners = [];
 const distanceSorter = createGaussianDistanceSorter();
 let hold = false;
 const pending = [];
+const blockedWork = [];
+const blockingOwner = memoryPool.createOwner();
 const factory = createGaussianContentAdapterFactory({
   resourceBudgetBytes: mode === "budget" ? 1600 : 131072,
   maximumVisibleSplats: 100,
@@ -403,10 +405,10 @@ globalThis.gaussianFixture = {
     adapters[0].setDrawnTiles(["child"]);
     renderWindow.render();
   },
-  moveMixed() {
+  moveMixed(x = 0.6) {
     hold = true;
     const matrix = [...IDENTITY];
-    matrix[12] = 0.6;
+    matrix[12] = x;
     adapters[0].setBaseMatrix(matrix);
     renderWindow.render();
   },
@@ -435,6 +437,18 @@ globalThis.gaussianFixture = {
   },
   errors: () => errors,
   pending: () => pending.length,
+  async blockWork() {
+    blockedWork.push(await blockingOwner.work(), await blockingOwner.work());
+  },
+  releaseWork() {
+    for (const work of blockedWork.splice(0)) work.release();
+  },
+  releaseNext() {
+    const entry = pending.shift();
+    entry.resolve(
+      distanceSorter.sort(entry.job.ranges, entry.job.cameraPosition),
+    );
+  },
   hold: () => {
     hold = true;
   },
@@ -457,6 +471,8 @@ globalThis.gaussianFixture = {
     return factory.stats(renderer);
   },
   dispose() {
+    for (const work of blockedWork.splice(0)) work.release();
+    blockingOwner.close();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
     for (const memory of memoryOwners) memory.close();

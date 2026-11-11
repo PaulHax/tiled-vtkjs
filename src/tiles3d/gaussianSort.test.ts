@@ -130,6 +130,100 @@ describe("Gaussian camera-distance order", () => {
 });
 
 describe("Gaussian sort presentation controller", () => {
+  it("captures the latest scene and camera after scheduled admission", async () => {
+    const controlled = controlledBackend();
+    const admitted = deferred<void>();
+    const queued = deferred<void>();
+    const presentations: GaussianSortPresentation[] = [];
+    const controller = createGaussianSortController({
+      backend: controlled.backend,
+      async schedule(run) {
+        queued.resolve();
+        await admitted.promise;
+        await run();
+      },
+      onOrder: (value) => presentations.push(value),
+      onError: vi.fn(),
+    });
+    controller.setScene([range("parent", [0, 0, 1])]);
+    controller.request([0, 0, 0]);
+    await queued.promise;
+    controller.setScene([range("obsolete", [0, 0, 2])]);
+    controller.request([1, 0, 0]);
+    controller.setScene([range("child", [0, 0, 3])]);
+    controller.request([2, 0, 0]);
+    expect(controlled.backend.sort).not.toHaveBeenCalled();
+    admitted.resolve();
+    const job = await controlled.call(0).started.promise;
+    expect(job.ranges[0]!.id).toBe("child");
+    expect(job.cameraPosition).toEqual([2, 0, 0]);
+    controlled.call(0).result.resolve(new Uint32Array([0]));
+    await controller.whenIdle();
+    expect(controlled.backend.sort).toHaveBeenCalledOnce();
+    expect(presentations[0]!.ranges[0]!.id).toBe("child");
+    controller.dispose();
+  });
+
+  it("reports admission failure for the latest scene and allows another request", async () => {
+    const failure = deferred<void>();
+    const queued = deferred<void>();
+    const controlled = controlledBackend();
+    const onError = vi.fn();
+    const schedule = vi.fn(async (run: () => Promise<void>) => {
+      queued.resolve();
+      await failure.promise;
+      await run();
+    });
+    const controller = createGaussianSortController({
+      backend: controlled.backend,
+      schedule,
+      onOrder: vi.fn(),
+      onError,
+    });
+    controller.request([0, 0, 0]);
+    await queued.promise;
+    controller.setScene([range("child", [0, 0, 1])]);
+    failure.reject(new Error("admission refused"));
+    await controller.whenIdle();
+    expect(onError).toHaveBeenCalledOnce();
+    expect(controlled.backend.sort).not.toHaveBeenCalled();
+    schedule.mockImplementation((run) => run());
+    controller.request([1, 0, 0]);
+    await controlled.call(0).started.promise;
+    controlled.call(0).result.resolve(new Uint32Array([0]));
+    await controller.whenIdle();
+    controller.dispose();
+  });
+
+  it("releases scheduled work without dispatch after disposal during admission", async () => {
+    const admitted = deferred<void>();
+    const queued = deferred<void>();
+    const released = deferred<void>();
+    const controlled = controlledBackend();
+    const onError = vi.fn();
+    const controller = createGaussianSortController({
+      backend: controlled.backend,
+      async schedule(run) {
+        queued.resolve();
+        await admitted.promise;
+        try {
+          await run();
+        } finally {
+          released.resolve();
+        }
+      },
+      onOrder: vi.fn(),
+      onError,
+    });
+    controller.request([0, 0, 0]);
+    await queued.promise;
+    controller.dispose();
+    admitted.resolve();
+    await released.promise;
+    expect(controlled.backend.sort).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it("coalesces camera updates and publishes only the latest requested order", async () => {
     const controlled = controlledBackend();
     const presentations: GaussianSortPresentation[] = [];

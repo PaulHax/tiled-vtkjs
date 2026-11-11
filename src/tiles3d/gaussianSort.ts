@@ -162,10 +162,13 @@ const sameCamera = (
 /** One running job and one latest request; only a current result is presented. */
 export const createGaussianSortController = ({
   backend,
+  schedule = (run) => run(),
   onOrder,
   onError,
 }: {
   backend: GaussianSortBackend;
+  /** Invoke once work is admitted; queued scene and camera changes coalesce. */
+  schedule?: (run: () => Promise<void>) => Promise<void>;
   onOrder(presentation: GaussianSortPresentation): void;
   onError(error: unknown): void;
 }) => {
@@ -173,7 +176,7 @@ export const createGaussianSortController = ({
   let ranges: readonly GaussianSortRange[] = [];
   let identities: readonly GaussianSortRangeIdentity[] = [];
   let camera: GaussianCameraPosition | null = null;
-  let running: GaussianSortJob | null = null;
+  let running = false;
   let completed: GaussianSortJob | null = null;
   let disposed = false;
   const idleWaiters = new Set<() => void>();
@@ -194,43 +197,42 @@ export const createGaussianSortController = ({
       settleIdle();
       return;
     }
-    const job: GaussianSortJob = {
-      sceneRevision,
-      ranges,
-      cameraPosition: camera,
-    };
-    const jobIdentities = identities;
-    running = job;
-    // Promise.resolve also routes a synchronous backend exception through the
-    // same completion path, so failed work cannot strand a pending revision.
+    let job: GaussianSortJob | null = null;
+    running = true;
     void Promise.resolve()
       .then(() => {
-        if (disposed) throw new Error("Gaussian sort controller is disposed");
-        return backend.sort(job);
-      })
-      .then(
-        (order) => {
-          if (!disposed && current(job)) {
-            completed = job;
+        if (disposed) return;
+        return schedule(async () => {
+          if (disposed || !camera || (completed && current(completed))) return;
+          const dispatched: GaussianSortJob = {
+            sceneRevision,
+            ranges,
+            cameraPosition: camera,
+          };
+          job = dispatched;
+          const jobIdentities = identities;
+          const order = await backend.sort(dispatched);
+          if (!disposed && current(dispatched)) {
+            completed = dispatched;
             safeCall(() =>
               onOrder({
-                sceneRevision: job.sceneRevision,
-                cameraPosition: job.cameraPosition,
+                sceneRevision: dispatched.sceneRevision,
+                cameraPosition: dispatched.cameraPosition,
                 ranges: jobIdentities,
                 order,
               }),
             );
           }
-        },
-        (error: unknown) => {
-          if (!disposed && current(job)) {
-            completed = job;
-            safeCall(() => onError(error));
-          }
-        },
-      )
+        });
+      })
+      .catch((error: unknown) => {
+        if (!disposed && camera && (!job || current(job))) {
+          completed = job ?? { sceneRevision, ranges, cameraPosition: camera };
+          safeCall(() => onError(error));
+        }
+      })
       .finally(() => {
-        running = null;
+        running = false;
         if (disposed) settleIdle();
         else start();
       });

@@ -54,6 +54,11 @@ obsolete results are discarded. Repeating a camera position does not sort again.
 Rotation alone is not a sorting input. The last published presentation remains
 the consumer's responsibility until the next one is ready.
 
+The shared renderer acquires a work slot before capturing the scene and camera
+for a sort. Changes while admission is queued coalesce into that job. Its latest
+workspace estimate must fit the shared work-byte allowance before worker dispatch;
+the slot remains owned until the scheduled work settles, including on disposal.
+
 Use `createGaussianSortWorkerBackend` with a module worker resolved from
 `tiled-vtkjs/tiles3d/gaussian-sort-worker`. The backend owns and terminates that
 worker. Scene attributes are cloned once per scene revision; subsequent camera
