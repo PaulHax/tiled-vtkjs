@@ -14,6 +14,7 @@ import {
 import { capabilityTarget, loadersBasisFormat } from "./capabilities";
 import { repairMeshoptFallbackOffsets } from "./meshoptFallback";
 import { collectContentBuffers } from "./transfer";
+import { ResourcePolicyError } from "../../core/memoryResources";
 import type {
   CompressedTextureFormat,
   DecodeTextureTarget,
@@ -60,6 +61,8 @@ type BasisRuntimeProviderResult = {
 };
 
 export type DecodeTileOptions = {
+  /** Claim additional overlapping workspace/output before managed allocations. */
+  reserveMemory?: (bytes: number) => Promise<void>;
   modules?: Record<string, unknown>;
   fetchDependency?: (url: string) => Promise<ArrayBuffer>;
   decodeRasterImage?: (
@@ -634,7 +637,11 @@ const defaultRasterDecoder = async (
     context.drawImage(bitmap, 0, 0);
     const image = context.getImageData(0, 0, bitmap.width, bitmap.height);
     return {
-      rgba: Uint8Array.from(image.data),
+      rgba: new Uint8Array(
+        image.data.buffer,
+        image.data.byteOffset,
+        image.data.byteLength,
+      ),
       width: bitmap.width,
       height: bitmap.height,
     };
@@ -1388,6 +1395,9 @@ const decodeKtx2Texture = async (
   context: DecodeContext,
 ): Promise<TextureResult> => {
   const metadata = basisMetadata(bytes);
+  await context.options.reserveMemory?.(
+    metadata.width * metadata.height * 4 * 2,
+  );
   const target = capabilityTarget(context.request.textureCapabilities);
   const levels = await transcodeBasisLevels(bytes, metadata, target, context);
   const sourceColorSpace = metadata.srgb ? "srgb" : "linear";
@@ -1437,12 +1447,108 @@ const decodeKtx2Texture = async (
   };
 };
 
+const rasterDimensions = (
+  bytes: Uint8Array,
+): readonly [number, number] | null => {
+  const data = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (
+    bytes.length >= 24 &&
+    data.getUint32(0) === 0x89504e47 &&
+    data.getUint32(4) === 0x0d0a1a0a
+  ) {
+    return [data.getUint32(16), data.getUint32(20)];
+  }
+  if (bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  for (let offset = 2; offset + 4 < bytes.length;) {
+    if (bytes[offset] !== 0xff) return null;
+    const marker = bytes[offset + 1]!;
+    if (marker === 0xff) {
+      offset += 1;
+      continue;
+    }
+    if (marker === 0xd9 || marker === 0xda) return null;
+    const length = data.getUint16(offset + 2);
+    if (length < 2 || offset + 2 + length > bytes.length) return null;
+    if (
+      [
+        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce,
+        0xcf,
+      ].includes(marker) &&
+      length >= 7
+    ) {
+      return [data.getUint16(offset + 7), data.getUint16(offset + 5)];
+    }
+    offset += length + 2;
+  }
+  return null;
+};
+
+const fetchManagedDependency = async (
+  url: string,
+  options: DecodeTileOptions,
+): Promise<ArrayBuffer> => {
+  if (!options.reserveMemory)
+    return (options.fetchDependency ?? fetchOkBytes)(url);
+  if (options.fetchDependency) {
+    const bytes = await options.fetchDependency(url);
+    await options.reserveMemory(bytes.byteLength * 2);
+    return bytes;
+  }
+  const response = await fetch(url);
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`HTTP ${response.status} fetching ${url}`);
+  }
+  const stated = Number(response.headers.get("content-length"));
+  let reserved = Number.isFinite(stated) && stated > 0 ? stated * 2 : 0;
+  try {
+    await options.reserveMemory(reserved);
+  } catch (error) {
+    await response.body?.cancel().catch(() => {});
+    throw error;
+  }
+  if (!response.body) {
+    const bytes = await response.arrayBuffer();
+    await options.reserveMemory(Math.max(0, bytes.byteLength * 2 - reserved));
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      length += next.value.byteLength;
+      if (length * 2 > reserved) {
+        await options.reserveMemory(length * 2 - reserved);
+        reserved = length * 2;
+      }
+      chunks.push(next.value);
+    }
+    const output = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      output.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return output.buffer;
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+};
+
 const decodeRasterTexture = async (
   bytes: Uint8Array,
   mimeType: string | undefined,
   sampler: SerializableSampler,
   options: DecodeTileOptions,
 ): Promise<TextureResult> => {
+  const size = rasterDimensions(bytes);
+  if (size) await options.reserveMemory?.(size[0] * size[1] * 4 * 3);
   const decoded = await (options.decodeRasterImage ?? defaultRasterDecoder)(
     bytes,
     mimeType ?? "application/octet-stream",
@@ -1456,10 +1562,11 @@ const decodeRasterTexture = async (
   ) {
     throw new Error("raster decoder returned an invalid RGBA image");
   }
+  if (!size) await options.reserveMemory?.(decoded.rgba.byteLength * 3);
   return {
     texture: {
       kind: "rgba",
-      rgba: decoded.rgba.slice(),
+      rgba: decoded.rgba,
       width: decoded.width,
       height: decoded.height,
       colorSpace: "srgb",
@@ -1477,11 +1584,8 @@ const decodeTexture = async (
   const { gltf, request, options } = context;
   const texture = requireIndex(gltf.json.textures, textureIndex, "texture");
   const image = requireIndex(gltf.json.images, texture.source ?? -1, "image");
-  const { bytes, mediaType } = await imageBytes(
-    gltf,
-    image,
-    request,
-    options.fetchDependency ?? fetchOkBytes,
+  const { bytes, mediaType } = await imageBytes(gltf, image, request, (url) =>
+    fetchManagedDependency(url, options),
   );
   const sampler = samplerFor(gltf.json, texture.sampler);
   const mimeType = image.mimeType ?? mediaType;
@@ -1609,6 +1713,37 @@ const decodeTileContentInner = async (
   // bytes handed to the parser describe the same buffer layout.
   const content = repairMeshoptFallbackOffsets(request.content);
   const originalJson = contentJson(content);
+  await options.reserveMemory?.(0);
+  if (options.reserveMemory) {
+    let geometry = 0;
+    for (const [index, accessor] of (originalJson.accessors ?? []).entries()) {
+      const components = COMPONENTS[accessor.type];
+      const width = COMPONENT_BYTES[accessor.componentType];
+      if (!Number.isSafeInteger(accessor.count) || accessor.count < 0)
+        throw new Error(`glTF accessor ${index} has an invalid count`);
+      if (!components || !width) continue;
+      if (accessor.bufferView !== undefined) {
+        const view = requireIndex(
+          originalJson.bufferViews,
+          accessor.bufferView,
+          "bufferView",
+        );
+        const stride = view.byteStride ?? components * width;
+        const end =
+          (accessor.byteOffset ?? 0) +
+          Math.max(0, accessor.count - 1) * stride +
+          components * width;
+        if (
+          !Number.isSafeInteger(end) ||
+          stride < components * width ||
+          end > view.byteLength
+        )
+          throw new Error(`glTF accessor ${index} exceeds its buffer`);
+      }
+      geometry += accessor.count * components * 4 * 3;
+    }
+    await options.reserveMemory(geometry);
+  }
   validateRequiredExtensions(originalJson, request.contentUrl);
   const allowedDependencies = dependencyAllowlist(request, originalJson);
   const needsDraco = hasExtension(originalJson, "KHR_draco_mesh_compression");
@@ -1623,46 +1758,56 @@ const decodeTileContentInner = async (
   }
 
   const modules = { ...wasmModules(request.wasm), ...options.modules };
-  const fetchDependency = async (value: string): Promise<Response> => {
-    const embeddedCandidate = allowedDependencies.embedded.get(value);
-    if (embeddedCandidate) {
-      const embedded = decodeDataUri(embeddedCandidate)!;
-      return new Response(copyArrayBuffer(embedded.bytes), { status: 200 });
-    }
-    if (decodeDataUri(value)) {
-      throw new Error(
-        "glTF parser requested an unauthorized embedded dependency",
-      );
-    }
-    const requestedUrl = new URL(value, request.contentUrl).href;
-    const canonicalUrl = allowedDependencies.external.get(requestedUrl);
-    if (!canonicalUrl) {
-      throw new Error(
-        `glTF parser requested an unauthorized dependency: ${value}`,
-      );
-    }
-    const data = await (options.fetchDependency ?? fetchOkBytes)(canonicalUrl);
-    return new Response(data, { status: 200 });
+  const dependencyJobs: Promise<Response>[] = [];
+  const fetchDependency = (value: string): Promise<Response> => {
+    const operation = (async (): Promise<Response> => {
+      const embeddedCandidate = allowedDependencies.embedded.get(value);
+      if (embeddedCandidate) {
+        const embedded = decodeDataUri(embeddedCandidate)!;
+        return new Response(copyArrayBuffer(embedded.bytes), { status: 200 });
+      }
+      if (decodeDataUri(value)) {
+        throw new Error(
+          "glTF parser requested an unauthorized embedded dependency",
+        );
+      }
+      const requestedUrl = new URL(value, request.contentUrl).href;
+      const canonicalUrl = allowedDependencies.external.get(requestedUrl);
+      if (!canonicalUrl) {
+        throw new Error(
+          `glTF parser requested an unauthorized dependency: ${value}`,
+        );
+      }
+      const data = await fetchManagedDependency(canonicalUrl, options);
+      return new Response(data, { status: 200 });
+    })();
+    dependencyJobs.push(operation);
+    return operation;
   };
-  const parsed = (await parse(content.slice(0), GLTFLoader, {
-    core: {
-      worker: false,
-      CDN: null,
-      useLocalLibraries: true,
-      baseUrl: request.contentUrl,
-      fetch: fetchDependency,
-    },
-    modules,
-    // Extract the stored index buffer; the authored glTF primitive mode still
-    // determines its topology. Generating new Draco strips changes that buffer.
-    draco: { topology: "triangle-list" },
-    gltf: {
-      normalize: false,
-      loadBuffers: true,
-      loadImages: false,
-      decompressMeshes: true,
-    },
-  })) as unknown as ParsedGltf;
+  let parsed: ParsedGltf;
+  try {
+    parsed = (await parse(content.slice(0), GLTFLoader, {
+      core: {
+        worker: false,
+        CDN: null,
+        useLocalLibraries: true,
+        baseUrl: request.contentUrl,
+        fetch: fetchDependency,
+      },
+      modules,
+      // Extract the stored index buffer; the authored glTF primitive mode still
+      // determines its topology. Generating new Draco strips changes that buffer.
+      draco: { topology: "triangle-list" },
+      gltf: {
+        normalize: false,
+        loadBuffers: true,
+        loadImages: false,
+        decompressMeshes: true,
+      },
+    })) as unknown as ParsedGltf;
+  } finally {
+    await Promise.allSettled(dependencyJobs);
+  }
   // loaders.gl normalizes material objects and currently drops the empty
   // KHR_materials_unlit marker. Material indices remain stable, so restore
   // that renderer-significant authored flag from the validated source JSON.
@@ -1696,7 +1841,7 @@ const decodeTileContentInner = async (
     diagnostics,
     textureCache: new Map(),
   };
-  const primitives: DecodedPrimitive[] = await Promise.all(
+  const results = await Promise.allSettled(
     pending.map(async ({ rtc, materialIndex, colors }) => ({
       ...(colors ? { colors } : {}),
       positions: rebasePositions(rtc, origin),
@@ -1705,6 +1850,11 @@ const decodeTileContentInner = async (
       ...(rtc.indices ? { indices: rtc.indices } : {}),
       material: await materialFor(materialIndex, rtc, context),
     })),
+  );
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
+  const primitives = results.map(
+    (result) => (result as PromiseFulfilledResult<DecodedPrimitive>).value,
   );
   return {
     primitives,
@@ -1724,7 +1874,11 @@ export const decodeTileContent = async (
   try {
     return await decodeTileContentInner(request, options);
   } catch (error) {
-    if (error instanceof TileDecodeError) throw error;
+    if (
+      error instanceof TileDecodeError ||
+      error instanceof ResourcePolicyError
+    )
+      throw error;
     const reason = error instanceof Error ? error.message : String(error);
     throw new TileDecodeError(request.contentUrl, "decode", reason, {
       cause: error,

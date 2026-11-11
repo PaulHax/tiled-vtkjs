@@ -21,6 +21,12 @@ import {
 } from "../core/submissionScheduler";
 import { IDENTITY, translatedMatrix, type Mat16 } from "../core/mat4";
 import { safeCall } from "../core/observers";
+import {
+  ResourcePolicyError,
+  type MemoryOwner,
+  type MemoryLease,
+} from "../core/memoryResources";
+import { buildTransferList } from "./decode/transfer";
 import type {
   DecodedPrimitive,
   DecodedTexture,
@@ -43,6 +49,8 @@ export type MeshAdapterOptions = {
   readonly submissions: SubmissionScheduler;
   readonly visible?: boolean;
   readonly onError?: (error: unknown) => void;
+  readonly memory?: MemoryOwner;
+  readonly onPolicyRefusal?: (error: ResourcePolicyError) => void;
 };
 
 export type MeshAdapterStats = {
@@ -93,6 +101,10 @@ export type MeshTileState = "absent" | "queued" | "submitted" | "failed";
 export type MeshSubmitOutcome = "queued" | "budget-blocked" | "failed";
 
 export type MeshAdapter = {
+  estimateTileBytes(content: DecodedTileContent): number;
+  requiredBytes(): number;
+  clearRequiredBytes(): void;
+  trimReuse(): void;
   submitTile(
     id: string,
     content: DecodedTileContent,
@@ -159,12 +171,16 @@ type TileResources = {
   readonly textureBytes: number;
   readonly formats: Set<string>;
   attached: boolean;
+  readonly memory?: MemoryLease;
+  readonly cpuBuffers: Set<ArrayBuffer>;
+  cpuReservedBytes: number;
 };
 
 type PendingTile = {
   readonly id: string;
   readonly jobs: Submission[];
   readonly resources: TileResources;
+  readonly sourceMemory?: MemoryLease;
   readonly onSubmitted?: () => void;
   readonly replacementIds: readonly string[];
   remainingJobs: number;
@@ -411,7 +427,11 @@ const primitiveChunk = (
 const rgbaImageData = (
   texture: Extract<DecodedTexture, { kind: "rgba" }>,
 ): ImageData => {
-  const pixels = new Uint8ClampedArray(texture.rgba);
+  const pixels = new Uint8ClampedArray(
+    texture.rgba.buffer as ArrayBuffer,
+    texture.rgba.byteOffset,
+    texture.rgba.byteLength,
+  );
   if (typeof ImageData === "function")
     return new ImageData(pixels, texture.width, texture.height);
   return {
@@ -429,6 +449,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   let visible = options.visible ?? true;
   let baseMatrix: readonly number[] = IDENTITY;
   let resourceCeilingBytes = Number.POSITIVE_INFINITY;
+  let requiredBytes = 0;
   let disposed = false;
   let workRevision = 0;
   // Running byte totals rather than a walk per question. Trimming asks how
@@ -514,6 +535,8 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     tile.primitives.length = 0;
     tile.textures.clear();
     tile.attached = false;
+    tile.memory?.release();
+    tile.cpuBuffers.clear();
   };
 
   const createTexture = (decoded: DecodedTexture): VtkTexture => {
@@ -664,6 +687,17 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         polyData,
         primitive: submittedPrimitive,
       };
+      for (const array of [
+        primitive.positions,
+        primitive.normals,
+        primitive.uvs,
+        primitive.indices,
+        cells,
+        colors,
+      ]) {
+        if (array?.buffer instanceof ArrayBuffer)
+          tile.cpuBuffers.add(array.buffer);
+      }
       includeBounds(tile, primitive.positions);
       tile.primitives.push(resources);
       setActorState(tile, resources);
@@ -697,6 +731,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         }
       }
       release(member.resources);
+      member.sourceMemory?.release();
       cancelled.push(member.id);
     }
     if (cancelled.length > 0) workRevision += 1;
@@ -758,6 +793,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     if (entry.cancelled || disposed || pending.get(entry.id) !== entry) return;
     attach(entry.resources);
     dropPending(entry);
+    entry.sourceMemory?.release();
     admit(entry.id, entry.resources);
     workRevision += 1;
     options.scheduleRender();
@@ -797,6 +833,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     onSubmitted?: () => void,
     replacementIds: readonly string[] = [],
     preapprovedPlan?: RealizationPlan,
+    preapprovedMemory?: MemoryLease,
   ): MeshSubmitOutcome => {
     if (disposed || failed.has(id)) return "failed";
     if (pending.has(id) || submitted.has(id)) return "queued";
@@ -833,6 +870,19 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       reservedBytes() + geometryBytes + textureBytes - replacementBytes >
         resourceCeilingBytes
     ) {
+      requiredBytes = Math.max(
+        requiredBytes,
+        reservedBytes() + geometryBytes + textureBytes - replacementBytes,
+      );
+      safeCall(() =>
+        options.onPolicyRefusal?.(
+          new ResourcePolicyError(
+            "renderer",
+            requiredBytes,
+            resourceCeilingBytes,
+          ),
+        ),
+      );
       return "budget-blocked";
     }
     const oversized = content.primitives.find(
@@ -851,6 +901,29 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       );
       return "failed";
     }
+    let resourceMemory = preapprovedMemory;
+    let sourceMemory: MemoryLease | undefined;
+    try {
+      resourceMemory ??= options.memory?.reserveRenderer(
+        geometryBytes + textureBytes,
+        {
+          cpuBytes: geometryBytes,
+          replacing: normalizedReplacements.flatMap((key) =>
+            submitted.get(key)?.memory ? [submitted.get(key)!.memory!] : [],
+          ),
+        },
+      );
+      sourceMemory = options.memory?.retain(buildTransferList(content));
+    } catch (error) {
+      resourceMemory?.release();
+      if (!(error instanceof ResourcePolicyError)) throw error;
+      requiredBytes = Math.max(
+        requiredBytes,
+        reservedBytes() + geometryBytes + textureBytes - replacementBytes,
+      );
+      safeCall(() => options.onPolicyRefusal?.(error));
+      return "budget-blocked";
+    }
     const resources: TileResources = {
       id,
       origin: [...content.origin],
@@ -861,11 +934,15 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       textureBytes,
       formats,
       attached: false,
+      memory: resourceMemory,
+      cpuBuffers: new Set(),
+      cpuReservedBytes: geometryBytes,
     };
     const entry: PendingTile = {
       id,
       jobs: [],
       resources,
+      sourceMemory,
       replacementIds: normalizedReplacements,
       remainingJobs: 0,
       cancelled: false,
@@ -877,7 +954,12 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       replacementClaims.set(replacementId, id);
     const textures = new Map<DecodedTexture, VtkTexture>();
     const pickAlphaTextures = new Map<DecodedTexture, PickAlphaTexture>();
-    const enqueue = (bytes: number, run: () => void, atomic = false): void => {
+    const enqueue = (
+      bytes: number,
+      run: () => void,
+      atomic = false,
+      cpuBytes = bytes,
+    ): void => {
       entry.remainingJobs += 1;
       const submission = options.submissions.enqueue({
         bytes,
@@ -885,6 +967,14 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         run: () => {
           if (entry.cancelled || disposed) return;
           run();
+          resources.cpuReservedBytes = Math.max(
+            0,
+            resources.cpuReservedBytes - cpuBytes,
+          );
+          resources.memory?.setCpu(
+            resources.cpuBuffers,
+            resources.cpuReservedBytes,
+          );
           entry.remainingJobs -= 1;
           if (entry.remainingJobs === 0) {
             entry.ready = true;
@@ -922,8 +1012,16 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
             const texture = createTexture(decodedTexture);
             textures.set(decodedTexture, texture);
             resources.textures.add(texture);
+            if (decodedTexture.kind === "rgba")
+              resources.cpuBuffers.add(
+                decodedTexture.rgba.buffer as ArrayBuffer,
+              );
+            else
+              for (const level of decodedTexture.levels)
+                resources.cpuBuffers.add(level.data.buffer as ArrayBuffer);
             if (alphaSource) {
               const alpha = new Uint8Array(alphaBytes);
+              resources.cpuBuffers.add(alpha.buffer);
               for (let pixel = 0; pixel < alpha.length; pixel += 1)
                 alpha[pixel] = alphaSource.rgba[pixel * 4 + 3]!;
               pickAlphaTextures.set(decodedTexture, {
@@ -935,6 +1033,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
             }
           },
           true,
+          alphaBytes,
         );
       }
       content.primitives.forEach((primitive) => {
@@ -984,6 +1083,20 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   };
 
   const api: MeshAdapter = {
+    estimateTileBytes(content) {
+      const plan = realizationPlan(content, maxJobBytes);
+      return plan.geometryBytes + plan.textureBytes;
+    },
+    requiredBytes: () => requiredBytes,
+    clearRequiredBytes() {
+      requiredBytes = 0;
+    },
+    trimReuse() {
+      for (const [id, tile] of pooled) {
+        unpool(id, tile);
+        release(tile);
+      }
+    },
     restoreTile(id) {
       if (disposed || failed.has(id)) return "failed";
       const reusable = pooled.get(id);
@@ -1046,6 +1159,41 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         reservedBytes() + groupBytes - replacementBytes >
         resourceCeilingBytes
       ) {
+        requiredBytes = Math.max(
+          requiredBytes,
+          reservedBytes() + groupBytes - replacementBytes,
+        );
+        safeCall(() =>
+          options.onPolicyRefusal?.(
+            new ResourcePolicyError(
+              "renderer",
+              requiredBytes,
+              resourceCeilingBytes,
+            ),
+          ),
+        );
+        return "budget-blocked";
+      }
+
+      let groupMemory: MemoryLease[] = [];
+      try {
+        groupMemory =
+          options.memory?.reserveRendererGroup(
+            plans.map((plan) => ({
+              rendererBytes: plan.geometryBytes + plan.textureBytes,
+              cpuBytes: plan.geometryBytes,
+            })),
+            normalizedReplacements.flatMap((id) =>
+              submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
+            ),
+          ) ?? [];
+      } catch (error) {
+        if (!(error instanceof ResourcePolicyError)) throw error;
+        requiredBytes = Math.max(
+          requiredBytes,
+          reservedBytes() + groupBytes - replacementBytes,
+        );
+        safeCall(() => options.onPolicyRefusal?.(error));
         return "budget-blocked";
       }
 
@@ -1058,11 +1206,13 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           entry.onSubmitted,
           index === entries.length - 1 ? normalizedReplacements : [],
           plans[index],
+          groupMemory[index],
         );
         if (outcome !== "queued") {
           for (const id of admitted) {
             if (!api.cancelTile(id)) api.retireTile(id);
           }
+          for (const lease of groupMemory) lease.release();
           return outcome;
         }
         admitted.push(entry.id);

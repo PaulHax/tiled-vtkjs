@@ -5,9 +5,10 @@
 
 import { finiteAbove, finiteAtLeast } from "./numeric";
 
-export type LruCacheOptions = {
+export type LruCacheOptions<K = unknown, V = unknown> = {
   /** Maximum total bytes retained. Must be > 0. */
   maxBytes: number;
+  onEvict?: (key: K, value: V) => void;
 };
 
 export type LruCache<K, V> = {
@@ -28,6 +29,7 @@ export type LruCache<K, V> = {
   totalBytes(): number;
   /** Current entry count. */
   count(): number;
+  trimTo(bytes: number): void;
 };
 
 type Entry<V> = {
@@ -36,7 +38,7 @@ type Entry<V> = {
 };
 
 export const createLruCache = <K, V>(
-  options: LruCacheOptions,
+  options: LruCacheOptions<K, V>,
 ): LruCache<K, V> => {
   const { maxBytes } = options;
   finiteAbove("maxBytes", maxBytes, 0);
@@ -52,6 +54,7 @@ export const createLruCache = <K, V>(
     if (entry === undefined) return false;
     entries.delete(key);
     totalBytes -= entry.bytes;
+    options.onEvict?.(key, entry.value);
     return true;
   };
 
@@ -87,8 +90,7 @@ export const createLruCache = <K, V>(
     },
 
     clear() {
-      entries.clear();
-      totalBytes = 0;
+      for (const key of entries.keys()) remove(key);
     },
 
     totalBytes() {
@@ -97,6 +99,12 @@ export const createLruCache = <K, V>(
 
     count() {
       return entries.size;
+    },
+    trimTo(bytes) {
+      for (const key of entries.keys()) {
+        if (totalBytes <= bytes) break;
+        remove(key);
+      }
     },
   };
 };

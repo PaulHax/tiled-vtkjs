@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PerspectiveCameraView } from "../core/camera";
+import { createMemoryPool } from "../core/memoryPool";
+import type { MemoryOwner } from "../core/memoryResources";
 import { createLodController } from "./controller";
 import { keyToString, type VoxelKey } from "./octree";
 import { createRendererAdapter, type RendererAdapter } from "./rendererAdapter";
@@ -33,6 +35,7 @@ const makeAdapter = (options?: {
   devicePixelRatio?: number;
   visible?: boolean;
   densityFraction?: number;
+  memory?: MemoryOwner;
 }) => {
   // Attachment, not call counts: what costs a frame is what the renderer
   // holds, and the same actor legitimately leaves and rejoins the prop list as
@@ -541,6 +544,43 @@ describe("adapter resource pool", () => {
       submittedPoints: 4,
       pooledTiles: 0,
       gpuResidentTiles: 1,
+    });
+  });
+
+  it("releases pooled graphics and ownership when restoring actor state fails", () => {
+    const memory = createMemoryPool({ totalBytes: 1024 });
+    const owner = memory.createOwner();
+    const { adapter, attached } = makeAdapter({ memory: owner });
+    const data = tile([0, 0, 0]);
+    const key = keyToString(KEY_A);
+    adapter.applyBatch({
+      added: [
+        { key: KEY_A, tile: data, memory: adapter.reserveTile(key, data) },
+      ],
+      removed: [],
+    });
+    drop(adapter, KEY_A);
+    const reused = adapter.reserveTile(key, data);
+    vi.spyOn(actorInstances[0]!, "setUserMatrix").mockImplementation(() => {
+      throw new RangeError("injected actor state failure");
+    });
+    expect(() =>
+      adapter.applyBatch({
+        added: [{ key: KEY_A, tile: data, memory: reused }],
+        removed: [],
+      }),
+    ).toThrow("injected actor state failure");
+    expect(attached.size).toBe(0);
+    expect(actorInstances[0]!.deleted).toBe(true);
+    expect(mapperInstances[0]!.deleted).toBe(true);
+    expect(polyDataInstances[0]!.deleted).toBe(true);
+    expect(adapter.activeKeys()).toEqual({ submitted: [], pooled: [] });
+    owner.close();
+    adapter.dispose();
+    expect(memory.stats()).toMatchObject({
+      owners: 0,
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
     });
   });
 

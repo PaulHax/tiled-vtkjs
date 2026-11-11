@@ -481,6 +481,13 @@ export const createCopcTileSource = async (
         throw new Error(`Hierarchy not loaded for node ${keyString}`);
       }
       opts?.signal?.throwIfAborted();
+      opts?.memory?.resize(
+        Math.max(
+          opts.memory.bytes(),
+          node.pointCount * (copc.header.pointDataRecordLength + 30) +
+            node.pointDataLength * 2,
+        ),
+      );
       const decoded = keyString === rootKeyString ? rootView : null;
       if (decoded !== null) rootView = null;
       return readTile(

@@ -22,6 +22,12 @@ import {
   type PreparedView,
 } from "../core/camera";
 import {
+  resourcePolicyError,
+  type MemoryOwner,
+  type MemoryLease,
+  type ResourcePolicyError,
+} from "../core/memoryResources";
+import {
   EMPTY_DRAW_PLAN,
   largestTerminalSpacing,
   planDraw,
@@ -116,10 +122,13 @@ export type LodControllerOptions = {
    * GPU-memory budget for resident tile bytes, updated through
    * `setMemoryBudgetBytes`. Defaults to `defaultMemoryBudgetBytes()`. The
    * controller converts it into a point ceiling using the measured
-   * bytes-per-point of resident tiles, so the frame-time loop can never climb
-   * into an out-of-memory failure it has no way to sense.
+   * bytes-per-point of resident tiles. This is managed accounting, not a
+   * measurement of available VRAM or a guarantee against allocation failure.
    */
   memoryBudgetBytes?: number;
+  memory?: MemoryOwner;
+  reserveRenderer?: (key: string, tile: TileData) => MemoryLease | undefined;
+  onPolicyRefusal?: (error: ResourcePolicyError) => void;
   /** Parallel tile fetches. Default 6. */
   fetchConcurrency?: number;
   /**
@@ -266,6 +275,10 @@ export type LodControllerStats = {
  * frame. Every field here is the same value under the same name there.
  */
 export type LodGovernorInputs = {
+  readonly memoryDemand: {
+    readonly minimumBytes: number;
+    readonly desiredBytes: number;
+  };
   readonly workRevision: number;
   /** Read from counts the loaders keep, so it walks nothing. */
   readonly workPending: boolean;
@@ -376,6 +389,8 @@ export type LodController = {
   setSource(source: TileSource): void;
   /** Force an immediate reselection with the current camera. */
   refresh(): void;
+  retryMemory(): void;
+  trimCache(bytes: number): void;
   /** Change the screen-space refinement cutoff and reselect immediately. */
   setRefinementCutoffPx(pixels: number): void;
   /**
@@ -559,7 +574,13 @@ export const createLodController = (
   const byFrontierPriority = (keyStrings: readonly string[]): string[] =>
     view === null ? [...keyStrings] : frontierOrder(keyStrings, nodes, view);
 
-  const residency = createPayloadResidency({ cacheBytes });
+  const residency = createPayloadResidency({
+    cacheBytes,
+    memory: options.memory,
+    reserveRenderer: options.reserveRenderer,
+    onPolicyRefusal: options.onPolicyRefusal,
+  });
+  const hierarchyMemory = new Map<string, MemoryLease>();
 
   // The byte share converts to a point ceiling at the measured bytes per point
   // of resident tiles. Whatever budget the host asks for, this ceiling is what
@@ -578,11 +599,15 @@ export const createLodController = (
 
   const memoryCeilingPoints = (): number => {
     const totals = residency.totals();
-    return pointCapacity(
+    const root = nodes.get(ROOT_KEY_STRING);
+    const capacity = pointCapacity(
       memoryBudgetBytes(),
-      totals.residentPoints,
-      totals.residentBytes,
+      totals.residentPoints || root?.pointCount || 0,
+      totals.residentBytes || (root ? nodePayloadBytes(root) : 0),
     );
+    return root && nodePayloadBytes(root) <= memoryBudgetBytes()
+      ? Math.max(root.pointCount, capacity)
+      : capacity;
   };
 
   let selection: PointSelection = EMPTY_SELECTION;
@@ -636,15 +661,34 @@ export const createLodController = (
     });
   };
 
-  const pages = createLoader<readonly NodeInfo[]>({
-    load: (keyString, signal) =>
-      source.nodes(keyFromString(keyString), { signal }),
+  const pages = createLoader<{
+    infos: readonly NodeInfo[];
+    memory?: MemoryLease;
+  }>({
+    load: async (keyString, signal) => {
+      const work = options.memory
+        ? await options.memory.work(signal, 0)
+        : undefined;
+      try {
+        signal.throwIfAborted();
+        const infos = await source.nodes(keyFromString(keyString), {
+          signal,
+          memory: work,
+        });
+        work?.resize(Math.max(work.bytes(), infos.length * 320));
+        return { infos, memory: work?.commit([], infos.length * 160) };
+      } finally {
+        work?.release();
+      }
+    },
     concurrency: hierarchyConcurrency,
     retry: POINT_RETRY_POLICY,
     // A page survives deactivation in the hierarchy, so cancelling one would
     // only buy a refetch of the same bytes.
     cancelGraceMs: Number.POSITIVE_INFINITY,
-    onLoaded: (keyString, infos) => {
+    onLoaded: (keyString, { infos, memory }) => {
+      hierarchyMemory.get(keyString)?.release();
+      if (memory) hierarchyMemory.set(keyString, memory);
       // Resolve a deferred diagnostic before changing its hierarchy inputs.
       // This avoids copying the hierarchy merely to preserve an old snapshot.
       readTerminalSpacing();
@@ -664,43 +708,82 @@ export const createLodController = (
       // one selection derives from it.
       runSelection();
     },
-    onFailed: (_keyString, error) => onError(error),
+    onDiscarded: ({ memory }) => memory?.release(),
+    onFailed: (_keyString, error) => {
+      const refusal = resourcePolicyError(error);
+      if (refusal) options.onPolicyRefusal?.(refusal);
+      else onError(error);
+    },
     onChange: markWork,
   });
 
-  const tiles = createLoader<TileData>({
-    load: (keyString, signal) =>
-      source.loadTile(keyFromString(keyString), { signal }),
+  const tiles = createLoader<{ tile: TileData; memory?: MemoryLease }>({
+    load: async (keyString, signal) => {
+      const work = options.memory
+        ? await options.memory.work(signal, 0)
+        : undefined;
+      try {
+        signal.throwIfAborted();
+        const estimate = nodes.get(keyString);
+        if (estimate) work?.resize(nodePayloadBytes(estimate) * 3);
+        const tile = await source.loadTile(keyFromString(keyString), {
+          signal,
+          memory: work,
+        });
+        work?.resize(Math.max(work.bytes(), tileBytes(tile) * 3));
+        return {
+          tile,
+          memory: work?.commit([
+            tile.positions.buffer as ArrayBuffer,
+            ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+          ]),
+        };
+      } finally {
+        work?.release();
+      }
+    },
     concurrency: fetchConcurrency,
     retry: POINT_RETRY_POLICY,
     // One selection interval, in which an orbit or pan crossing back over a
     // recent tile adopts its read instead of cancelling and refetching it.
     cancelGraceMs: selectionDelayMs,
-    onLoaded: (keyString, tile) => {
-      const entry = nodes.get(keyString);
-      const bytes = tileBytes(tile);
-      const exceedsEstimate =
-        entry !== undefined && bytes > nodePayloadBytes(entry);
-      if (entry !== undefined)
-        nodes.set(keyString, { ...entry, tileBytes: bytes });
-      // A source may decode more points than its hierarchy advertised. Learn
-      // that cost before admitting the payload, and keep it after cache
-      // eviction so another selection cannot refetch the same oversized tile.
-      if (exceedsEstimate && selection.target.has(keyString)) {
-        runSelection(undefined, { keyString, tile });
-        return;
-      }
-      // Cancellation is advisory, so a cancelled read can still deliver. If
-      // the key was reselected while it ran, this payload is exactly what the
-      // selection is waiting for.
-      if (selection.target.has(keyString) && !residency.isResident(keyString)) {
-        residency.hold(keyString, tile);
-        scheduleFlush();
-      } else {
-        residency.park(keyString, tile);
+    onLoaded: (keyString, { tile, memory }) => {
+      try {
+        const entry = nodes.get(keyString);
+        const bytes = tileBytes(tile);
+        const exceedsEstimate =
+          entry !== undefined && bytes > nodePayloadBytes(entry);
+        if (entry !== undefined)
+          nodes.set(keyString, { ...entry, tileBytes: bytes });
+        // A source may decode more points than its hierarchy advertised. Learn
+        // that cost before admitting the payload, and keep it after cache
+        // eviction so another selection cannot refetch the same oversized tile.
+        if (exceedsEstimate && selection.target.has(keyString)) {
+          runSelection(undefined, { keyString, tile });
+          return;
+        }
+        // Cancellation is advisory, so a cancelled read can still deliver. If
+        // the key was reselected while it ran, this payload is exactly what the
+        // selection is waiting for.
+        if (
+          selection.target.has(keyString) &&
+          !residency.isResident(keyString)
+        ) {
+          residency.hold(keyString, tile);
+          scheduleFlush();
+        } else {
+          residency.park(keyString, tile);
+        }
+      } finally {
+        memory?.release();
       }
     },
-    onFailed: (_keyString, error) => onError(error),
+    onDiscarded: ({ memory }) => memory?.release(),
+    onFailed: (_keyString, error) => {
+      const refusal = resourcePolicyError(error);
+      if (refusal) options.onPolicyRefusal?.(refusal);
+      else onError(error);
+    },
     onChange: markWork,
   });
 
@@ -815,6 +898,7 @@ export const createLodController = (
       // Structural hierarchy nodes participate in selection but carry no tile.
       if (nodes.get(keyString)?.pointCount === 0) continue;
       if (residency.promote(keyString)) continue;
+      if (residency.blocked(keyString)) continue;
       missing.push(keyString);
     }
     scheduleFlush();
@@ -881,6 +965,8 @@ export const createLodController = (
     tiles.reset();
     pages.reset();
     nodes.clear();
+    for (const lease of hierarchyMemory.values()) lease.release();
+    hierarchyMemory.clear();
     loadedPages.clear();
     residency.clear();
     clearSelection();
@@ -904,6 +990,13 @@ export const createLodController = (
   };
 
   return {
+    retryMemory() {
+      residency.retryBlocked();
+      tiles.retryBlocked();
+      pages.retryBlocked();
+      runSelection();
+    },
+    trimCache: (bytes) => residency.trimCache(bytes),
     setCamera(nextView) {
       if (disposed || !usableView(nextView)) return;
       // Hosts feed the camera on every render, so an unchanged view is a
@@ -1035,6 +1128,14 @@ export const createLodController = (
       const tileCounts = tiles.counts();
       const pageCounts = pages.counts();
       return {
+        memoryDemand: {
+          minimumBytes: nodes.has(ROOT_KEY_STRING)
+            ? nodePayloadBytes(nodes.get(ROOT_KEY_STRING)!)
+            : 0,
+          desiredBytes: loadedPages.has(ROOT_KEY_STRING)
+            ? selection.memoryDemandBytes
+            : Number.POSITIVE_INFINITY,
+        },
         workRevision,
         workPending: workPendingIn(tileCounts, pageCounts),
         memoryBudgetBytes: memoryBudgetBytes(),

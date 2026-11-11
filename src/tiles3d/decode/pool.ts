@@ -5,6 +5,11 @@ import type {
   DecodeWorkerPoolHandle,
 } from "./types";
 import {
+  ResourcePolicyError,
+  type MemoryWork,
+  type MemoryDomain,
+} from "../../core/memoryResources";
+import {
   TileDecodeError,
   TileUnsupportedExtensionError,
   type TileDecodeStage,
@@ -14,6 +19,25 @@ type DecodeWorkerRequestMessage = {
   kind: "decode";
   jobId: number;
   request: DecodeTileRequest;
+  managedMemory?: boolean;
+};
+
+export type DecodeMemoryRequestMessage = {
+  kind: "memory-request";
+  jobId: number;
+  requestId: number;
+  bytes: number;
+};
+export type DecodeMemoryResponseMessage = {
+  kind: "memory-response";
+  jobId: number;
+  requestId: number;
+  error?: {
+    domain: MemoryDomain;
+    requestedBytes: number;
+    limitBytes: number;
+    retryable: boolean;
+  };
 };
 
 type DecodeWorkerCompleteMessage = {
@@ -32,6 +56,10 @@ type DecodeWorkerErrorMessage = {
     readonly stage?: TileDecodeStage;
     readonly reason?: string;
     readonly extension?: string;
+    readonly domain?: MemoryDomain;
+    readonly requestedBytes?: number;
+    readonly limitBytes?: number;
+    readonly retryable?: boolean;
   };
 };
 
@@ -43,7 +71,7 @@ export type DecodeWorkerLike = {
   onmessage: ((event: MessageEvent<unknown>) => void) | null;
   onerror: ((event: ErrorEvent) => void) | null;
   postMessage(
-    message: DecodeWorkerRequestMessage,
+    message: DecodeWorkerRequestMessage | DecodeMemoryResponseMessage,
     transfer?: Transferable[],
   ): void;
   terminate(): void;
@@ -62,6 +90,7 @@ type JobRecord = {
   startedAt: number | null;
   resolve(value: DecodedTileContent): void;
   reject(reason: unknown): void;
+  memory?: MemoryWork;
 };
 
 type WorkerSlot = {
@@ -142,7 +171,10 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
     );
   }
 
-  decode(request: DecodeTileRequest): DecodeJob {
+  decode(
+    request: DecodeTileRequest,
+    options: { readonly memory?: MemoryWork } = {},
+  ): DecodeJob {
     if (this.#disposed) throw new DecodeWorkerPoolDisposedError();
     let resolve!: (value: DecodedTileContent) => void;
     let reject!: (reason: unknown) => void;
@@ -159,6 +191,7 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
       startedAt: null,
       resolve,
       reject,
+      memory: options.memory,
     };
     this.#nextJobId += 1;
     this.#queued.push(record);
@@ -233,12 +266,47 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
         kind: "decode",
         jobId: record.jobId,
         request: record.request,
+        managedMemory: record.memory !== undefined,
       };
       slot.worker.postMessage(message, [record.request.content]);
     }
   }
 
   #onMessage(slot: WorkerSlot, value: unknown): void {
+    if (
+      value &&
+      typeof value === "object" &&
+      "kind" in value &&
+      value.kind === "memory-request"
+    ) {
+      const message = value as DecodeMemoryRequestMessage;
+      const active = slot.active;
+      if (!active || active.jobId !== message.jobId) return;
+      const response: DecodeMemoryResponseMessage = {
+        kind: "memory-response",
+        jobId: message.jobId,
+        requestId: message.requestId,
+      };
+      try {
+        active.memory?.resize(message.bytes);
+      } catch (error) {
+        if (!(error instanceof ResourcePolicyError)) {
+          this.#onWorkerFailure(
+            slot,
+            new DecodeWorkerError("invalid memory reservation request"),
+          );
+          return;
+        }
+        response.error = {
+          domain: error.domain,
+          requestedBytes: error.requestedBytes,
+          limitBytes: error.limitBytes,
+          retryable: error.retryable,
+        };
+      }
+      slot.worker.postMessage(response);
+      return;
+    }
     if (
       !value ||
       typeof value !== "object" ||
@@ -302,27 +370,37 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
         this.#failedJobs += 1;
         const payload = message.error;
         const decodeError =
-          payload?.name === "TileUnsupportedExtensionError" &&
-          typeof payload.tileUri === "string" &&
-          typeof payload.extension === "string"
-            ? new TileUnsupportedExtensionError(
-                payload.tileUri,
-                payload.extension,
+          payload?.name === "ResourcePolicyError" &&
+          payload.domain &&
+          typeof payload.requestedBytes === "number" &&
+          typeof payload.limitBytes === "number"
+            ? new ResourcePolicyError(
+                payload.domain,
+                payload.requestedBytes,
+                payload.limitBytes,
+                payload.retryable,
               )
-            : payload?.name === "TileDecodeError" &&
+            : payload?.name === "TileUnsupportedExtensionError" &&
                 typeof payload.tileUri === "string" &&
-                (payload.stage === "profile" || payload.stage === "decode") &&
-                typeof payload.reason === "string"
-              ? new TileDecodeError(
+                typeof payload.extension === "string"
+              ? new TileUnsupportedExtensionError(
                   payload.tileUri,
-                  payload.stage,
-                  payload.reason,
+                  payload.extension,
                 )
-              : new DecodeWorkerError(
-                  typeof payload?.message === "string"
-                    ? payload.message
-                    : "decode worker returned an invalid error",
-                );
+              : payload?.name === "TileDecodeError" &&
+                  typeof payload.tileUri === "string" &&
+                  (payload.stage === "profile" || payload.stage === "decode") &&
+                  typeof payload.reason === "string"
+                ? new TileDecodeError(
+                    payload.tileUri,
+                    payload.stage,
+                    payload.reason,
+                  )
+                : new DecodeWorkerError(
+                    typeof payload?.message === "string"
+                      ? payload.message
+                      : "decode worker returned an invalid error",
+                  );
         this.#reject(active, decodeError);
       }
     }

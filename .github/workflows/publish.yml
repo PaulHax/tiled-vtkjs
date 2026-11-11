@@ -110,8 +110,8 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: Verify packed imports, workers and real VTK rendering
         run: npm run verify:package
-      - name: Verify texture realization and decoder codecs in Chromium
-        run: npx vitest run --config vitest.browser.config.ts test/browser/meshAlpha.spec.ts test/browser/tiles3dDecodeWorker.spec.ts
+      - name: Verify memory policy, texture realization and decoder codecs in Chromium
+        run: npx vitest run --config vitest.browser.config.ts test/browser/memoryPolicy.spec.ts test/browser/meshAlpha.spec.ts test/browser/tiles3dDecodeWorker.spec.ts
 
   release:
     needs: [test, example-chain]

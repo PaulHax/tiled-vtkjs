@@ -7,6 +7,24 @@ import type {
 } from "./decode";
 import type { Allocation } from "../core/streamedMember";
 import type { MeshAdapterStats } from "./meshAdapter";
+import type { MemoryDomain } from "../core/memoryResources";
+
+export type Tiles3dResourceState =
+  | { readonly status: "ready" }
+  | {
+      readonly status: "blocked";
+      readonly domain: MemoryDomain;
+      readonly requestedBytes: number;
+      readonly limitBytes: number;
+      readonly reason: "configured-limit" | "transition-unavailable";
+      readonly retryable: boolean;
+    }
+  | {
+      readonly status: "error";
+      readonly errorName: string;
+      readonly message: string;
+    }
+  | { readonly status: "stalled"; readonly message: string };
 
 export const DEFAULT_MAXIMUM_SCREEN_SPACE_ERROR_PX = 16;
 export const DEFAULT_TILES3D_CACHE_BYTES = 128 * 1024 * 1024;
@@ -22,6 +40,7 @@ export type ContentQueueStats = {
   readonly retrying: number;
   readonly ready: number;
   readonly failed: number;
+  readonly blocked: number;
   readonly cached: number;
   readonly decodedBytes: number;
   readonly workPending: boolean;
@@ -32,7 +51,13 @@ export type ContentQueueStats = {
   readonly entries: readonly {
     readonly id: string;
     readonly url: string;
-    readonly status: "queued" | "fetching" | "retrying" | "ready" | "failed";
+    readonly status:
+      | "queued"
+      | "fetching"
+      | "retrying"
+      | "ready"
+      | "failed"
+      | "blocked";
     readonly attempt: number;
   }[];
 };
@@ -66,6 +91,7 @@ export type Tiles3dMemberConfig = {
   readonly fetchContent?: ContentQueueFetch;
   readonly fetchSubtree?: ContentQueueFetch;
   readonly onError?: (error: unknown) => void;
+  readonly onResourceState?: (state: Tiles3dResourceState) => void;
 };
 
 export type Tiles3dMemberStats = {
@@ -92,6 +118,7 @@ export type Tiles3dMemberStats = {
   readonly effectiveScreenSpaceErrorPx: number;
   readonly sseMultiplier: number;
   readonly memoryConstrained: boolean;
+  readonly resourceState: Tiles3dResourceState;
   /** Submitted tiles whose replacement group did not fit the allowance. */
   readonly blockedGroups: number;
   readonly selectedTiles: number;

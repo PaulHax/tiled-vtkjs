@@ -235,8 +235,23 @@ const checkBrowser = async (
     const rootState = await call("root");
     assert.equal(rootState.sharedScheduler, true);
     assert.equal(rootState.memory.memberCount, 2);
-    assert.equal(rootState.point.allocation.memoryBudgetBytes, 8192);
-    assert.equal(rootState.mesh.allocation.memoryBudgetBytes, 8192);
+    assert(
+      rootState.point.allocation.memoryBudgetBytes >=
+        rootState.point.renderer.gpuResidentBytes,
+    );
+    assert(
+      rootState.mesh.allocation.memoryBudgetBytes >=
+        rootState.mesh.renderer.residentBytes,
+    );
+    assert(
+      rootState.point.allocation.memoryBudgetBytes <
+        rootState.memory.totalBytes / 2,
+    );
+    assert(
+      rootState.point.allocation.memoryBudgetBytes +
+        rootState.mesh.allocation.memoryBudgetBytes <=
+        rootState.memory.totalBytes,
+    );
     assert.deepEqual(rootState.pixels.point, [255, 0, 0, 255]);
     assert.deepEqual(rootState.pixels.mesh, [0, 255, 0, 255]);
     assert.equal(rootState.picks.point.status, "hit");
@@ -366,14 +381,23 @@ const checkBrowser = async (
     );
     const released = await call("releasePoint");
     assert.equal(released.memory.memberCount, 1);
-    assert.equal(
-      released.mesh.allocation.memoryBudgetBytes,
-      released.memory.totalBytes,
+    assert(
+      released.mesh.allocation.memoryBudgetBytes >=
+        released.mesh.renderer.residentBytes,
     );
+    assert(
+      released.mesh.allocation.memoryBudgetBytes <= released.memory.totalBytes,
+    );
+    assert.equal(released.memory.owners, 1);
     assert.deepEqual(released.pixels.point, [0, 0, 0, 255]);
     const disposed = await call("dispose");
     assert.equal(disposed.actors, 0);
     assert.equal(disposed.memory.memberCount, 0);
+    assert.equal(disposed.memory.owners, 0);
+    assert.equal(disposed.memory.rendererBytes, 0);
+    assert.equal(disposed.memory.cpuRetainedBytes, 0);
+    assert.equal(disposed.memory.cpuReservedBytes, 0);
+    assert.equal(disposed.memory.workReservedBytes, 0);
     assert.equal(disposed.mesh.disposed, true);
     assert.equal(disposed.coordinator.submissions.queuedJobs, 0);
     assert.deepEqual(disposed.pixels.mesh, [0, 0, 0, 255]);

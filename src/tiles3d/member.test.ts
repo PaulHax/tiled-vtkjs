@@ -85,7 +85,12 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
   const scheduleRender = vi.fn();
   const decodedRequests: DecodeTileRequest[] = [];
   const contentRequests: string[] = [];
-  const memory = createMemoryPool({ totalBytes: 4096 });
+  const memory = createMemoryPool({
+    totalBytes: 4096,
+    cpuBytes: 1024 * 1024,
+    workBytes: 1024 * 1024,
+    maxConcurrentOperations: 5,
+  });
   const submissions = createSubmissionScheduler({
     scheduleRender,
     maxBytesPerFrame: schedulerBytes,

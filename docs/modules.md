@@ -67,6 +67,77 @@ can outlive an individual view. Decoded CPU cache, GPU residency and active draw
 remain separate lifecycles. Point draw-plan changes preserve the existing
 prefix upload behavior; extraction does not add staged GPU upload admission.
 
+## Memory policy
+
+Share one `MemoryPool` between every participating coordinator that uses the
+same page resource allowance. Point and mesh members report minimum useful
+coverage and desired capacity. The pool grants feasible minima in registration
+order, then distributes spare capacity up to each member's demand. A small
+member therefore leaves capacity available to a larger one. Registration order
+is the priority policy when minimum representations cannot all fit.
+
+```js
+const memory = createMemoryPool({
+  totalBytes: 512 * 1024 ** 2,
+  cpuBytes: 1024 * 1024 ** 2,
+  workBytes: 1024 * 1024 ** 2,
+  transitionBytes: 128 * 1024 ** 2,
+  maxConcurrentOperations: 2,
+});
+memory.configure({ totalBytes: 768 * 1024 ** 2 });
+const usage = memory.stats();
+```
+
+`totalBytes` bounds estimated managed renderer residency. `cpuBytes` separately
+admits retained CPU buffers and reserved realization arrays; shared backing
+buffers count once. `workBytes` admits conservative estimates of overlapping
+fetch, queued input, decoder workspace and output. A shared FIFO operation
+queue bounds unknown work and remains occupied until physical completion or
+worker termination, including after cancellation. Finished output transfers to
+retained ownership before queued renderer jobs release their source buffers.
+
+The renderer default retains the existing device-memory heuristic and 512 MiB
+fallback. CPU and work limits default to twice that renderer allowance;
+transition headroom defaults to one quarter. `configure` changes only the
+specified limits. Lowering a limit does not instantly free committed resources.
+Per-format payload caches and actor reuse remain soft, reclaimable storage
+under these aggregate admission limits.
+
+Resource ownership is independent of active scheduling. Hiding a member removes
+its scheduling grant while its caches, renderer reuse and unsettled operations
+remain charged. Disposal releases caches and renderer objects immediately;
+uncancellable operations keep their work charges until they settle.
+
+Mesh replacement reserves the complete new group before realization, including
+old/new overlap. Its final frontier must fit `totalBytes`, and its overlapping
+renderer estimate must fit `totalBytes + transitionBytes`. A refusal rolls back
+partial preparation rather than waiting while holding incomplete groups. If a
+lower limit cannot admit a coarse replacement, the member reports an inability
+to transition and preserves existing coverage. Hosts can increase the relevant
+limit, hide/remove lower-priority content, or supply a cheaper representation.
+
+Member `stats().resourceState` and `onResourceState` distinguish `blocked` policy
+refusals from `error` failures; mesh members also report `stalled`. Blocked states
+include the domain, requested estimate, configured limit and whether competing
+ownership can make the request feasible. Limit changes retry blocked work;
+intrinsically oversized work does not repeatedly decode under unchanged limits.
+Errors retain their error name and are also delivered to `onError`, preserving
+the distinction between decode/validation errors and allocation failures.
+Cancellation remains an operation-lifetime event. WebGL context loss belongs
+to the host's canvas lifecycle, separately from policy refusal. Retained arrays
+remain available for graphics-resource reconstruction. Hosts own renderer
+recreation after context loss; this policy does not implement automatic WebGL
+context restoration.
+
+These counters are accounting estimates, not total browser memory or physical
+VRAM measurements. Standard raster dimensions, accessor ranges, COPC records
+and streamed bodies provide early checks. Opaque custom sources are reconciled
+after they return; decoder runtimes, browser image internals, uncertain codec
+workspace and delayed driver reclamation cannot be bounded exactly. Source
+initialization performed before member creation remains host-owned. The work
+concurrency limit provides a coarse bound where sizes are unknown. Malformed
+range validation remains independent of resource policy.
+
 ## Workers and assets
 
 `/points/copc-worker` exports `serveCopcTileSourceWorker`, an endpoint function.
