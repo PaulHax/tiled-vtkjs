@@ -48,6 +48,19 @@ type Stats = {
   residentBytes: number;
 };
 type Fixture = {
+  setupRecovery(): void;
+  refineRecovery(): void;
+  panRecovery(evict: boolean): void;
+  flushRecovery(): void;
+  recoveryStats(): {
+    stats: {
+      renderer: { pendingTiles: number; drawnTileIds: string[] };
+      queue: { cached: number; workPending: boolean };
+    };
+    fetches: string[];
+    work: number;
+    pick: { status: string } | null;
+  };
   stats(): Stats;
   submitWithoutCamera(prepared: boolean): string;
   cancelWithoutCamera(clear: boolean): void;
@@ -403,6 +416,68 @@ describe("coherent mixed presentations and ownership", () => {
       },
       { method, args },
     ) as Promise<Awaited<ReturnType<Fixture[K]>>>;
+
+  it.each([false, true])(
+    "renders a wanted sibling after group cancellation (evict=%s)",
+    async (evict) => {
+      const page = await open("member-recovery");
+      try {
+        await api(page, "setupRecovery");
+        await expect
+          .poll(
+            async () =>
+              (await api(page, "recoveryStats")).stats.renderer.pendingTiles,
+          )
+          .toBe(1);
+        await api(page, "flushRecovery");
+        expect(pixel(await pixels(page), 128, 128)[0]).toBeGreaterThan(200);
+        await api(page, "refineRecovery");
+        await expect
+          .poll(
+            async () =>
+              (await api(page, "recoveryStats")).stats.renderer.pendingTiles,
+          )
+          .toBe(2);
+        await api(page, "panRecovery", evict);
+        await expect
+          .poll(
+            async () =>
+              (await api(page, "recoveryStats")).stats.renderer.pendingTiles,
+          )
+          .toBe(1);
+        expect(pixel(await pixels(page), 128, 128)[0]).toBeGreaterThan(200);
+        await api(page, "flushRecovery");
+        const restored = await api(page, "recoveryStats");
+        expect(restored.stats.renderer.drawnTileIds).toEqual(["root/0"]);
+        expect(restored.pick?.status).toBe("hit");
+        expect(restored.work).toBe(0);
+        expect(restored.stats.queue.workPending).toBe(false);
+        expect(
+          restored.fetches.filter((url) => url.endsWith("/child-0.glb")),
+        ).toHaveLength(evict ? 2 : 1);
+        expect(
+          restored.fetches.filter((url) => url.endsWith("/child-1.glb")),
+        ).toHaveLength(1);
+        const green = pixel(await pixels(page), 128, 128);
+        expect(green[1]).toBeGreaterThan(200);
+        expect(green[0]).toBe(0);
+        await api(page, "dispose");
+        await expect
+          .poll(() => api(page, "ledger"))
+          .toMatchObject({
+            rendererBytes: 0,
+            cpuRetainedBytes: 0,
+            cpuReservedBytes: 0,
+            activeOperations: 0,
+            queuedOperations: 0,
+            workReservedBytes: 0,
+            owners: 0,
+          });
+      } finally {
+        await page.close();
+      }
+    },
+  );
 
   it.each([false, true])(
     "presents a camera sort during off-frontier preparation (prepare at completion=%s)",

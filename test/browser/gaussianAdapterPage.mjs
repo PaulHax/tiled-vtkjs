@@ -14,6 +14,7 @@ import {
   createGaussianContentAdapterFactory,
 } from "../../src/tiles3d/gaussianAdapter";
 import { createGaussianDistanceSorter } from "../../src/tiles3d/gaussianSort";
+import { createTiles3dMember } from "../../src/tiles3d/member";
 
 const mode = new URLSearchParams(location.search).get("mode") ?? "shared";
 const generic = vtkGenericRenderWindow.newInstance({ background: [0, 0, 0] });
@@ -180,7 +181,7 @@ const translucentMesh = {
   ],
   byteEstimate: { geometry: 72, textures: 0 },
 };
-if (mode === "no-camera") {
+if (mode === "no-camera" || mode === "member-recovery") {
 } else if (mode === "blend") {
   const content = field([red]);
   content.primitives.push(triangle(1, [1, 1, 1, 0.5], "BLEND"));
@@ -236,7 +237,140 @@ const settle = async () => {
   );
   return factory.stats(renderer);
 };
+let recoveryMember;
+let recoveryConfig;
+const recoveryFetches = [];
 globalThis.gaussianFixture = {
+  setupRecovery() {
+    const box = (x, half) => [x, 0, 0, half, 0, 0, 0, half, 0, 0, 0, half];
+    recoveryConfig = {
+      endpoint: "/recovery",
+      revision: "r1",
+      tilesetToScene: IDENTITY,
+      maximumScreenSpaceErrorPx: 1e9,
+      maxAttempts: 1,
+      fetchTileset: async () => ({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({
+          asset: { version: "1.1" },
+          geometricError: 8,
+          root: {
+            geometricError: 8,
+            refine: "REPLACE",
+            boundingVolume: { box: box(0, 1) },
+            content: { uri: "root.glb" },
+            children: [-0.5, 0.5].map((x, i) => ({
+              geometricError: 0,
+              boundingVolume: { box: box(x, 0.5) },
+              content: { uri: `child-${i}.glb` },
+            })),
+          },
+        }),
+      }),
+      fetchContent: async (url) => {
+        recoveryFetches.push(url);
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          arrayBuffer: async () => new ArrayBuffer(1),
+        };
+      },
+    };
+    recoveryMember = createTiles3dMember(
+      {
+        renderer,
+        submissions: scheduler,
+        memory: memoryPool,
+        devicePixelRatio: 1,
+        scheduleRender() {},
+        onWorkChange() {},
+      },
+      recoveryConfig,
+      {
+        textureCapabilities: { capabilityKey: "none", compressedFormats: [] },
+        workers: {
+          decode(request) {
+            const root = request.contentUrl.endsWith("/root.glb");
+            const left = request.contentUrl.endsWith("/child-0.glb");
+            const mesh = triangle(
+              0,
+              root ? [1, 0, 0, 1] : left ? [0, 1, 0, 1] : [0, 0, 1, 1],
+              "OPAQUE",
+            );
+            if (!root) {
+              const x = left ? -0.5 : 0.5;
+              mesh.positions = new Float32Array([
+                x - 0.4,
+                -0.5,
+                0,
+                x + 0.4,
+                -0.5,
+                0,
+                x,
+                0.5,
+                0,
+              ]);
+            }
+            const primitives = root
+              ? [mesh, triangle(0, [1, 0, 0, 1], "OPAQUE")]
+              : [mesh];
+            if (root) {
+              primitives[0].positions = new Float32Array([
+                -1, -1, 0, 1, -1, 0, 1, 1, 0,
+              ]);
+              primitives[1].positions = new Float32Array([
+                -1, -1, 0, 1, 1, 0, -1, 1, 0,
+              ]);
+            }
+            return {
+              promise: Promise.resolve({
+                origin: [0, 0, 0],
+                primitives,
+                byteEstimate: { geometry: primitives.length * 36, textures: 0 },
+              }),
+              cancel() {},
+            };
+          },
+        },
+      },
+    );
+    recoveryMember.applyAllocation({
+      qualityFraction: 1,
+      memoryBudgetBytes: 120,
+      regime: "stationary",
+    });
+    recoveryMember.setCamera(view());
+  },
+  refineRecovery() {
+    recoveryConfig = { ...recoveryConfig, maximumScreenSpaceErrorPx: 4 };
+    recoveryMember.setConfig(recoveryConfig);
+  },
+  panRecovery(evict) {
+    if (evict) {
+      recoveryConfig = { ...recoveryConfig, cacheBytes: 0 };
+      recoveryMember.setConfig(recoveryConfig);
+    }
+    camera.setPosition(-0.5, 0, 10);
+    camera.setFocalPoint(-0.5, 0, 0);
+    camera.setParallelScale(0.4);
+    recoveryMember.setCamera(view());
+  },
+  recoveryStats() {
+    return {
+      stats: recoveryMember.stats(),
+      fetches: [...recoveryFetches],
+      work: recoveryMember.governorInputs().work.operations,
+      pick: recoveryMember.pick(view(), 128, 128),
+    };
+  },
+  flushRecovery() {
+    while (scheduler.hasPending()) scheduler.prepareFrame();
+    recoveryMember.prepareFrame();
+    renderWindow.render();
+  },
   stats: () => factory.stats(renderer),
   submitWithoutCamera(prepared) {
     const content = field([red]);
@@ -505,6 +639,7 @@ globalThis.gaussianFixture = {
     return factory.stats(renderer);
   },
   dispose() {
+    recoveryMember?.dispose();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
     for (const memory of memoryOwners) memory.close();
