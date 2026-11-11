@@ -8,6 +8,7 @@ import { ROOT_KEY, keyToString, type VoxelKey } from "./octree";
 import type { LoadOptions, NodeInfo, TileData, TileSource } from "./tileSource";
 
 export type CopcWorkerTileSourceOptions = {
+  readonly signal?: AbortSignal;
   /** Remote COPC URL or a local file/blob sent to the source workers. */
   readonly source: string | Blob;
   /** A fresh module worker, owned and terminated by the returned source. */
@@ -147,6 +148,7 @@ const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
 export const createCopcWorkerTileSource = async (
   options: CopcWorkerTileSourceOptions,
 ): Promise<TileSource> => {
+  options.signal?.throwIfAborted();
   const workerCount = Math.max(
     1,
     Math.floor(options.workers ?? defaultWorkerCount()),
@@ -164,6 +166,8 @@ export const createCopcWorkerTileSource = async (
 
   const hierarchy = openChannel(options.createWorker(), teardown);
   channels.add(hierarchy);
+  const abortOpen = (): void => teardown(abortReason(options.signal));
+  options.signal?.addEventListener("abort", abortOpen, { once: true });
   let opened: CopcWorkerResponse;
   try {
     opened = await hierarchy.send({
@@ -175,7 +179,10 @@ export const createCopcWorkerTileSource = async (
   } catch (error) {
     teardown(error);
     throw error;
+  } finally {
+    options.signal?.removeEventListener("abort", abortOpen);
   }
+  options.signal?.throwIfAborted();
   if (opened.type !== "opened") {
     const error = new Error(
       `COPC worker returned ${opened.type} while opening`,

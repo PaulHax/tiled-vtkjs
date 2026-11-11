@@ -1,3 +1,4 @@
+import { createDatasetOperations } from "./datasetOperations";
 import { createFreemanSource, FREEMAN_URL } from "./freeman";
 import type { StreamedMemberRegistration } from "../../../src";
 import {
@@ -15,7 +16,10 @@ import {
   createGaussianContentAdapterFactory,
   createTiles3dMember,
 } from "../../../src/tiles3d/vtk";
-import { defaultMemoryBudgetBytes } from "../../../src/core/memoryPool";
+import {
+  createMemoryPool,
+  defaultMemoryBudgetBytes,
+} from "../../../src/core/memoryPool";
 import { createGaussianSource, GAUSSIAN_CITY } from "./gaussian";
 import type { GaussianDataset } from "./gaussianDatasets";
 import type {
@@ -102,7 +106,7 @@ type TilesSource = {
   readonly tilesetToScene?: Tiles3dMemberConfig["tilesetToScene"];
   readonly view?: ViewTarget;
   readonly place?: Place;
-  readonly prepare?: () => Promise<TilesSource>;
+  readonly prepare?: (signal: AbortSignal) => Promise<TilesSource>;
   readonly attribution?: GaussianDataset;
   readonly fetchTileset?: Tiles3dMemberConfig["fetchTileset"];
   readonly fetchContent?: Tiles3dMemberConfig["fetchContent"];
@@ -412,9 +416,10 @@ const pointPresentation = (
 export const startSceneExplorer = (preset: ExplorerPreset): void => {
   renderExplorerShell(preset);
   const resourceBudgetBytes = defaultMemoryBudgetBytes();
-  const host = createSceneHost(element<HTMLElement>("#viewer"), {
-    memoryBudgetBytes: resourceBudgetBytes,
-  });
+  const host = createSceneHost(
+    element<HTMLElement>("#viewer"),
+    createMemoryPool({ totalBytes: resourceBudgetBytes }),
+  );
   const gaussian = createGaussianContentAdapterFactory({
     resourceBudgetBytes,
     createSortBackend: () =>
@@ -460,6 +465,8 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   const dialogDescription = element<HTMLElement>("#add-dataset-description");
   const submitDataset = element<HTMLButtonElement>("#submit-dataset");
   const datasets: Dataset[] = [];
+  const operations = createDatasetOperations();
+  let disposed = false;
   let nextDatasetId = 1;
   let loading = 0;
   let sceneError: string | null = null;
@@ -512,6 +519,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       : host.frameVisible();
 
   const removeDataset = (dataset: Dataset, frameRemaining = true): void => {
+    operations.cancel(dataset.card);
     const index = datasets.indexOf(dataset);
     if (index >= 0) datasets.splice(index, 1);
     pendingTilesFrames.delete(dataset);
@@ -528,9 +536,12 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     frame = datasets.length === 0,
     before: Element | null = null,
   ): Promise<Dataset> => {
+    const operation = operations.begin(before);
     loading += 1;
     try {
+      operation.check();
       const source = await createCopcWorkerTileSource({
+        signal: operation.signal,
         source: input.source,
         createWorker: () =>
           new Worker(new URL("../copc.worker.ts", import.meta.url), {
@@ -538,6 +549,12 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           }),
         lazPerfWasmUrl: new URL("/laz-perf.wasm", window.location.href).href,
       });
+      try {
+        operation.check();
+      } catch (error) {
+        source.dispose?.();
+        throw error;
+      }
       const id = `dataset-${nextDatasetId++}`;
       const built = makeCard(id, displayName, "Point cloud · COPC");
       built.card.open = preset !== "combined" && datasets.length === 0;
@@ -707,6 +724,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       if (frame) frameDataset(dataset);
       return dataset;
     } finally {
+      operation.finish();
       loading -= 1;
     }
   };
@@ -717,9 +735,12 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     frame = datasets.length === 0,
     before: Element | null = null,
   ): Promise<Dataset> => {
+    const operation = operations.begin(before);
     loading += 1;
     try {
-      input = input.prepare ? await input.prepare() : input;
+      operation.check();
+      input = input.prepare ? await input.prepare(operation.signal) : input;
+      operation.check();
       const id = `dataset-${nextDatasetId++}`;
       const built = makeCard(id, displayName, "3D Tiles 1.1");
       built.card.open = preset !== "combined" && datasets.length === 0;
@@ -832,20 +853,24 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       }
       return dataset;
     } finally {
+      operation.finish();
       loading -= 1;
     }
   };
 
-  window.addEventListener(
-    "pagehide",
-    () => {
-      for (const dataset of datasets) dataset.release();
-      gaussian.dispose(host.renderer);
-      gaussianPass.delete();
-      host.dispose();
-    },
-    { once: true },
-  );
+  const onPageHide = (event: PageTransitionEvent): void => {
+    if (event.persisted || disposed) return;
+    disposed = true;
+    window.removeEventListener("pagehide", onPageHide);
+    operations.dispose();
+    clearInterval(diagnosticsTimer);
+    frameRate.dispose();
+    for (const dataset of datasets) dataset.release();
+    gaussian.dispose(host.renderer);
+    gaussianPass.delete();
+    host.dispose();
+  };
+  window.addEventListener("pagehide", onPageHide);
 
   host.onBeforeFrame((view, devicePixelRatio) => {
     const showingGaussians =
@@ -971,7 +996,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     }
   };
   updateDiagnostics();
-  setInterval(updateDiagnostics, 250);
+  const diagnosticsTimer = setInterval(updateDiagnostics, 250);
 
   const syncPresetChoices = (): void => {
     presetSelect.replaceChildren();
@@ -1022,11 +1047,11 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     source: PointSource | TilesSource,
     displayName = source.label,
   ): Promise<void> {
-    const currentIndex = datasets.indexOf(current);
     const replacement =
       "source" in source
         ? await addPointDataset(source, displayName, true, current.card)
         : await addTilesDataset(source, displayName, true, current.card);
+    const currentIndex = datasets.indexOf(current);
     const appendedIndex = datasets.indexOf(replacement);
     if (currentIndex >= 0 && appendedIndex >= 0) {
       datasets.splice(appendedIndex, 1);
@@ -1107,6 +1132,8 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       if (!source) return;
       sceneError = null;
       void replaceDataset(dataset, source).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError")
+          return;
         sceneError = error instanceof Error ? error.message : String(error);
       });
     });
@@ -1187,6 +1214,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       closeDialog();
     };
     void add().catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       addError.textContent =
         error instanceof Error ? error.message : String(error);
     });
@@ -1298,6 +1326,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   }
 
   void initial().catch((error: unknown) => {
+    if (error instanceof DOMException && error.name === "AbortError") return;
     sceneError = error instanceof Error ? error.message : String(error);
   });
 };

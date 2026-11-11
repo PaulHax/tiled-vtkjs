@@ -1,5 +1,6 @@
 /** Mesh realization with explicit rejection of unsupported primitive kinds. */
 
+import { IDENTITY } from "../core/mat4";
 import { safeCall } from "../core/observers";
 import type { DecodedMeshTileContent, DecodedTileContent } from "./decode";
 import {
@@ -19,6 +20,7 @@ export const createMeshContentAdapter: TileContentAdapterFactory = (
   const adapter = createMeshAdapter(options);
   const rejected = new Set<string>();
   let disposed = false;
+  let placement = [...IDENTITY];
   const accept = (id: string, content: DecodedTileContent): boolean => {
     if (disposed || rejected.has(id)) return false;
     if (isMeshContent(content)) return true;
@@ -36,6 +38,15 @@ export const createMeshContentAdapter: TileContentAdapterFactory = (
   return {
     ...adapter,
     setCamera() {},
+    presentationMatrix: () => placement,
+    setBaseMatrix(matrix) {
+      adapter.setBaseMatrix(matrix);
+      placement = Array.from(matrix ?? IDENTITY);
+      safeCall(options.onPresentationChange);
+    },
+    estimateTileBytes(content) {
+      return isMeshContent(content) ? adapter.estimateTileBytes(content) : 0;
+    },
     submitTile(id, content, onSubmitted, replacementIds) {
       if (!accept(id, content) || !isMeshContent(content)) return "failed";
       return adapter.submitTile(id, content, onSubmitted, replacementIds);

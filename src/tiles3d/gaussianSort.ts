@@ -237,9 +237,13 @@ export const createGaussianSortController = ({
   };
 
   return {
-    setScene(next: readonly GaussianSortRange[]): void {
+    setScene(
+      next: readonly GaussianSortRange[],
+      options: { defer?: boolean } = {},
+    ): void {
       if (disposed) return;
       rangeCount(next);
+      completed = null;
       ranges = next.map((range) => ({
         ...range,
         modelToScene: Float64Array.from(range.modelToScene),
@@ -257,7 +261,7 @@ export const createGaussianSortController = ({
         return identity;
       });
       sceneRevision += 1;
-      start();
+      if (!options.defer) start();
     },
     request(cameraPosition: GaussianCameraPosition): void {
       if (disposed) return;

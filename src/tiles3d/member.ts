@@ -240,6 +240,19 @@ export const createTiles3dMember = (
     visible: active,
     onError: report,
     memory,
+    memoryPool: context.memory,
+    onPresentationChange: () => syncPickPresentation(),
+    onAdmissionRefusal: (ids, error) =>
+      queueMicrotask(() => {
+        if (disposed || !active) return;
+        policyRefused(error);
+        for (const id of ids) {
+          if (!requested.has(id)) continue;
+          admissionBlocked.add(id);
+          blockGroupUnder(id);
+        }
+        refreshSelection();
+      }),
     onPolicyRefusal: policyRefused,
   });
   const pickSet = createMeshPickSet();
@@ -268,13 +281,18 @@ export const createTiles3dMember = (
       ? multiply(modelMatrix, verticalExaggeration())
       : verticalExaggeration();
 
+  let presentedScene: Mat16 | null = null;
+  const syncPickPresentation = (): void => {
+    const drawn = adapter.presentationMatrix();
+    const requested = placementMatrix();
+    if (Array.from(drawn).every((value, index) => value === requested[index]))
+      presentedScene = modelMatrix === null ? null : Array.from(modelMatrix);
+    pickSet.setPlacement({ drawn, scene: presentedScene });
+    pickSet.replaceDrawn(adapter.pickableMeshTiles());
+  };
   const applyPlacement = (): void => {
-    const placement = Array.from(placementMatrix()) as Mat16;
-    adapter.setBaseMatrix(placement);
-    pickSet.setPlacement({
-      drawn: placement,
-      scene: modelMatrix === null ? null : (Array.from(modelMatrix) as Mat16),
-    });
+    adapter.setBaseMatrix(placementMatrix());
+    syncPickPresentation();
   };
 
   const traversalMaximumSse = (): number =>

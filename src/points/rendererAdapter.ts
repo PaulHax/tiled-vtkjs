@@ -326,9 +326,7 @@ export const createRendererAdapter = (
   ): TileActors => {
     builtTiles += 1;
     let polyData: ReturnType<typeof vtkPolyData.newInstance> | undefined;
-    let mapper:
-      | ReturnType<typeof vtkPointSpriteMapper.newInstance>
-      | undefined;
+    let mapper: ReturnType<typeof vtkPointSpriteMapper.newInstance> | undefined;
     let actor: ReturnType<typeof vtkActor.newInstance> | undefined;
     try {
       polyData = vtkPolyData.newInstance();

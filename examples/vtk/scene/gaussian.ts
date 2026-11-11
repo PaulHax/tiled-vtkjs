@@ -14,9 +14,9 @@ export const createGaussianSource = () => {
   };
   return {
     ...source,
-    async prepare() {
+    async prepare(signal: AbortSignal) {
       const request = new URL("/gaussian-city/tileset.json", location.href);
-      const response = await fetch(request);
+      const response = await fetch(request, { signal });
       if (!response.ok)
         throw new Error(`Gaussian tileset: HTTP ${response.status}`);
       const document = (await response.json()) as unknown;

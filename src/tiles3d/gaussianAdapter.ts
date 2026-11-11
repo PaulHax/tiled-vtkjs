@@ -10,6 +10,12 @@ import vtkRenderPass, {
 
 import { IDENTITY, invert, multiply, type Mat16 } from "../core/mat4";
 import { safeCall } from "../core/observers";
+import { createMemoryPool } from "../core/memoryPool";
+import {
+  ResourcePolicyError,
+  resourcePolicyError,
+  type MemoryLease,
+} from "../core/memoryResources";
 import type { Submission } from "../core/submissionScheduler";
 import type { CameraView } from "../core/camera";
 import type {
@@ -107,6 +113,8 @@ type Tile = {
   count: number;
   bytes: number;
   sourceBytes: number;
+  meshBytes: number;
+  sourceMemory?: MemoryLease;
   prepared: boolean;
   meshReady: boolean;
   submitted: boolean;
@@ -124,9 +132,12 @@ type Owner = {
   failed: Set<string>;
   drawn: Set<string>;
   base: number[];
+  presentedBase: number[];
   placementRevision: number;
   visible: boolean;
   ceiling: number;
+  requiredBytes: number;
+  policyBlocked: boolean;
   workRevision: number;
   submissionRevision: number;
   disposed: boolean;
@@ -351,19 +362,20 @@ export const createGaussianContentAdapterFactory = (
     );
   const managers = new WeakMap<object, ReturnType<typeof createManager>>();
   const factory = ((options: TileContentAdapterOptions) => {
-    let manager = managers.get(options.renderer);
+    const renderer = options.realizationRenderer ?? options.renderer;
+    let manager = managers.get(renderer);
     if (!manager) {
       manager = createManager(
-        options,
+        { ...options, renderer },
         maximum,
         budget,
         configuration.createSortBackend,
       );
-      managers.set(options.renderer, manager);
+      managers.set(renderer, manager);
     }
     return manager.addOwner(options, () => {
       manager!.dispose();
-      managers.delete(options.renderer);
+      managers.delete(renderer);
     });
   }) as GaussianContentAdapterFactory;
   factory.stats = (renderer) => managers.get(renderer)?.stats() ?? null;
@@ -388,6 +400,15 @@ const createManager = (
   let nextOwner = 0,
     generation = 0,
     workRevision = 0;
+  const memoryPool =
+    firstOptions.memoryPool ?? createMemoryPool({ totalBytes: budget });
+  const memory = memoryPool.createOwner();
+  let arenaMemory: MemoryLease | undefined;
+  let displayedMemory: MemoryLease | undefined;
+  let workerMemory: MemoryLease | undefined;
+  let workerSceneRevision = -1;
+  let arenaCapacity = 0;
+  const sortCancellation = new AbortController();
   let disposed = false,
     dirty = false,
     pendingSort = false;
@@ -466,7 +487,15 @@ const createManager = (
   firstOptions.renderer.addActor(actor);
 
   const report = (error: unknown): void => {
-    for (const owner of owners) safeCall(() => owner.options.onError?.(error));
+    const policy = resourcePolicyError(error);
+    if (policy) {
+      for (const owner of owners) {
+        owner.policyBlocked = true;
+        safeCall(() => owner.options.onPolicyRefusal?.(policy));
+      }
+    } else
+      for (const owner of owners)
+        safeCall(() => owner.options.onError?.(error));
   };
   const sourceTiles = (): Tile[] => {
     const selected = new Set<Tile>();
@@ -486,18 +515,82 @@ const createManager = (
     return [...tiles];
   };
   const sourceCharge = (): number =>
-    Math.max(
-      chargedTiles().reduce((sum, tile) => sum + tile.bytes, 0),
-      arena.bytes * 2 +
-        (storage && candidate && storage.positions !== candidate.positions
-          ? storage.bytes * 2
-          : 0) +
-        desiredPrimitives.reduce(
-          (sum, primitive) => sum + primitive.count * 48,
-          0,
-        ) +
-        chargedTiles().reduce((sum, tile) => sum + tile.sourceBytes, 0),
+    arena.capacity * 60 +
+    (storage && candidate && storage.positions !== candidate.positions
+      ? (storage.positions.length / 3) * 60
+      : 0);
+  const releaseRetiredSources = (): void => {
+    for (const tile of retiredSources) {
+      if (!displayed.has(tile)) tile.owner.mesh.retireTile(tile.id);
+      if (!storage?.tiles.includes(tile) && !candidate?.tiles.includes(tile)) {
+        tile.sourceMemory?.release();
+        tile.sourceMemory = undefined;
+        retiredSources.delete(tile);
+      }
+    }
+  };
+  const retiredSources = new Set<Tile>();
+  const hideTiles = (tiles: ReadonlySet<Tile>): void => {
+    if (!storage || !tiles.size) return;
+    const removed = storage.primitives.filter((packed) =>
+      tiles.has(packed.tile),
     );
+    const previous = orderArray.getData() as Uint32Array;
+    const order = previous.filter(
+      (id) =>
+        !removed.some(
+          (packed) => id >= packed.offset && id < packed.offset + packed.count,
+        ),
+    );
+    if (order.length === previous.length) return;
+    orderArray.setData(order, 1);
+    arenaMemory?.setCpu(
+      [
+        arena.positions.buffer,
+        arena.scales.buffer,
+        arena.rotations.buffer,
+        arena.colors.buffer,
+        order.buffer,
+      ] as ArrayBuffer[],
+      Math.max(0, arena.capacity * 4 - order.byteLength),
+    );
+    orderUploadBytes += order.byteLength;
+    for (const tile of tiles) displayed.delete(tile);
+    actor.setVisibility(order.length > 0);
+    presentationRevision++;
+    for (const owner of owners) safeCall(owner.options.onPresentationChange);
+    notify();
+  };
+  const refuse = (error: ResourcePolicyError, tiles: readonly Tile[]): void => {
+    const groups = new Map<Owner, string[]>();
+    for (const tile of tiles) {
+      const ids = groups.get(tile.owner) ?? [];
+      ids.push(tile.id);
+      groups.set(tile.owner, ids);
+    }
+    for (const [owner, ids] of groups) {
+      owner.requiredBytes = Math.max(
+        owner.requiredBytes,
+        ownerChargeFor(owner),
+      );
+      safeCall(() =>
+        owner.options.onAdmissionRefusal
+          ? owner.options.onAdmissionRefusal(ids, error)
+          : owner.options.onPolicyRefusal?.(error),
+      );
+    }
+  };
+  const ownerChargeFor = (owner: Owner): number => {
+    const all = chargedTiles();
+    const totalCount = all.reduce((sum, tile) => sum + tile.count, 0);
+    const ownCount = all
+      .filter((tile) => tile.owner === owner)
+      .reduce((sum, tile) => sum + tile.count, 0);
+    return (
+      sourceCharge() * (totalCount ? ownCount / totalCount : 0) +
+      owner.mesh.workState().residentBytes
+    );
+  };
   const desiredTiles = (): Set<Tile> => {
     const result = new Set<Tile>();
     for (const owner of owners)
@@ -546,12 +639,55 @@ const createManager = (
     );
   const sorter = createGaussianSortController({
     backend: {
-      sort(job) {
+      async sort(job) {
         sortStarted = performance.now();
         pendingSort = true;
-        return backend.sort(job);
+        const count = job.ranges.reduce(
+          (sum, range) => sum + range.positions.length / 3,
+          0,
+        );
+        const sourceMemory = memory.retain(
+          job.ranges.flatMap((range) => [
+            range.positions.buffer as ArrayBuffer,
+            (range.modelToScene as Float64Array).buffer as ArrayBuffer,
+          ]),
+        );
+        let work;
+        let nextWorkerMemory: MemoryLease | undefined;
+        try {
+          work = await memory.work(
+            sortCancellation.signal,
+            count ? count * 32 + 1024 : 0,
+          );
+          if (count && workerSceneRevision !== job.sceneRevision)
+            nextWorkerMemory = memory.retain(
+              [],
+              count * 24 + job.ranges.length * 128 + 1024,
+            );
+          const order = await backend.sort(job);
+          if (nextWorkerMemory) {
+            workerMemory?.release();
+            workerMemory = nextWorkerMemory;
+            workerSceneRevision = job.sceneRevision;
+            nextWorkerMemory = undefined;
+          }
+          if (!count) {
+            workerMemory?.setCpu([], 1024);
+            workerSceneRevision = job.sceneRevision;
+          }
+          return order;
+        } finally {
+          nextWorkerMemory?.release();
+          sourceMemory.release();
+          work?.release();
+        }
       },
-      dispose: () => backend.dispose(),
+      dispose() {
+        sortCancellation.abort();
+        backend.dispose();
+        workerMemory?.release();
+        workerMemory = undefined;
+      },
     },
     onOrder(presentation) {
       if (disposed || !candidate || dirty || !presentationAllowed) {
@@ -687,19 +823,41 @@ const createManager = (
           attached = false;
         }
         orderArray.setData(order, 1);
+        arenaMemory?.setCpu(
+          [
+            next.positions.buffer,
+            next.scales.buffer,
+            next.rotations.buffer,
+            next.colors.buffer,
+            order.buffer,
+          ] as ArrayBuffer[],
+          Math.max(0, arena.capacity * 4 - order.byteLength),
+        );
         orderUploadBytes += order.byteLength;
         actor.setVisibility(order.length > 0);
         storage = next;
+        if (displayedMemory !== arenaMemory) displayedMemory?.release();
+        displayedMemory = arenaMemory;
+        releaseRetiredSources();
+        for (const owner of owners) {
+          owner.mesh.setBaseMatrix(owner.base);
+          owner.presentedBase = [...owner.base];
+          owner.mesh.setVisible(owner.visible);
+          owner.mesh.setDrawnTiles(owner.visible ? [...owner.drawn] : []);
+        }
         arena.retireExcept(next.allocationKeys);
         displayed = new Set(
           desiredPrimitives.map((primitive) => primitive.tile),
         );
+        releaseRetiredSources();
         latestColorCamera = [...presentation.cameraPosition];
         sortMs = performance.now() - sortStarted;
         sortCount++;
         presentationRevision++;
         pendingSort = false;
         completeAdmissions();
+        for (const owner of owners)
+          safeCall(owner.options.onPresentationChange);
         notify();
         const retained = sourceTiles();
         if (
@@ -713,10 +871,18 @@ const createManager = (
           scheduleRefresh();
       } catch (error) {
         pendingSort = false;
+        const policy = resourcePolicyError(error);
+        if (policy)
+          refuse(
+            policy,
+            [...owners].flatMap((owner) =>
+              [...owner.tiles.values()].filter((tile) => !tile.submitted),
+            ),
+          );
         for (const owner of owners)
           for (const tile of owner.tiles.values())
             if (!tile.submitted) {
-              owner.failed.add(tile.id);
+              if (!resourcePolicyError(error)) owner.failed.add(tile.id);
               dropTile(owner, tile.id);
             }
         report(error);
@@ -725,10 +891,18 @@ const createManager = (
     },
     onError(error) {
       pendingSort = false;
+      const policy = resourcePolicyError(error);
+      if (policy)
+        refuse(
+          policy,
+          [...owners].flatMap((owner) =>
+            [...owner.tiles.values()].filter((tile) => !tile.submitted),
+          ),
+        );
       for (const owner of owners)
         for (const tile of owner.tiles.values())
           if (!tile.submitted) {
-            owner.failed.add(tile.id);
+            if (!resourcePolicyError(error)) owner.failed.add(tile.id);
             dropTile(owner, tile.id);
           }
       report(error);
@@ -751,8 +925,49 @@ const createManager = (
     if (disposed || !camera) return;
     try {
       presentationAllowed = false;
-      sorter.setScene([]);
+      sorter.setScene([], { defer: true });
       const nextTiles = sourceTiles();
+      if (!nextTiles.length) {
+        const empty = makeStorage([], null, arena);
+        polyData.getPoints().setData(empty.positions, 3);
+        scaleArray.setData(empty.scales, 3);
+        rotationArray.setData(empty.rotations, 4);
+        colorArray.setData(empty.colors, 4);
+        orderArray.setData(new Uint32Array(), 1);
+        actor.setVisibility(false);
+        if (attached) {
+          firstOptions.renderer.removeActor(actor);
+          attached = false;
+        }
+        const oldArenaMemory = arenaMemory;
+        arenaMemory = undefined;
+        oldArenaMemory?.release();
+        if (displayedMemory !== oldArenaMemory) displayedMemory?.release();
+        displayedMemory = undefined;
+        arenaCapacity = 0;
+        storage = empty;
+        candidate = empty;
+        desiredPrimitives = [];
+        displayed.clear();
+        releaseRetiredSources();
+        for (const owner of owners) {
+          owner.mesh.setBaseMatrix(owner.base);
+          owner.presentedBase = [...owner.base];
+          owner.mesh.setVisible(owner.visible);
+          owner.mesh.setDrawnTiles(owner.visible ? [...owner.drawn] : []);
+        }
+        completeAdmissions();
+        for (const owner of owners)
+          safeCall(owner.options.onPresentationChange);
+        presentationRevision++;
+        if (workerMemory || pendingSort) {
+          pendingSort = true;
+          sorter.request(camera.position);
+          trackSortIdle();
+        }
+        notify();
+        return;
+      }
       const requests = nextTiles.flatMap((tile) =>
         tile.gaussian.map((primitive, index) => ({
           key: `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`,
@@ -764,29 +979,45 @@ const createManager = (
         ...requests.map((request) => request.key),
       ]);
       arena.retireExcept(retainedKeys);
-      const projectedCapacity = arena.requiredCapacity(requests);
-      const oldStorageBytes =
-        storage &&
-        (projectedCapacity > arena.capacity ||
-          storage.positions !== arena.positions)
-          ? storage.bytes
-          : 0;
-      const peak =
-        projectedCapacity * 56 * 2 +
-        oldStorageBytes * 2 +
-        chargedTiles().reduce(
-          (sum, tile) => sum + tile.sourceBytes + tile.count * 48,
-          0,
-        ) +
-        [...owners].reduce(
-          (sum, owner) => sum + owner.mesh.workState().residentBytes,
-          0,
-        );
-      if (peak > budget)
-        throw new GaussianResourceLimitError(
-          `Gaussian placement requires ${peak} resident bytes including presentation overlap, exceeding the ${budget}-byte budget`,
-        );
+      const projectedCapacity = nextTiles.length
+        ? arena.requiredCapacity(requests)
+        : 0;
+      if (
+        arenaMemory !== displayedMemory &&
+        projectedCapacity === arena.capacity &&
+        arenaCapacity !== arena.capacity
+      ) {
+        arenaMemory?.release();
+        arenaMemory = displayedMemory;
+        arenaCapacity = arena.capacity;
+      }
+      if (projectedCapacity !== arenaCapacity) {
+        if (arenaMemory && arenaMemory !== displayedMemory) {
+          throw new ResourcePolicyError(
+            "renderer",
+            projectedCapacity * 60,
+            memoryPool.stats().totalBytes,
+            true,
+          );
+        }
+        const nextMemory = memory.reserveRenderer(projectedCapacity * 60, {
+          cpuBytes: projectedCapacity * 60,
+          replacing: arenaMemory ? [arenaMemory] : [],
+        });
+        arenaMemory = nextMemory;
+        arenaCapacity = projectedCapacity;
+      }
       candidate = makeStorage(nextTiles, candidate, arena);
+      arenaMemory?.setCpu(
+        [
+          arena.positions.buffer,
+          arena.scales.buffer,
+          arena.rotations.buffer,
+          arena.colors.buffer,
+          orderArray.getData().buffer,
+        ] as ArrayBuffer[],
+        Math.max(0, arena.capacity * 4 - orderArray.getData().byteLength),
+      );
       const drawn = desiredTiles();
       desiredPrimitives = candidate.primitives.filter((primitive) =>
         drawn.has(primitive.tile),
@@ -813,10 +1044,18 @@ const createManager = (
       notify();
     } catch (error) {
       pendingSort = false;
+      const policy = resourcePolicyError(error);
+      if (policy)
+        refuse(
+          policy,
+          [...owners].flatMap((owner) =>
+            [...owner.tiles.values()].filter((tile) => !tile.submitted),
+          ),
+        );
       for (const owner of owners)
         for (const tile of owner.tiles.values())
           if (!tile.submitted) {
-            owner.failed.add(tile.id);
+            if (!resourcePolicyError(error)) owner.failed.add(tile.id);
             dropTile(owner, tile.id);
           }
       report(error);
@@ -828,13 +1067,16 @@ const createManager = (
     queueMicrotask(refresh);
     notify();
   };
-  const dropTile = (owner: Owner, id: string): boolean => {
+  const dropTile = (owner: Owner, id: string, immediate = false): boolean => {
     const tile = owner.tiles.get(id);
     if (!tile) return owner.failed.delete(id);
+    if (immediate) hideTiles(new Set([tile]));
+    retiredSources.add(tile);
     for (const grouped of tile.group)
       if (!grouped.submitted) {
         grouped.job?.cancel();
         grouped.retired = true;
+        retiredSources.add(grouped);
         grouped.owner.tiles.delete(grouped.id);
         grouped.owner.mesh.cancelTile(grouped.id);
         grouped.owner.mesh.retireTile(grouped.id);
@@ -843,7 +1085,9 @@ const createManager = (
     tile.retired = true;
     owner.tiles.delete(id);
     owner.drawn.delete(id);
-    owner.mesh.retireTile(id);
+    if (immediate || !displayed.has(tile)) owner.mesh.retireTile(id);
+    safeCall(owner.options.onPresentationChange);
+    releaseRetiredSources();
     owner.submissionRevision++;
     owner.workRevision++;
     scheduleRefresh();
@@ -853,6 +1097,15 @@ const createManager = (
     if (disposed) return;
     disposed = true;
     sorter.dispose();
+    for (const tile of [
+      ...retiredSources,
+      ...[...owners].flatMap((owner) => [...owner.tiles.values()]),
+    ])
+      tile.sourceMemory?.release();
+    retiredSources.clear();
+    arenaMemory?.release();
+    if (displayedMemory !== arenaMemory) displayedMemory?.release();
+    memory.close();
     for (const owner of owners) {
       owner.disposed = true;
       for (const tile of owner.tiles.values()) tile.job?.cancel();
@@ -930,31 +1183,37 @@ const createManager = (
       const owner: Owner = {
         key: ++nextOwner,
         options,
-        mesh: createMeshAdapter(options),
+        mesh: createMeshAdapter({
+          ...options,
+          memory,
+          retainReplacements: true,
+        }),
         tiles: new Map(),
         failed: new Set(),
         drawn: new Set(),
         base: [...IDENTITY],
+        presentedBase: [...IDENTITY],
         placementRevision: 0,
         visible: options.visible ?? true,
         ceiling: budget,
+        requiredBytes: 0,
+        policyBlocked: false,
         workRevision: 0,
         submissionRevision: 0,
         disposed: false,
       };
       owners.add(owner);
-      const ownerCharge = (): number => {
-        const all = chargedTiles();
-        const own = all.filter((tile) => tile.owner === owner);
-        const total = all.reduce((sum, tile) => sum + tile.bytes, 0);
-        const ownBytes = own.reduce((sum, tile) => sum + tile.bytes, 0);
-        const overhead = Math.max(0, sourceCharge() - total);
-        return (
-          ownBytes +
-          overhead * (total > 0 ? ownBytes / total : 1 / owners.size) +
-          owner.mesh.workState().residentBytes
+      const ownerCharge = (): number => ownerChargeFor(owner);
+      const estimateTileBytes = (content: DecodedTileContent): number =>
+        owner.mesh.estimateTileBytes(meshContent(content)) +
+        content.primitives.reduce(
+          (sum, primitive) =>
+            sum +
+            (primitive.kind === "gaussian"
+              ? (primitive.positions.length / 3) * 120
+              : 0),
+          0,
         );
-      };
       const submit = (
         entries: readonly {
           id: string;
@@ -965,6 +1224,17 @@ const createManager = (
       ): MeshSubmitOutcome => {
         if (disposed || owner.disposed || !entries.length) return "failed";
         const group: Tile[] = [];
+        const oldArenaMemory = arenaMemory;
+        const oldArenaCapacity = arenaCapacity;
+        let reserved: readonly MemoryLease[] = [];
+        let reservedArena: MemoryLease | undefined;
+        const rollbackReservations = (): void => {
+          for (const lease of reserved) lease.release();
+          if (reservedArena && arenaMemory === reservedArena) {
+            arenaMemory = oldArenaMemory;
+            arenaCapacity = oldArenaCapacity;
+          }
+        };
         try {
           for (const entry of entries) {
             if (owner.failed.has(entry.id)) return "failed";
@@ -991,12 +1261,8 @@ const createManager = (
               ...entry.content,
               primitives: gaussian,
             }).geometry;
-            // Reserve source arrays, two CPU presentations, two GPU presentations,
-            // the worker center copy, radix workspace and both draw-order copies.
-            const bytes =
-              sourceBytes +
-              count * (56 * 4 + 12 + 32 + 4) +
-              gaussian.length * 128;
+            // A tile's demand includes power-of-two attribute capacity and order.
+            const bytes = count * 120;
             group.push({
               id: entry.id,
               key: `${owner.key}:${entry.id}`,
@@ -1006,6 +1272,9 @@ const createManager = (
               hasTranslucentMesh,
               count,
               sourceBytes,
+              meshBytes: owner.mesh.estimateTileBytes(
+                meshContent(entry.content),
+              ),
               bytes,
               prepared: false,
               meshReady: false,
@@ -1040,38 +1309,42 @@ const createManager = (
             (sum, tile) => sum + tile.count,
             0,
           );
-          const projectedCapacity = arena.requiredCapacity(
-            group.flatMap((tile) =>
-              tile.gaussian.map((primitive, index) => ({
-                key: `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`,
-                count: primitive.positions.length / 3,
-              })),
-            ),
-          );
-          const minimumProjectedBytes =
-            (projectedCapacity +
-              (projectedCapacity > arena.capacity ? arena.capacity : 0)) *
-              56 *
-              2 +
-            charged.reduce((sum, tile) => sum + tile.sourceBytes, 0) +
-            group.reduce((sum, tile) => sum + tile.sourceBytes, 0) +
-            (residentCount + additionalCount) * 48;
-          // Reserve real parent-plus-children overlap; replacements do not discount
-          // the currently displayed resources before their presentation retires.
+          const finalBytes =
+            ownerCharge() +
+            group.reduce(
+              (sum, _tile, index) =>
+                sum + estimateTileBytes(entries[index]!.content),
+              0,
+            ) -
+            [...owner.tiles.values()]
+              .filter((tile) => replacements.has(tile.id))
+              .reduce((sum, tile) => sum + tile.bytes + tile.meshBytes, 0);
           if (
-            ownerCharge() + additionalBytes > owner.ceiling ||
-            sourceCharge() +
-              additionalBytes +
-              [...owners].reduce(
-                (sum, entry) => sum + entry.mesh.workState().residentBytes,
-                0,
-              ) >
-              budget ||
-            minimumProjectedBytes > budget ||
+            finalBytes > owner.ceiling ||
             residentCount + additionalCount - replacedCount > maximum ||
             residentCount + additionalCount > maximum * 2
-          )
+          ) {
+            owner.requiredBytes = Math.max(owner.requiredBytes, finalBytes);
+            safeCall(() =>
+              options.onPolicyRefusal?.(
+                new ResourcePolicyError("renderer", finalBytes, owner.ceiling),
+              ),
+            );
             return "budget-blocked";
+          }
+          if (arenaMemory && arenaMemory !== displayedMemory && pendingSort) {
+            safeCall(() =>
+              options.onPolicyRefusal?.(
+                new ResourcePolicyError(
+                  "renderer",
+                  finalBytes,
+                  memoryPool.stats().totalBytes,
+                  true,
+                ),
+              ),
+            );
+            return "budget-blocked";
+          }
           owner.mesh.setResourceCeilingBytes(
             Math.max(
               0,
@@ -1080,24 +1353,67 @@ const createManager = (
                 additionalBytes,
             ),
           );
-          for (const tile of group) owner.tiles.set(tile.id, tile);
-          for (const [index, tile] of group.entries()) {
+          for (const tile of group) {
+            tile.sourceMemory = (options.memory ?? memory).retain([
+              ...collectContentBuffers(tile.gaussian).geometry,
+            ]);
+            owner.tiles.set(tile.id, tile);
+          }
+          const meshEntries = group.flatMap((tile, index) => {
             const content = meshContent(entries[index]!.content);
-            if (content.primitives.length) {
-              const outcome = owner.mesh.submitTile(
-                tile.id,
+            if (!content.primitives.length) {
+              tile.meshReady = true;
+              return [];
+            }
+            return [
+              {
+                id: tile.id,
                 content,
-                () => {
+                onSubmitted: () => {
                   tile.meshReady = true;
                   scheduleRefresh();
                 },
-                replacementIds,
-              );
-              if (outcome !== "queued") {
-                for (const admitted of group) dropTile(owner, admitted.id);
-                return outcome;
-              }
-            } else tile.meshReady = true;
+              },
+            ];
+          });
+          const storageRequests = [...chargedTiles()].flatMap((tile) =>
+            tile.gaussian.map((primitive, index) => ({
+              key: `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`,
+              count: primitive.positions.length / 3,
+            })),
+          );
+          const projectedCapacity = arena.requiredCapacity(storageRequests);
+          const grows = projectedCapacity > arenaCapacity;
+          const amounts = meshEntries.map((entry) =>
+            owner.mesh.resourcePlan(entry.content),
+          );
+          if (grows)
+            amounts.push({
+              rendererBytes: projectedCapacity * 60,
+              cpuBytes: projectedCapacity * 60,
+            });
+          reserved = memory.reserveRendererGroup(amounts, [
+            ...owner.mesh.resourceLeases(replacementIds),
+            ...(grows && arenaMemory ? [arenaMemory] : []),
+          ]);
+          if (grows) {
+            reservedArena = reserved[meshEntries.length];
+            arenaMemory = reservedArena;
+            arenaCapacity = projectedCapacity;
+          }
+          if (meshEntries.length) {
+            const outcome = owner.mesh.submitTileGroup(
+              meshEntries,
+              replacementIds,
+              reserved.slice(0, meshEntries.length),
+            );
+            if (outcome !== "queued") {
+              for (const admitted of group) dropTile(owner, admitted.id);
+              rollbackReservations();
+              return outcome;
+            }
+          }
+          for (const tile of group) {
             tile.job = options.submissions.enqueue({
               bytes: tile.bytes,
               atomic: true,
@@ -1114,18 +1430,44 @@ const createManager = (
               },
             });
           }
+          if (
+            grows &&
+            oldArenaMemory &&
+            oldArenaMemory !== displayedMemory &&
+            arena.capacity !== oldArenaCapacity
+          )
+            oldArenaMemory.release();
           owner.workRevision++;
           notify();
           return "queued";
         } catch (error) {
-          for (const entry of entries) owner.failed.add(entry.id);
+          rollbackReservations();
+          const policy = resourcePolicyError(error);
+          if (!policy) for (const entry of entries) owner.failed.add(entry.id);
           for (const tile of group)
             if (owner.tiles.has(tile.id)) dropTile(owner, tile.id);
-          safeCall(() => options.onError?.(error));
-          return "failed";
+          safeCall(() =>
+            policy
+              ? options.onPolicyRefusal?.(policy)
+              : options.onError?.(error),
+          );
+          return policy ? "budget-blocked" : "failed";
         }
       };
       return {
+        estimateTileBytes,
+        presentationMatrix: () => owner.presentedBase,
+        requiredBytes: () =>
+          Math.max(owner.requiredBytes, owner.mesh.requiredBytes()),
+        clearRequiredBytes() {
+          owner.requiredBytes = 0;
+          owner.mesh.clearRequiredBytes();
+          if (owner.policyBlocked) {
+            owner.policyBlocked = false;
+            scheduleRefresh();
+          }
+        },
+        trimReuse: () => owner.mesh.trimReuse(),
         submitTile(id, content, onSubmitted, replacements = []) {
           return submit([{ id, content, onSubmitted }], replacements);
         },
@@ -1141,7 +1483,6 @@ const createManager = (
           );
           if (sameIds(owner.drawn, next)) return;
           owner.drawn = next;
-          owner.mesh.setDrawnTiles([...next]);
           scheduleRefresh();
         },
         setBaseMatrix(matrix: Mat16 | null) {
@@ -1159,7 +1500,6 @@ const createManager = (
           }
           owner.base = next;
           owner.placementRevision++;
-          owner.mesh.setBaseMatrix(matrix);
           scheduleRefresh();
         },
         setCamera(view) {
@@ -1182,7 +1522,15 @@ const createManager = (
         setVisible(visible) {
           if (owner.visible === visible) return;
           owner.visible = visible;
-          owner.mesh.setVisible(visible);
+          if (!visible)
+            hideTiles(
+              new Set([...displayed].filter((tile) => tile.owner === owner)),
+            );
+          if (!visible) {
+            owner.mesh.setVisible(false);
+            owner.mesh.setDrawnTiles([]);
+          }
+          safeCall(owner.options.onPresentationChange);
           scheduleRefresh();
         },
         setResourceCeilingBytes(bytes) {
@@ -1207,7 +1555,7 @@ const createManager = (
           return cancelled;
         },
         clearTiles() {
-          for (const id of owner.tiles.keys()) dropTile(owner, id);
+          for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.clearTiles();
           owner.failed.clear();
           owner.drawn.clear();
@@ -1280,7 +1628,7 @@ const createManager = (
         dispose() {
           if (owner.disposed) return;
           owner.disposed = true;
-          for (const id of owner.tiles.keys()) dropTile(owner, id);
+          for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.dispose();
           owners.delete(owner);
           if (!owners.size) onEmpty();

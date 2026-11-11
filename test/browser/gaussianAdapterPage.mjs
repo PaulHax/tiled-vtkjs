@@ -7,6 +7,8 @@ import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
 
 import { createSubmissionScheduler } from "../../src/core/submissionScheduler";
 import { IDENTITY } from "../../src/core/mat4";
+import { createMeshPickSet } from "../../src/tiles3d/meshPicking";
+import { createMemoryPool } from "../../src/core/memoryPool";
 import {
   createGaussianAlphaPass,
   createGaussianContentAdapterFactory,
@@ -39,6 +41,15 @@ const scheduler = createSubmissionScheduler({
   now: () => 0,
 });
 const errors = [];
+const refusals = [];
+const memoryPool = createMemoryPool({
+  totalBytes: mode === "budget" ? 300 : mode === "group-budget" ? 360 : 131072,
+  cpuBytes: 1048576,
+  workBytes: 1048576,
+  transitionBytes:
+    mode === "budget" ? 0 : mode === "group-budget" ? 200 : 32768,
+});
+const memoryOwners = [];
 const distanceSorter = createGaussianDistanceSorter();
 let hold = false;
 const pending = [];
@@ -61,18 +72,37 @@ const factory = createGaussianContentAdapterFactory({
     },
   }),
 });
-const makeAdapter = () =>
-  factory({
-    renderer,
+const makeAdapter = () => {
+  const memory = memoryPool.createOwner();
+  memoryOwners.push(memory);
+  return factory({
+    realizationRenderer: renderer,
+    memoryPool,
+    memory,
+    onPolicyRefusal: (error) => refusals.push(String(error)),
+    renderer:
+      mode === "wrapped"
+        ? {
+            addActor: (actor) => renderer.addActor(actor),
+            removeActor: (actor) => renderer.removeActor(actor),
+          }
+        : renderer,
     scheduleRender() {},
     submissions: scheduler,
     onError: (error) => errors.push(String(error)),
   });
+};
 const adapters = [makeAdapter(), makeAdapter()];
 const view = () => ({
   projection: "orthographic",
   position: Array.from(camera.getPosition()),
-  viewProj: IDENTITY,
+  viewProj: Array.from(
+    { length: 16 },
+    (_, index) =>
+      camera.getCompositeProjectionMatrix(1, -1, 1)[
+        (index % 4) * 4 + Math.floor(index / 4)
+      ],
+  ),
   viewportWidthCssPx: 256,
   viewportHeightCssPx: 256,
   parallelScale: 1.2,
@@ -202,6 +232,110 @@ const settle = async () => {
 };
 globalThis.gaussianFixture = {
   stats: () => factory.stats(renderer),
+  ledger: () => memoryPool.stats(),
+  setWorkLimit(bytes) {
+    memoryPool.configure({ workBytes: bytes });
+    for (const adapter of adapters) adapter.clearRequiredBytes();
+  },
+  refusals: () => refusals,
+  presentation: () => {
+    const adapter = adapters[0],
+      picks = adapter.pickableMeshTiles(),
+      placement = adapter.presentationMatrix();
+    const pickSet = createMeshPickSet();
+    pickSet.replaceDrawn(picks);
+    pickSet.setPlacement({ drawn: placement, scene: placement });
+    const hit = pickSet.pick(view(), 128, 128);
+    pickSet.dispose();
+    return {
+      stats: adapter.stats(),
+      picks: picks.map((tile) => tile.id),
+      placement: Array.from(placement),
+      hit,
+    };
+  },
+  async setupGroup() {
+    for (const adapter of adapters) adapter.clearTiles();
+    await settle();
+    const parent = field([red]);
+    parent.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
+    adapters[0].submitTile("parent", parent);
+    await settle();
+    adapters[0].setDrawnTiles(["parent"]);
+    await settle();
+  },
+  async admitGroup() {
+    let ready = 0;
+    const entries = [
+      { id: "left", entry: green },
+      { id: "right", entry: blue },
+    ].map(({ id, entry }) => {
+      const content = field([entry]);
+      content.primitives.push(triangle(-1, [1, 1, 1, 1], "OPAQUE"));
+      return {
+        id,
+        content,
+        onSubmitted() {
+          if (++ready === 2) {
+            adapters[0].setDrawnTiles(["left", "right"]);
+            adapters[0].retireTile("parent");
+          }
+        },
+      };
+    });
+    const outcome = adapters[0].submitTileGroup(entries, ["parent"]);
+    await settle();
+    return outcome;
+  },
+  async setupMixed() {
+    for (const adapter of adapters) adapter.clearTiles();
+    await settle();
+    const parent = field([red]);
+    parent.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
+    const child = field([{ color: [0, 1, 0], z: 0 }]);
+    child.primitives.push(triangle(-1, [1, 1, 1, 1], "OPAQUE"));
+    adapters[0].submitTile("parent", parent);
+    await settle();
+    adapters[0].setDrawnTiles(["parent"]);
+    await settle();
+    adapters[0].submitTile("child", child, undefined, ["parent"]);
+    await settle();
+  },
+  selectMixed() {
+    hold = true;
+    adapters[0].setDrawnTiles(["child"]);
+    renderWindow.render();
+  },
+  moveMixed() {
+    hold = true;
+    const matrix = [...IDENTITY];
+    matrix[12] = 0.6;
+    adapters[0].setBaseMatrix(matrix);
+    renderWindow.render();
+  },
+  hideMixed() {
+    adapters[0].setVisible(false);
+    renderWindow.render();
+  },
+  showMixed() {
+    hold = true;
+    adapters[0].setVisible(true);
+    renderWindow.render();
+  },
+  clearMixed() {
+    adapters[0].clearTiles();
+    renderWindow.render();
+  },
+  growMixed() {
+    hold = true;
+    const content = field(Array.from({ length: 8 }, () => blue));
+    adapters[0].submitTile("growth", content);
+    while (scheduler.hasPending()) scheduler.prepareFrame();
+  },
+  removeMixed() {
+    adapters[0].dispose();
+    renderWindow.render();
+  },
   errors: () => errors,
   pending: () => pending.length,
   hold: () => {
@@ -228,6 +362,7 @@ globalThis.gaussianFixture = {
   dispose() {
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
+    for (const memory of memoryOwners) memory.close();
     generic.delete();
   },
 };

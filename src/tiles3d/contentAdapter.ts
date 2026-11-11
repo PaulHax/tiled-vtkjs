@@ -1,5 +1,8 @@
 /** Content realization contract beneath tile selection and residency. */
 
+import type { MemoryPool } from "../core/memoryPool";
+import type { ResourcePolicyError } from "../core/memoryResources";
+import type { Mat16 } from "../core/mat4";
 import type { CameraView } from "../core/camera";
 import type { DecodedTileContent } from "./decode";
 import type {
@@ -10,7 +13,16 @@ import type {
 } from "./meshAdapter";
 import type { SubmittedMeshTile } from "./meshPicking";
 
-export type TileContentAdapterOptions = MeshAdapterOptions;
+export type TileContentAdapterOptions = MeshAdapterOptions & {
+  /** Physical renderer shared by realizations behind per-layer mesh wrappers. */
+  readonly realizationRenderer?: MeshAdapterOptions["renderer"];
+  readonly memoryPool?: MemoryPool;
+  readonly onPresentationChange?: () => void;
+  readonly onAdmissionRefusal?: (
+    ids: readonly string[],
+    error: ResourcePolicyError,
+  ) => void;
+};
 export type TileContentAdapterStats = MeshAdapterStats;
 
 /**
@@ -20,8 +32,15 @@ export type TileContentAdapterStats = MeshAdapterStats;
  */
 export type TileContentAdapter = Omit<
   MeshAdapter,
-  "submitTile" | "submitTileGroup" | "submittedTiles"
+  | "resourcePlan"
+  | "resourceLeases"
+  | "estimateTileBytes"
+  | "submitTile"
+  | "submitTileGroup"
+  | "submittedTiles"
 > & {
+  presentationMatrix(): Mat16;
+  estimateTileBytes(content: DecodedTileContent): number;
   setCamera(view: CameraView): void;
   submitTile(
     id: string,

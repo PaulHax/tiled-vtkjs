@@ -50,6 +50,8 @@ export type MeshAdapterOptions = {
   readonly visible?: boolean;
   readonly onError?: (error: unknown) => void;
   readonly memory?: MemoryOwner;
+  /** Composite content retires replacements after its complete presentation is accepted. */
+  readonly retainReplacements?: boolean;
   readonly onPolicyRefusal?: (error: ResourcePolicyError) => void;
 };
 
@@ -101,7 +103,12 @@ export type MeshTileState = "absent" | "queued" | "submitted" | "failed";
 export type MeshSubmitOutcome = "queued" | "budget-blocked" | "failed";
 
 export type MeshAdapter = {
-  estimateTileBytes(content: DecodedTileContent): number;
+  resourcePlan(content: DecodedMeshTileContent): {
+    rendererBytes: number;
+    cpuBytes: number;
+  };
+  resourceLeases(ids: readonly string[]): readonly MemoryLease[];
+  estimateTileBytes(content: DecodedMeshTileContent): number;
   requiredBytes(): number;
   clearRequiredBytes(): void;
   trimReuse(): void;
@@ -118,6 +125,7 @@ export type MeshAdapter = {
       readonly onSubmitted?: () => void;
     }[],
     replacementIds: readonly string[],
+    reservations?: readonly MemoryLease[],
   ): MeshSubmitOutcome;
   cancelTile(id: string): boolean;
   retireTile(id: string): boolean;
@@ -1086,6 +1094,17 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   };
 
   const api: MeshAdapter = {
+    resourcePlan(content) {
+      const plan = realizationPlan(content, maxJobBytes);
+      return {
+        rendererBytes: plan.geometryBytes + plan.textureBytes,
+        cpuBytes: plan.geometryBytes,
+      };
+    },
+    resourceLeases: (ids) =>
+      ids.flatMap((id) =>
+        submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
+      ),
     estimateTileBytes(content) {
       const plan = realizationPlan(content, maxJobBytes);
       return plan.geometryBytes + plan.textureBytes;
@@ -1127,7 +1146,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       return submitTile(id, content, onSubmitted, replacementIds);
     },
 
-    submitTileGroup(entries, replacementIds) {
+    submitTileGroup(entries, replacementIds, reservations) {
       if (disposed || entries.length === 0) return "failed";
       const ids = new Set(entries.map((entry) => entry.id));
       if (
@@ -1178,9 +1197,10 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         return "budget-blocked";
       }
 
-      let groupMemory: MemoryLease[] = [];
+      let groupMemory: readonly MemoryLease[] = [];
       try {
         groupMemory =
+          reservations ??
           options.memory?.reserveRendererGroup(
             plans.map((plan) => ({
               rendererBytes: plan.geometryBytes + plan.textureBytes,
@@ -1189,7 +1209,8 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
             normalizedReplacements.flatMap((id) =>
               submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
             ),
-          ) ?? [];
+          ) ??
+          [];
       } catch (error) {
         if (!(error instanceof ResourcePolicyError)) throw error;
         requiredBytes = Math.max(
@@ -1235,7 +1256,9 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         // ready. Then the displayed frontier swaps synchronously: no paint
         // can observe the gap, and replacement residency is released before
         // any child becomes submitted.
-        for (const id of normalizedReplacements) {
+        for (const id of options.retainReplacements
+          ? []
+          : normalizedReplacements) {
           const tile = withdraw(id);
           if (!tile) continue;
           drawn.delete(id);
@@ -1273,8 +1296,11 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       // destroys vtk render nodes and forces GPU uploads on cache reuse.
       // Pool eviction still releases the actors under the residency ceiling.
       for (const primitive of tile.primitives) setActorState(tile, primitive);
-      pool(id, tile);
-      trimPool();
+      if (options.retainReplacements) release(tile);
+      else {
+        pool(id, tile);
+        trimPool();
+      }
       workRevision += 1;
       options.scheduleRender();
       return true;

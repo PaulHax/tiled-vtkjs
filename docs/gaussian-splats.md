@@ -70,7 +70,10 @@ camera, placement, visibility, admission, replacement groups and disposal.
 
 The default `createMeshContentAdapter` rejects Gaussian content. Opt in by
 passing the same `createGaussianContentAdapterFactory` to the members sharing a
-view. It supports sRGB reconstruction, complete SH degrees 0 through 3, affine
+view. When the member renderer is wrapped for per-layer mesh appearance, set
+`TileContentAdapterOptions.realizationRenderer` to the canonical physical renderer.
+Meshes continue to use their layer renderer while Gaussian attachment and global
+ordering share the physical renderer. It supports sRGB reconstruction, complete SH degrees 0 through 3, affine
 covariance transformation and explicit XYZW-to-mapper quaternion conversion.
 The renderer rejects linear reconstruction color space until a corresponding
 resolve/composition policy is available. Gaussian picking remains disabled.
@@ -87,8 +90,11 @@ color ranges. Capacity growth and context restoration require full uploads.
 Retired ranges become reusable only after a coherent presentation swap. Parent
 and child representations do not draw together during replacement.
 
-`maximumVisibleSplats` and `resourceBudgetBytes` constrain complete
-representations. The selector retains a coarser representation when a replacement
+`maximumVisibleSplats` constrains complete representations. Members pass their
+shared `MemoryPool` through `TileContentAdapterOptions.memoryPool`; its ledger
+owns source buffers, storage capacity, overlapping presentations, worker copies
+and sort workspace. Per-member grants still constrain demand. The factory's
+`resourceBudgetBytes` configures its pool when used without an injected pool. The selector retains a coarser representation when a replacement
 cannot fit. Diagnostics separate source/staging attributes, GPU attributes,
 worker attributes, sort workspace and replacement storage. Texture row padding
 and runtime allocations can add overhead beyond logical payload estimates.

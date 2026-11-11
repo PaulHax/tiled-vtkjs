@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { gzipSync } from "node:zlib";
 
 import { spzGlb } from "../../../test/fixtures/spzGlb";
+import { ResourcePolicyError } from "../../core/memoryResources";
 import { IDENTITY, transformPoint } from "../../core/mat4";
 import { buildTransferList, type DecodeTileRequest } from ".";
 import { decodeTileContent } from "./decoder";
@@ -127,6 +128,27 @@ describe("SPZ Gaussian tile decoding", () => {
     expect(gaussian.opacityKernel).toBe("power");
     expect(gaussian.opacities[0]).toBe(0.5);
     expect(gaussian.opacities[1]).toBeCloseTo(Math.exp(3 / Math.E), 5);
+  });
+
+  it("refuses compressed expansion before entering the codec", async () => {
+    const content = await spzGlb({
+      mutate(json) {
+        for (const accessor of json.accessors) accessor.count = 1_000_000;
+      },
+    });
+    expect(content.byteLength).toBeLessThan(10_000);
+    await expect(
+      decodeTileContent(request(content), {
+        reserveMemory: async (bytes) => {
+          if (bytes > 1_000_000)
+            throw new ResourcePolicyError("work", bytes, 1_000_000);
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: "ResourcePolicyError",
+      domain: "work",
+      limitBytes: 1_000_000,
+    });
   });
 
   it("rejects compressed attribute count mismatches", async () => {

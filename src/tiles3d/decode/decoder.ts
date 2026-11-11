@@ -1994,6 +1994,27 @@ const decodeTileContentInner = async (
       }
       geometry += accessor.count * components * 4 * 3;
     }
+    for (const mesh of originalJson.meshes ?? [])
+      for (const primitive of mesh.primitives) {
+        const extension = primitive.extensions?.[GAUSSIAN_EXTENSION] as
+          | Record<string, unknown>
+          | undefined;
+        if (!extension) continue;
+        const position = primitive.attributes.POSITION;
+        if (typeof position !== "number") continue;
+        const count = requireIndex(
+          originalJson.accessors,
+          position,
+          "Gaussian POSITION",
+        ).count;
+        // SPZ harmonics are carried inside the stream, beyond its glTF accessors.
+        // Reserve degree-three output and overlapping codec/chunk arrays before WASM.
+        geometry += count * (44 + 16 * 12) * 3 + 128;
+      }
+    if (!Number.isSafeInteger(geometry))
+      throw new Error(
+        "decoded geometry estimate exceeds the safe integer range",
+      );
     await options.reserveMemory(geometry);
   }
   validateRequiredExtensions(originalJson, request.contentUrl);
