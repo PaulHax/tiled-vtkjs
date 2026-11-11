@@ -175,7 +175,8 @@ const translucentMesh = {
   ],
   byteEstimate: { geometry: 72, textures: 0 },
 };
-if (mode === "blend") {
+if (mode === "no-camera") {
+} else if (mode === "blend") {
   const content = field([red]);
   content.primitives.push(triangle(1, [1, 1, 1, 0.5], "BLEND"));
   adapters[0].submitTile("field", content);
@@ -232,6 +233,21 @@ const settle = async () => {
 };
 globalThis.gaussianFixture = {
   stats: () => factory.stats(renderer),
+  submitWithoutCamera(prepared) {
+    const content = field([red]);
+    content.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
+    const outcome = adapters[0].submitTile("unplaced", content);
+    if (prepared) while (scheduler.hasPending()) scheduler.prepareFrame();
+    return outcome;
+  },
+  cancelWithoutCamera(clear) {
+    if (clear) adapters[0].clearTiles();
+    else adapters[0].cancelTile("unplaced");
+  },
+  async drawUnplaced() {
+    adapters[0].setDrawnTiles(["unplaced"]);
+    await settle();
+  },
   ledger: () => memoryPool.stats(),
   setWorkLimit(bytes) {
     memoryPool.configure({ workBytes: bytes });
@@ -366,7 +382,7 @@ globalThis.gaussianFixture = {
     generic.delete();
   },
 };
-setCamera([0, 0, 10]);
+if (mode !== "no-camera") setCamera([0, 0, 10]);
 await settle();
 for (const adapter of adapters) adapter.setDrawnTiles(["field"]);
 await settle();

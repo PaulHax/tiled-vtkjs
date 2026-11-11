@@ -922,7 +922,7 @@ const createManager = (
 
   const refresh = (): void => {
     dirty = false;
-    if (disposed || !camera) return;
+    if (disposed || (!camera && chargedTiles().length > 0)) return;
     try {
       presentationAllowed = false;
       sorter.setScene([], { defer: true });
@@ -960,7 +960,7 @@ const createManager = (
         for (const owner of owners)
           safeCall(owner.options.onPresentationChange);
         presentationRevision++;
-        if (workerMemory || pendingSort) {
+        if (camera && (workerMemory || pendingSort)) {
           pendingSort = true;
           sorter.request(camera.position);
           trackSortIdle();
@@ -968,6 +968,7 @@ const createManager = (
         notify();
         return;
       }
+      if (!camera) return;
       const requests = nextTiles.flatMap((tile) =>
         tile.gaussian.map((primitive, index) => ({
           key: `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`,

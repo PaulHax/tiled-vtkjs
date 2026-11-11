@@ -49,6 +49,9 @@ type Stats = {
 };
 type Fixture = {
   stats(): Stats;
+  submitWithoutCamera(prepared: boolean): string;
+  cancelWithoutCamera(clear: boolean): void;
+  drawUnplaced(): Promise<void>;
   ledger(): {
     rendererBytes: number;
     cpuRetainedBytes: number;
@@ -575,4 +578,52 @@ describe("coherent mixed presentations and ownership", () => {
       await page.close();
     }
   });
+  it.each([
+    { clear: false, prepared: false },
+    { clear: true, prepared: false },
+    { clear: false, prepared: true },
+    { clear: true, prepared: true },
+  ])(
+    "releases canceled reservations before receiving a camera: %o",
+    async ({ clear, prepared }) => {
+      const page = await open("no-camera");
+      try {
+        expect(await api(page, "submitWithoutCamera", prepared)).toBe("queued");
+        await api(page, "settle");
+        const reserved = await api(page, "ledger");
+        expect(reserved.rendererBytes).toBeGreaterThan(0);
+        expect(reserved.cpuReservedBytes).toBeGreaterThan(0);
+        await api(page, "cancelWithoutCamera", clear);
+        await api(page, "settle");
+        const released = await api(page, "ledger");
+        expect(released).toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          workReservedBytes: 0,
+          activeOperations: 0,
+        });
+        expect(released.owners).toBeGreaterThan(0);
+        expect(pixel(await pixels(page), 128, 128)).toEqual([0, 0, 0]);
+        expect(await api(page, "submitWithoutCamera", false)).toBe("queued");
+        await api(page, "setCamera", [0, 0, 10]);
+        await api(page, "settle");
+        await api(page, "drawUnplaced");
+        expect(pixel(await pixels(page), 128, 128)[0]).toBeGreaterThan(100);
+        await api(page, "dispose");
+        await expect
+          .poll(() => api(page, "ledger"))
+          .toMatchObject({
+            rendererBytes: 0,
+            cpuRetainedBytes: 0,
+            cpuReservedBytes: 0,
+            workReservedBytes: 0,
+            activeOperations: 0,
+            owners: 0,
+          });
+      } finally {
+        await page.close();
+      }
+    },
+  );
 });
