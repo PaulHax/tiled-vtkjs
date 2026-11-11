@@ -82,31 +82,84 @@ const pixel = (
 ];
 
 describe("shared Gaussian realization", () => {
-  it("rejects mixed translucent triangles before any Gaussian presentation", async () => {
-    const page = await open("blend");
+  it.each(["blend", "group-blend-gaussian"])(
+    "rejects mixed translucent triangles in %s before any presentation",
+    async (mode) => {
+      const page = await open(mode);
+      try {
+        const result = await page.evaluate(() => {
+          const api = (globalThis as unknown as { gaussianFixture: Fixture })
+            .gaussianFixture;
+          return { stats: api.stats(), errors: api.errors() };
+        });
+        expect(result.stats.displayedSplats).toBe(0);
+        expect(result.stats.pendingSort).toBe(false);
+        expect(result.errors).toEqual([
+          expect.stringContaining(
+            "GaussianRenderingProfileError: translucent triangle",
+          ),
+        ]);
+        const image = await pixels(page);
+        expect(
+          image.data
+            .filter((_value, index) => index % 4 !== 3)
+            .every((value) => value === 0),
+        ).toBe(true);
+      } finally {
+        await page.close();
+      }
+    },
+  );
+
+  it("preserves translucent mesh rendering with the ordinary host pass", async () => {
+    const page = await open("mesh-blend");
     try {
-      const result = await page.evaluate(() => {
-        const api = (globalThis as unknown as { gaussianFixture: Fixture })
-          .gaussianFixture;
-        return { stats: api.stats(), errors: api.errors() };
-      });
-      expect(result.stats.displayedSplats).toBe(0);
-      expect(result.stats.pendingSort).toBe(false);
-      expect(result.errors).toEqual([
-        expect.stringContaining(
-          "GaussianRenderingProfileError: translucent triangle",
-        ),
-      ]);
-      const image = await pixels(page);
+      const center = pixel(await pixels(page), 128, 128);
+      expect(center[0]).toBeGreaterThan(110);
+      expect(center[0]).toBeLessThan(145);
+      expect(center[1]).toBe(0);
+      expect(center[2]).toBeGreaterThan(110);
+      expect(center[2]).toBeLessThan(145);
       expect(
-        image.data
-          .filter((_value, index) => index % 4 !== 3)
-          .every((value) => value === 0),
-      ).toBe(true);
+        await page.evaluate(() =>
+          (
+            globalThis as unknown as { gaussianFixture: Fixture }
+          ).gaussianFixture.errors(),
+        ),
+      ).toEqual([]);
     } finally {
       await page.close();
     }
   });
+
+  it.each([
+    ["blend-before-gaussian", "mesh-blend"],
+    ["gaussian-before-blend", "gaussian-only"],
+  ])(
+    "rejects cross-member %s while preserving the admitted scene",
+    async (mode, referenceMode) => {
+      const reference = await open(referenceMode);
+      const page = await open(mode);
+      try {
+        expect((await pixels(page)).data).toEqual(
+          (await pixels(reference)).data,
+        );
+        expect(
+          await page.evaluate(() =>
+            (
+              globalThis as unknown as { gaussianFixture: Fixture }
+            ).gaussianFixture.errors(),
+          ),
+        ).toEqual([
+          expect.stringContaining(
+            "GaussianRenderingProfileError: translucent triangle",
+          ),
+        ]);
+      } finally {
+        await Promise.all([page.close(), reference.close()]);
+      }
+    },
+  );
 
   it("keeps the last presentation when placement overlap exceeds its budget", async () => {
     const page = await open("budget");

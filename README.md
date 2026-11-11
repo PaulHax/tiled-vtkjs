@@ -374,7 +374,7 @@ removed.
 
 ### vtk.js examples
 
-The runnable app in [`examples/vtk`](./examples/vtk/) contains six examples.
+The runnable app in [`examples/vtk`](./examples/vtk/) contains five examples.
 Two use `createLodController` directly, which is all a single point cloud
 needs:
 
@@ -387,7 +387,7 @@ needs:
   fixed/adaptive presentation, custom point-cloud camera interaction, local
   telemetry, and the diagnostic hooks exercised by the browser suite.
 
-Four more use the member API; `createStreamedSceneCoordinator` with
+Three more use the member API; `createStreamedSceneCoordinator` with
 `createTiles3dMember` and `createPointCloudMember`; which is what a scene of
 more than one streamed dataset needs, and are the reference for it:
 
@@ -395,19 +395,18 @@ more than one streamed dataset needs, and are the reference for it:
   clouds and 3D Tiles datasets to one scene, each with its own controls, over
   one shared view governor. It is also the page the recorded-gesture benchmark
   drives; `?record=1` adds the capture panel and nothing else loads it.
+  The 3D Tiles presets include Jastrzębia Góra, a geolocated Gaussian
+  reconstruction with 103.5 million retained splats, 8,784 tiles and 13 hierarchy
+  levels. Gaussian tiles share the same dataset controls, coordinator and
+  diagnostics as meshes and point clouds. [Data attribution and hosting](./examples/vtk/scene/GAUSSIAN_DATA.md)
+  describe the source license and local proxy. [Gaussian integration](./docs/gaussian-splats.md)
+  describes the supported content profile and resource accounting.
 - **Mesh** (`/mesh/`) streams 3D Tiles: every building in the Netherlands at
   LoD2.2, live from [3DBAG](https://docs.3dbag.nl/) with no key.
 - **Combined** (`/combined/`) puts AHN4 lidar and 3DBAG buildings in one scene
   sharing one memory pool, one submission scheduler and one view governor. Its
   panel shows each member's claimed share of the view beside the quality the
   governor gave it back, which is the only place that negotiation is visible.
-
-- **Gaussian Tiles** (`/gaussian-tiles/`) streams an existing Jastrzębia Góra
-  reconstruction with 103.5 million retained splats, 8,784 tiles and 13 hierarchy
-  levels. It uses one shared Gaussian renderer, camera-distance ordering and
-  supplied replacement LOD. [Data attribution and hosting](./examples/vtk/gaussian-tiles/DATA.md)
-  describe the source license and the local proxy. [Gaussian integration](./docs/gaussian-splats.md)
-  describes the supported content profile and resource accounting.
 
 Both meet in a local ENU frame whose Z is NAP: the mesh arrives in ECEF and is
 placed by `tilesetToScene`, the lidar arrives in RD New (EPSG:28992) and is placed

@@ -84,7 +84,7 @@ export type SceneHost = {
   readonly rendererName: string;
   /** The live WebGL context, for callers that report on the machine drawing. */
   glContext(): WebGL2RenderingContext | null;
-  setTranslucentPass(pass: object): void;
+  setTranslucentPass(pass: object | null): void;
   /** Coalesced repaint request; the only way anything here paints. */
   scheduleRender(): void;
   cameraView(): CameraView;
@@ -177,9 +177,16 @@ export const createSceneHost = (
     fullScreen.getApiSpecificRenderWindow() as ReturnType<
       typeof fullScreen.getApiSpecificRenderWindow
     > &
-      Pick<vtkOpenGLRenderWindow, "getCanvas" | "setRenderPasses"> & {
+      Pick<
+        vtkOpenGLRenderWindow,
+        "getCanvas" | "getRenderPasses" | "setRenderPasses"
+      > & {
         getContext(): WebGL2RenderingContext | null;
       };
+  const defaultRenderPasses = openGlRenderWindow.getRenderPasses();
+  let customForwardPass: ReturnType<typeof vtkForwardPass.newInstance> | null =
+    null;
+  let customTranslucentPass: object | null = null;
   const interactor = fullScreen.getInteractor();
   const camera = renderer.getActiveCamera();
 
@@ -499,9 +506,18 @@ export const createSceneHost = (
     rendererName,
     glContext: () => openGlRenderWindow.getContext(),
     setTranslucentPass(pass) {
-      openGlRenderWindow.setRenderPasses([
-        vtkForwardPass.newInstance({ translucentPass: pass as vtkRenderPass }),
-      ]);
+      if (pass === null) {
+        openGlRenderWindow.setRenderPasses(defaultRenderPasses);
+      } else {
+        if (pass !== customTranslucentPass) {
+          customForwardPass?.delete();
+          customTranslucentPass = pass;
+          customForwardPass = vtkForwardPass.newInstance({
+            translucentPass: pass as vtkRenderPass,
+          });
+        }
+        openGlRenderWindow.setRenderPasses([customForwardPass!]);
+      }
       scheduleRender();
     },
     scheduleRender,
@@ -594,6 +610,7 @@ export const createSceneHost = (
       coordinator.dispose();
       tiles3dServices.workers.dispose?.();
       gpuTimer.dispose();
+      customForwardPass?.delete();
       fullScreen.delete();
     },
   };

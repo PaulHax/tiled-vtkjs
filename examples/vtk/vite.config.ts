@@ -174,7 +174,6 @@ export default defineConfig({
         mesh: resolve(exampleRoot, "mesh/index.html"),
         memory: resolve(exampleRoot, "memory/index.html"),
         combined: resolve(exampleRoot, "combined/index.html"),
-        "gaussian-tiles": resolve(exampleRoot, "gaussian-tiles/index.html"),
       },
     },
   },

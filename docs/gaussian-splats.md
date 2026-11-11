@@ -3,8 +3,8 @@
 The tiles member accepts Gaussian glTF content alongside triangle meshes.
 `createGaussianContentAdapterFactory` supplies one shared Gaussian presentation
 per VTK renderer, using the existing tile hierarchy, queues and residency
-governor. The [Gaussian Tiles example](../examples/vtk/gaussian-tiles/) streams an
-existing city reconstruction; its [data record](../examples/vtk/gaussian-tiles/DATA.md)
+governor. The [dataset explorer](../examples/vtk/) streams an
+existing city reconstruction; its [data record](../examples/vtk/scene/GAUSSIAN_DATA.md)
 documents the source, supplied placement, license record and hosting.
 
 ## Decoded content
@@ -28,7 +28,9 @@ attributes. Skinning and morph targets are rejected. The selected city's draft
 `@adobe/spz`, including SPZ version 3 and the producer's optional
 `EXT_splat_opacity` power kernel. The codec contains its WASM and requires no
 external codec URL. These draft compressed inputs are distinct from ratified
-uncompressed Gaussian attributes.
+uncompressed Gaussian attributes. The SPZ codec preserves the packed numeric
+coordinate frame; the authored glTF node and tile matrices place the centers,
+rotations and harmonics without another axis conversion.
 
 The existing document-wide codec checks still require codec URLs
 when Draco or Basis extensions are declared, including declarations associated
@@ -105,13 +107,14 @@ npm run build
 npm run example -- --host 127.0.0.1 --port 5194
 ```
 
-Open `/gaussian-tiles/`. The city preset uses the example server's fixed
-same-origin proxy because its upstream redirect does not support browser CORS.
-Other URLs need a CORS-enabled endpoint. Query options `memory` (MiB), `splats`
-(visible limit), and `sse` (pixels) set the example's resource and quality controls.
-Custom tilesets stay in local coordinates unless `ecef=1` explicitly identifies
-their supplied Earth-centered placement. The application bridge and map view
-are separate integrations and are not enabled by this standalone example.
+Open `/` and choose **Add dataset → 3D Tiles → Jastrzębia Góra**. The
+city is a normal dataset in the main explorer, with the shared camera, view
+governor, visibility, screen-space error control, source switcher and diagnostics.
+A `?tiles=<tileset URL>` link opens a tileset directly, including on the root page.
+The city preset uses the example server's fixed same-origin proxy because its
+upstream redirect does not support browser CORS. Other URLs need a CORS-enabled
+endpoint. The preset derives its local ENU frame from the supplied ECEF root
+transform. Application bridge and map view integration remain separate work.
 
 The tiny test GLB is synthetic and unlocated. It verifies standard attribute and
 worker handling, not independent geographic alignment or producer compatibility.

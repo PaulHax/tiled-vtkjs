@@ -20,11 +20,12 @@ generic.resize();
 const renderer = generic.getRenderer();
 const renderWindow = generic.getRenderWindow();
 const openGL = generic.getApiSpecificRenderWindow();
-openGL.setRenderPasses([
-  vtkForwardPass.newInstance({
-    translucentPass: createGaussianAlphaPass(() => openGL.getContext()),
-  }),
-]);
+if (mode !== "mesh-blend" && mode !== "blend-before-gaussian")
+  openGL.setRenderPasses([
+    vtkForwardPass.newInstance({
+      translucentPass: createGaussianAlphaPass(() => openGL.getContext()),
+    }),
+  ]);
 const camera = renderer.getActiveCamera();
 camera.setPosition(0, 0, 10);
 camera.setFocalPoint(0, 0, 0);
@@ -118,27 +119,52 @@ const field = (entries, degree = 0) => {
 const red = { color: [1, 0, 0], z: 0 },
   green = { color: [0, 1, 0], z: 1 },
   blue = { color: [0, 0, 1], z: 2 };
+const triangle = (z, color, alphaMode) => ({
+  kind: "mesh",
+  positions: new Float32Array([-1, -1, z, 1, -1, z, 0, 1, z]),
+  material: {
+    baseColorFactor: color,
+    raw: {
+      version: 1,
+      kind: "gltf-material",
+      alphaMode,
+      alphaCutoff: 0.5,
+      doubleSided: false,
+      unlit: true,
+      metallicFactor: 0,
+      roughnessFactor: 1,
+      emissiveFactor: [0, 0, 0],
+    },
+  },
+});
+const translucentMesh = {
+  origin: [0, 0, 0],
+  primitives: [
+    triangle(0, [0, 0, 1, 1], "OPAQUE"),
+    triangle(1, [1, 0, 0, 0.5], "BLEND"),
+  ],
+  byteEstimate: { geometry: 72, textures: 0 },
+};
 if (mode === "blend") {
   const content = field([red]);
-  content.primitives.push({
-    kind: "mesh",
-    positions: new Float32Array([-1, -1, 1, 1, -1, 1, 0, 1, 1]),
-    material: {
-      baseColorFactor: [1, 1, 1, 0.5],
-      raw: {
-        version: 1,
-        kind: "gltf-material",
-        alphaMode: "BLEND",
-        alphaCutoff: 0.5,
-        doubleSided: false,
-        unlit: true,
-        metallicFactor: 0,
-        roughnessFactor: 1,
-        emissiveFactor: [0, 0, 0],
-      },
-    },
-  });
+  content.primitives.push(triangle(1, [1, 1, 1, 0.5], "BLEND"));
   adapters[0].submitTile("field", content);
+} else if (mode === "group-blend-gaussian") {
+  adapters[0].submitTileGroup(
+    [
+      { id: "field", content: field([red]) },
+      { id: "mesh", content: translucentMesh },
+    ],
+    [],
+  );
+} else if (mode === "mesh-blend" || mode === "blend-before-gaussian") {
+  adapters[1].submitTile("field", translucentMesh);
+  if (mode === "blend-before-gaussian")
+    adapters[0].submitTile("field", field([red]));
+} else if (mode === "gaussian-only" || mode === "gaussian-before-blend") {
+  adapters[0].submitTile("field", field([red]));
+  if (mode === "gaussian-before-blend")
+    adapters[1].submitTile("field", translucentMesh);
 } else if (mode === "sh")
   adapters[0].submitTile("field", field([{ color: [0.5, 0.5, 0.5], z: 0 }], 1));
 else if (mode === "single")

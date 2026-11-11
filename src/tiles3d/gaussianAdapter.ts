@@ -103,6 +103,7 @@ type Tile = {
   owner: Owner;
   generation: number;
   gaussian: DecodedGaussianPrimitive[];
+  hasTranslucentMesh: boolean;
   count: number;
   bytes: number;
   sourceBytes: number;
@@ -973,16 +974,11 @@ const createManager = (
               throw new Error(
                 "Gaussian tile identities must be unique and nonempty",
               );
-            if (
-              entry.content.primitives.some(
-                (primitive) =>
-                  primitive.kind === "mesh" &&
-                  primitive.material.raw.alphaMode === "BLEND",
-              )
-            )
-              throw new GaussianRenderingProfileError(
-                "translucent triangle interleaving with Gaussian fields is not supported",
-              );
+            const hasTranslucentMesh = entry.content.primitives.some(
+              (primitive) =>
+                primitive.kind === "mesh" &&
+                primitive.material.raw.alphaMode === "BLEND",
+            );
             const gaussian = entry.content.primitives.filter(
               (primitive) => primitive.kind === "gaussian",
             );
@@ -1007,6 +1003,7 @@ const createManager = (
               owner,
               generation: ++generation,
               gaussian,
+              hasTranslucentMesh,
               count,
               sourceBytes,
               bytes,
@@ -1031,6 +1028,14 @@ const createManager = (
             .filter((tile) => replacements.has(tile.id))
             .reduce((sum, tile) => sum + tile.count, 0);
           const charged = chargedTiles();
+          const combined = [...charged, ...group];
+          if (
+            combined.some((tile) => tile.count > 0) &&
+            combined.some((tile) => tile.hasTranslucentMesh)
+          )
+            throw new GaussianRenderingProfileError(
+              "translucent triangle interleaving with Gaussian fields is not supported",
+            );
           const residentCount = charged.reduce(
             (sum, tile) => sum + tile.count,
             0,

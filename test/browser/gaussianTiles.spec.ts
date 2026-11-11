@@ -7,6 +7,7 @@ import sharp from "sharp";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { gaussianTilesFixture } from "../fixtures/gaussianTiles";
+import { DATASETS } from "../../examples/vtk/scene/gaussianDatasets";
 import { startStaticServer, type StaticServer } from "./server";
 
 let browser: Browser;
@@ -35,29 +36,6 @@ afterAll(async () => {
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
-type DemoStats = {
-  fetchedTiles: number;
-  totalTiles: number;
-  renderer: {
-    displayedSplats: number;
-    pendingSort: boolean;
-    sortCount: number;
-    attributeUploadBytes: number;
-    residentBytes: number;
-  } | null;
-  member: {
-    renderer: { drawnTiles: number; drawnTileIds: string[] };
-    queue: { workPending: boolean } | null;
-  } | null;
-};
-
-const stats = (page: Page): Promise<DemoStats> =>
-  page.evaluate(() =>
-    (
-      globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-    ).gaussianTiles.stats(),
-  );
-
 const coloredPixels = async (page: Page) => {
   const image = await sharp(await page.locator("canvas").screenshot())
     .ensureAlpha()
@@ -65,7 +43,7 @@ const coloredPixels = async (page: Page) => {
     .toBuffer({ resolveWithObject: true });
   const counts = { red: 0, green: 0, blue: 0 };
   for (let y = 0; y < image.info.height; y++)
-    for (let x = 380; x < image.info.width; x++) {
+    for (let x = 0; x < image.info.width; x++) {
       const offset = (y * image.info.width + x) * 4;
       const r = image.data[offset]!,
         g = image.data[offset + 1]!,
@@ -77,8 +55,8 @@ const coloredPixels = async (page: Page) => {
   return counts;
 };
 
-describe("Gaussian 3D Tiles example", () => {
-  it("renders a coarse view, retains its parent while children load, and swaps the complete replacement", async () => {
+describe("Gaussian tiles in the main dataset explorer", () => {
+  it("uses the standard dataset controls and keeps complete replacement coverage", async () => {
     const page = await browser.newPage({
       viewport: { width: 1000, height: 700 },
     });
@@ -87,127 +65,169 @@ describe("Gaussian 3D Tiles example", () => {
     page.on("console", (message) => {
       if (message.type() === "error") errors.push(message.text());
     });
-    let leftRelease!: () => void;
-    let rightRelease!: () => void;
-    let leftRequested!: () => void;
-    let rightRequested!: () => void;
-    const leftGate = new Promise<void>((resolve) => {
-      leftRelease = resolve;
-    });
-    const rightGate = new Promise<void>((resolve) => {
-      rightRelease = resolve;
-    });
-    const leftStarted = new Promise<void>((resolve) => {
-      leftRequested = resolve;
-    });
-    const rightStarted = new Promise<void>((resolve) => {
-      rightRequested = resolve;
-    });
-    await page.route("**/fixture/left.glb", async (route) => {
-      leftRequested();
-      await leftGate;
-      await route.continue();
-    });
-    await page.route("**/fixture/right.glb", async (route) => {
-      rightRequested();
-      await rightGate;
-      await route.continue();
-    });
-    try {
-      const url = `${server.origin}/gaussian-tiles/index.html?test=1&sse=96&tileset=${encodeURIComponent(`${server.origin}/fixture/tileset.json`)}`;
-      await page.goto(url);
-      await page.locator('#status[data-state="ready"]').waitFor();
-      expect(await stats(page)).toMatchObject({
-        totalTiles: 3,
-        fetchedTiles: 1,
-        renderer: { displayedSplats: 3 },
-        member: { renderer: { drawnTileIds: ["root"] } },
+    type SceneWindow = {
+      pointCloudScene: {
+        camera: {
+          place(value: { position: number[]; focalPoint: number[] }): void;
+        };
+      };
+    };
+    const gate = () => {
+      let release!: () => void;
+      let started!: () => void;
+      return {
+        ready: new Promise<void>((resolve) => {
+          started = resolve;
+        }),
+        waiting: new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+        release: () => release(),
+        started: () => started(),
+      };
+    };
+    const root = gate(),
+      left = gate(),
+      right = gate();
+    for (const [name, held] of [
+      ["root", root],
+      ["left", left],
+      ["right", right],
+    ] as const) {
+      await page.route(`**/fixture/${name}.glb`, async (route) => {
+        held.started();
+        await held.waiting;
+        await route.continue();
       });
-      expect((await coloredPixels(page)).red).toBeGreaterThan(40);
-
-      await page.locator("#quality").focus();
-      await page.locator("#quality").press("Home");
-      await Promise.all([leftStarted, rightStarted]);
-      expect((await stats(page)).member?.renderer.drawnTileIds).toEqual([
-        "root",
-      ]);
-      leftRelease();
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().fetchedTiles === 2,
+    }
+    const hasColor = async (color: "red" | "green" | "blue") =>
+      expect
+        .poll(async () => (await coloredPixels(page))[color])
+        .toBeGreaterThan(40);
+    const noColor = async (color: "red" | "green" | "blue") =>
+      expect.poll(async () => (await coloredPixels(page))[color]).toBe(0);
+    try {
+      const fixtureUrl = `${server.origin}/fixture/tileset.json`;
+      await page.goto(
+        `${server.origin}/?harness=1&tiles=${encodeURIComponent(fixtureUrl)}`,
       );
-      expect((await stats(page)).renderer?.displayedSplats).toBe(3);
-      rightRelease();
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().renderer?.displayedSplats === 6,
-      );
-      expect((await stats(page)).member?.renderer.drawnTileIds).toEqual([
-        "root/0",
-        "root/1",
-      ]);
-      const refined = await coloredPixels(page);
-      expect(refined.red).toBe(0);
-      expect(refined.blue).toBeGreaterThan(40);
-      expect(refined.green).toBeGreaterThan(40);
-      expect(errors).toEqual([]);
+      await root.ready;
+      const card = page.locator("#dataset-list > .dataset-card");
+      await card.waitFor();
+      const sse = card.locator('[data-role="sse"]');
+      await sse.focus();
+      await sse.press("End");
+      root.release();
+      await hasColor("red");
+      expect(await card.count()).toBe(1);
+      expect(await page.locator("#governor-activity").count()).toBe(1);
+      expect(await page.locator('a[href="/gaussian-tiles/"]').count()).toBe(0);
+      expect(new URL(page.url()).searchParams.get("tiles")).toBe(fixtureUrl);
 
+      await sse.focus();
+      await sse.press("Home");
+      await Promise.all([left.ready, right.ready]);
+      await hasColor("red");
+      left.release();
+      await hasColor("red");
+      await noColor("blue");
+      right.release();
+      await hasColor("blue");
+      await hasColor("green");
+      await noColor("red");
+
+      await page.waitForFunction(() =>
+        Boolean((globalThis as unknown as SceneWindow).pointCloudScene),
+      );
       await page.evaluate(() =>
-        (
-          globalThis as unknown as {
-            gaussianTiles: {
-              moveCamera(position: number[], target: number[]): void;
-            };
-          }
-        ).gaussianTiles.moveCamera([6000, 7000, 4500], [0, 0, 0]),
+        (globalThis as unknown as SceneWindow).pointCloudScene.camera.place({
+          position: [60, 70, 45],
+          focalPoint: [0, 0, 0],
+        }),
       );
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().renderer?.displayedSplats === 3,
-      );
-      expect((await stats(page)).member?.renderer.drawnTileIds).toEqual([
-        "root",
-      ]);
+      // At this distance the coarser representation is selected; reset uses
+      // the explorer's dataset framing and restores the cached detail.
+      await expect
+        .poll(async () => (await coloredPixels(page)).red)
+        .toBeGreaterThan(0);
       await page.locator("#reset-view").click();
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().renderer?.displayedSplats === 6,
-      );
+      await hasColor("blue");
+      await hasColor("green");
 
-      await page.locator("#visible").uncheck();
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().renderer?.displayedSplats === 0,
-      );
-      expect(await coloredPixels(page)).toEqual({ red: 0, green: 0, blue: 0 });
-      await page.locator("#visible").check();
-      await page.waitForFunction(
-        () =>
-          (
-            globalThis as unknown as { gaussianTiles: { stats(): DemoStats } }
-          ).gaussianTiles.stats().renderer?.displayedSplats === 6,
-      );
-      await page.evaluate(() =>
-        (
-          globalThis as unknown as { gaussianTiles: { dispose(): void } }
-        ).gaussianTiles.dispose(),
-      );
-      expect(await page.locator('#status[data-state="disposed"]').count()).toBe(
+      const visible = card.locator('[data-role="visible"]');
+      await visible.uncheck();
+      await noColor("red");
+      await noColor("green");
+      await noColor("blue");
+      await visible.check();
+      await hasColor("blue");
+      await hasColor("green");
+
+      // The same URL restores a Gaussian dataset through the main page.
+      await page.reload();
+      await expect
+        .poll(async () => {
+          const colors = await coloredPixels(page);
+          return colors.red + colors.blue + colors.green;
+        })
+        .toBeGreaterThan(40);
+      expect(await page.locator("#dataset-list > .dataset-card").count()).toBe(
         1,
       );
+      await page.locator('#dataset-list [data-role="remove"]').click();
+      await expect
+        .poll(async () => page.locator("#dataset-list > .dataset-card").count())
+        .toBe(0);
+      await noColor("red");
+      // The hosted Gaussian preset uses the same Add dataset dialog. Its
+      // placement is supplied as ECEF; these synthetic payloads stay local.
+      const fixture = gaussianTilesFixture();
+      const located = {
+        ...fixture.document,
+        root: {
+          ...fixture.document.root,
+          transform: [0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 6378137, 0, 0, 1],
+        },
+      };
+      await page.route("**/gaussian-city/**", async (route) => {
+        const name = new URL(route.request().url()).pathname.split("/").at(-1)!;
+        const bytes = fixture.files[name as keyof typeof fixture.files];
+        await route.fulfill(
+          name === "tileset.json"
+            ? { contentType: "application/json", body: JSON.stringify(located) }
+            : { contentType: "model/gltf-binary", body: Buffer.from(bytes) },
+        );
+      });
+      await page.locator("#open-add-dataset").click();
+      await page.locator("#dataset-type").selectOption("tiles");
+      await page
+        .locator("#dataset-preset")
+        .selectOption({ label: DATASETS[0]!.label });
+      await page.locator("#submit-dataset").click();
+      await expect
+        .poll(async () => {
+          const colors = await coloredPixels(page);
+          return colors.red + colors.blue + colors.green;
+        })
+        .toBeGreaterThan(40);
+      expect(new URL(page.url()).searchParams.get("tiles")).toBe(
+        DATASETS[0]!.url,
+      );
+      expect(await page.locator("#dataset-list").textContent()).toContain(
+        "Andrii Shramko",
+      );
+      expect(
+        await page
+          .locator(
+            '#dataset-list a[href="https://creativecommons.org/licenses/by/4.0/"]',
+          )
+          .count(),
+      ).toBe(1);
+      expect(errors).toEqual([]);
     } finally {
-      leftRelease();
-      rightRelease();
+      root.release();
+      left.release();
+      right.release();
       await page.close();
     }
   });
