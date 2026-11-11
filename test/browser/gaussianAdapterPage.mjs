@@ -42,6 +42,7 @@ const scheduler = createSubmissionScheduler({
 });
 const errors = [];
 const refusals = [];
+const admissionRefusals = [];
 const memoryPool = createMemoryPool({
   totalBytes: mode === "budget" ? 300 : mode === "group-budget" ? 360 : 131072,
   cpuBytes: 1048576,
@@ -80,6 +81,8 @@ const makeAdapter = () => {
     memoryPool,
     memory,
     onPolicyRefusal: (error) => refusals.push(String(error)),
+    onAdmissionRefusal: (ids, error) =>
+      admissionRefusals.push({ ids: [...ids], message: String(error) }),
     renderer:
       mode === "wrapped"
         ? {
@@ -254,6 +257,22 @@ globalThis.gaussianFixture = {
     for (const adapter of adapters) adapter.clearRequiredBytes();
   },
   refusals: () => refusals,
+  admissionRefusals: () => admissionRefusals,
+  flushUploads() {
+    while (scheduler.hasPending()) scheduler.prepareFrame();
+  },
+  replacementGaussian() {
+    return adapters[0].submitTile(
+      "replacement",
+      field([green, green]),
+      () => {
+        hold = true;
+        adapters[0].setDrawnTiles(["replacement"]);
+        adapters[0].retireTile("parent");
+      },
+      ["parent"],
+    );
+  },
   presentation: () => {
     const adapter = adapters[0],
       picks = adapter.pickableMeshTiles(),
@@ -269,6 +288,68 @@ globalThis.gaussianFixture = {
       placement: Array.from(placement),
       hit,
     };
+  },
+  async setupDemand(gaussian) {
+    for (const adapter of adapters) adapter.clearTiles();
+    await settle();
+    adapters[0].setResourceCeilingBytes(4096);
+    const content = gaussian
+      ? field([red])
+      : {
+          origin: [0, 0, 0],
+          primitives: [],
+          byteEstimate: { geometry: 0, textures: 0 },
+        };
+    content.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
+    adapters[0].submitTile("parent", content);
+    await settle();
+    adapters[0].setDrawnTiles(["parent"]);
+    await settle();
+  },
+  queueDemand(gaussian) {
+    let ready = 0;
+    const entries = ["left", "right"].map((id) => {
+      const content = gaussian
+        ? field([green])
+        : {
+            origin: [0, 0, 0],
+            primitives: [],
+            byteEstimate: { geometry: 0, textures: 0 },
+          };
+      content.primitives.push(triangle(-1, [0, 1, 0, 1], "OPAQUE"));
+      return {
+        id,
+        content,
+        onSubmitted() {
+          if (++ready === 2) {
+            adapters[0].setDrawnTiles(["left", "right"]);
+            adapters[0].retireTile("parent");
+          }
+        },
+      };
+    });
+    return adapters[0].submitTileGroup(entries, ["parent"]);
+  },
+  additionalGaussian() {
+    return adapters[0].submitTile("additional", field([blue, blue]), () =>
+      adapters[0].setDrawnTiles(["left", "right", "additional"]),
+    );
+  },
+  demandState() {
+    return {
+      required: adapters[0].requiredBytes(),
+      renderer: adapters[0].stats(),
+      queue: scheduler.stats(),
+    };
+  },
+  reduceDemand() {
+    return adapters[0].setResourceCeilingBytes(
+      adapters[0].workState().residentBytes,
+    );
+  },
+  raiseDemand(bytes) {
+    adapters[0].setResourceCeilingBytes(bytes);
+    adapters[0].clearRequiredBytes();
   },
   async setupGroup() {
     for (const adapter of adapters) adapter.clearTiles();

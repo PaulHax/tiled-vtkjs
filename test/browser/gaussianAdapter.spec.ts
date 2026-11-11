@@ -64,6 +64,23 @@ type Fixture = {
   setWorkLimit(bytes: number): void;
   setupMixed(): Promise<void>;
   setupGroup(): Promise<void>;
+  setupDemand(gaussian: boolean): Promise<void>;
+  queueDemand(gaussian: boolean): string;
+  additionalGaussian(): string;
+  replacementGaussian(): string;
+  flushUploads(): void;
+  admissionRefusals(): { ids: string[]; message: string }[];
+  demandState(): {
+    required: number;
+    renderer: {
+      residentBytes: number;
+      pendingTiles: number;
+      pendingJobs: number;
+    };
+    queue: { queuedJobs: number };
+  };
+  reduceDemand(): string[];
+  raiseDemand(bytes: number): void;
   admitGroup(): Promise<string>;
   selectMixed(): void;
   moveMixed(): void;
@@ -626,4 +643,156 @@ describe("coherent mixed presentations and ownership", () => {
       }
     },
   );
+  it.each([false, true])(
+    "propagates grant cancellation and retries pending content (Gaussian=%s)",
+    async (gaussian) => {
+      const page = await open("gaussian-only");
+      try {
+        await api(page, "setupDemand", gaussian);
+        const before = await pixels(page);
+        expect(await api(page, "queueDemand", gaussian)).toBe("queued");
+        const pending = await api(page, "demandState");
+        const cancelled = await api(page, "reduceDemand");
+        await api(page, "settle");
+        expect([...cancelled].sort()).toEqual(["left", "right"]);
+        expect(pending.required).toBeGreaterThan(
+          pending.renderer.residentBytes,
+        );
+        expect(await api(page, "demandState")).toMatchObject({
+          renderer: { pendingTiles: 0, pendingJobs: 0 },
+          queue: { queuedJobs: 0 },
+        });
+        expect((await pixels(page)).data).toEqual(before.data);
+        expect(await api(page, "queueDemand", gaussian)).toBe("budget-blocked");
+        const refused = await api(page, "demandState");
+        expect(refused.required).toBeGreaterThan(
+          refused.renderer.residentBytes,
+        );
+        for (let frame = 0; frame < 3; frame++) await api(page, "settle");
+        expect((await pixels(page)).data).toEqual(before.data);
+        await api(page, "raiseDemand", refused.required);
+        expect(await api(page, "queueDemand", gaussian)).toBe("queued");
+        await api(page, "settle");
+        expect(await api(page, "demandState")).toMatchObject({
+          renderer: { pendingTiles: 0, pendingJobs: 0 },
+          queue: { queuedJobs: 0 },
+        });
+        expect((await api(page, "presentation")).picks).toEqual([
+          "left",
+          "right",
+        ]);
+        expect(pixel(await pixels(page), 128, 128)[1]).toBeGreaterThan(200);
+        expect(await api(page, "errors")).toEqual([]);
+        await api(page, "dispose");
+        await expect
+          .poll(() => api(page, "ledger"))
+          .toMatchObject({
+            rendererBytes: 0,
+            cpuRetainedBytes: 0,
+            cpuReservedBytes: 0,
+            workReservedBytes: 0,
+            activeOperations: 0,
+            owners: 0,
+          });
+      } finally {
+        await page.close();
+      }
+    },
+  );
+  it("preserves queued meshes when additional Gaussian capacity cannot fit", async () => {
+    const page = await open("gaussian-only");
+    try {
+      await api(page, "setupDemand", false);
+      await api(page, "raiseDemand", 200);
+      const before = await pixels(page);
+      expect(await api(page, "queueDemand", false)).toBe("queued");
+      expect(await api(page, "additionalGaussian")).toBe("budget-blocked");
+      const pending = await api(page, "demandState");
+      expect(pending.renderer.pendingTiles).toBe(2);
+      expect(pending.queue.queuedJobs).toBeGreaterThan(0);
+      expect((await pixels(page)).data).toEqual(before.data);
+      await api(page, "settle");
+      expect(await api(page, "demandState")).toMatchObject({
+        renderer: { pendingTiles: 0, pendingJobs: 0 },
+        queue: { queuedJobs: 0 },
+      });
+      expect((await api(page, "presentation")).picks).toEqual([
+        "left",
+        "right",
+      ]);
+      expect(pixel(await pixels(page), 128, 128)).toEqual([0, 255, 0]);
+      const refused = await api(page, "demandState");
+      expect(refused.required).toBeGreaterThan(200);
+      await api(page, "raiseDemand", refused.required);
+      expect(await api(page, "additionalGaussian")).toBe("queued");
+      await api(page, "settle");
+      expect(await api(page, "demandState")).toMatchObject({
+        renderer: { pendingTiles: 0, pendingJobs: 0 },
+        queue: { queuedJobs: 0 },
+      });
+      expect(pixel(await pixels(page), 128, 128)[2]).toBeGreaterThan(100);
+      expect(await api(page, "errors")).toEqual([]);
+      await api(page, "dispose");
+      await expect
+        .poll(() => api(page, "ledger"))
+        .toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          workReservedBytes: 0,
+          activeOperations: 0,
+          owners: 0,
+        });
+    } finally {
+      await page.close();
+    }
+  });
+  it("notifies canceled outer groups when submission changes the mesh allowance", async () => {
+    const page = await open("gaussian-only");
+    try {
+      await api(page, "setupDemand", false);
+      await api(page, "raiseDemand", 200);
+      const before = await pixels(page);
+      expect(await api(page, "queueDemand", false)).toBe("queued");
+      expect(await api(page, "replacementGaussian")).toBe("budget-blocked");
+      await api(page, "settle");
+      const refusals = await api(page, "admissionRefusals");
+      expect(refusals).toHaveLength(1);
+      expect([...refusals[0]!.ids].sort()).toEqual(["left", "right"]);
+      expect(refusals[0]!.message).toContain("ResourcePolicyError");
+      expect((await api(page, "demandState")).required).toBeGreaterThan(200);
+      expect(await api(page, "demandState")).toMatchObject({
+        renderer: { pendingTiles: 0, pendingJobs: 0 },
+        queue: { queuedJobs: 0 },
+      });
+      expect((await pixels(page)).data).toEqual(before.data);
+      expect(await api(page, "replacementGaussian")).toBe("queued");
+      await api(page, "flushUploads");
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      expect((await pixels(page)).data).toEqual(before.data);
+      expect((await api(page, "presentation")).picks).toEqual(["parent"]);
+      await api(page, "release");
+      await api(page, "settle");
+      expect(await api(page, "demandState")).toMatchObject({
+        renderer: { pendingTiles: 0, pendingJobs: 0 },
+        queue: { queuedJobs: 0 },
+      });
+      expect((await api(page, "presentation")).picks).toEqual([]);
+      expect(pixel(await pixels(page), 128, 128)[1]).toBeGreaterThan(100);
+      expect(await api(page, "errors")).toEqual([]);
+      await api(page, "dispose");
+      await expect
+        .poll(() => api(page, "ledger"))
+        .toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          workReservedBytes: 0,
+          activeOperations: 0,
+          owners: 0,
+        });
+    } finally {
+      await page.close();
+    }
+  });
 });

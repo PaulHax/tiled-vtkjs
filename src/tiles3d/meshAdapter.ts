@@ -1109,7 +1109,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       const plan = realizationPlan(content, maxJobBytes);
       return plan.geometryBytes + plan.textureBytes;
     },
-    requiredBytes: () => requiredBytes,
+    requiredBytes: () => Math.max(requiredBytes, committedBytes()),
     clearRequiredBytes() {
       requiredBytes = 0;
     },
