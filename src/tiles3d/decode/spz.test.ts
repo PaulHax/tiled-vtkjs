@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { gzipSync } from "node:zlib";
 
 import { spzGlb } from "../../../test/fixtures/spzGlb";
-import { IDENTITY } from "../../core/mat4";
+import { IDENTITY, transformPoint } from "../../core/mat4";
 import { buildTransferList, type DecodeTileRequest } from ".";
 import { decodeTileContent } from "./decoder";
 
@@ -17,6 +18,75 @@ const request = (content: ArrayBuffer): DecodeTileRequest => ({
 });
 
 describe("SPZ Gaussian tile decoding", () => {
+  it("joins independently centered compressed tiles in their authored glTF frame", async () => {
+    const storedSpz = (positions: number[]): Uint8Array => {
+      const count = positions.length / 3;
+      const raw = Buffer.alloc(16 + count * 20);
+      raw.writeUInt32LE(0x5053474e, 0);
+      raw.writeUInt32LE(3, 4);
+      raw.writeUInt32LE(count, 8);
+      raw[13] = 12;
+      for (const [index, value] of positions.entries())
+        raw.writeIntLE(value * 4096, 16 + index * 3, 3);
+      let offset = 16 + count * 9;
+      raw.fill(128, offset, offset + count * 4);
+      offset += count * 4;
+      raw.fill(160, offset, offset + count * 3);
+      offset += count * 3;
+      for (let point = 0; point < count; point += 1)
+        raw.writeUInt32LE(0xc0000000, offset + point * 4);
+      return gzipSync(raw);
+    };
+    const decoded = await Promise.all(
+      [
+        { center: [8, 17, 24], positions: [2, -3, -6, 3, -4, -8] },
+        { center: [12, 24, 35], positions: [-2, 4, 5, -1, 3, 3] },
+      ].map(async ({ center, positions }) => {
+        const input = request(
+          await spzGlb({
+            compressedBytes: storedSpz(positions),
+            mutate(json) {
+              json.nodes[0].matrix = [
+                1,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                0,
+                0,
+                0,
+                0,
+                -1,
+                0,
+                ...center,
+                1,
+              ];
+            },
+          }),
+        );
+        input.accumulatedTransform[12] = 6_378_137.125;
+        input.tilesetToScene[12] = -6_378_137;
+        const content = await decodeTileContent(input);
+        const primitive = content.primitives[0]!;
+        if (primitive.kind !== "gaussian") throw new Error("expected Gaussian");
+        expect([...primitive.positions]).toEqual(positions);
+        return [0, 3].map((offset) =>
+          transformPoint(primitive.modelToScene, [
+            primitive.positions[offset]!,
+            primitive.positions[offset + 1]!,
+            primitive.positions[offset + 2]!,
+          ]),
+        );
+      }),
+    );
+    expect(decoded[0]).toEqual([
+      [10.125, -30, 20],
+      [11.125, -32, 21],
+    ]);
+    expect(decoded[1]).toEqual(decoded[0]);
+  });
+
   it.each([0, 1, 2, 3] as const)(
     "decodes degree %i through the official codec without losing SH or placement",
     async (degree) => {

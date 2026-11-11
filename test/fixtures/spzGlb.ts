@@ -3,31 +3,40 @@ import createSpzModule from "@adobe/spz";
 export const spzGlb = async ({
   degree = 0,
   opacity = false,
+  compressedBytes,
   mutate,
 }: {
   degree?: 0 | 1 | 2 | 3;
   opacity?: boolean;
+  compressedBytes?: Uint8Array;
   mutate?: (json: Record<string, any>) => void;
 } = {}): Promise<ArrayBuffer> => {
   const spz = await createSpzModule();
-  const bytes = spz.saveSpzToBuffer(
-    {
-      numPoints: 2,
-      shDegree: degree,
-      antialiased: false,
-      extensions: [],
-      positions: Float32Array.of(1, 2, 3, 4, 5, 6),
-      scales: Float32Array.of(-1, -2, -3, -1, -2, -3),
-      rotations: Float32Array.of(0, 0, 0, 1, 0, 0, 0, 1),
-      alphas: Float32Array.of(0, Infinity),
-      colors: Float32Array.of(-1, 0, 1, 1, 2, 3),
-      sh: Float32Array.from(
-        { length: 2 * ((degree + 1) ** 2 - 1) * 3 },
-        (_, index) => (index % 17) / 32 - 0.25,
-      ),
-    },
-    { version: 3, from: spz.CoordinateSystem.LUF, sh1Bits: 8, shRestBits: 8 },
-  );
+  const bytes =
+    compressedBytes ??
+    spz.saveSpzToBuffer(
+      {
+        numPoints: 2,
+        shDegree: degree,
+        antialiased: false,
+        extensions: [],
+        positions: Float32Array.of(1, 2, 3, 4, 5, 6),
+        scales: Float32Array.of(-1, -2, -3, -1, -2, -3),
+        rotations: Float32Array.of(0, 0, 0, 1, 0, 0, 0, 1),
+        alphas: Float32Array.of(0, Infinity),
+        colors: Float32Array.of(-1, 0, 1, 1, 2, 3),
+        sh: Float32Array.from(
+          { length: 2 * ((degree + 1) ** 2 - 1) * 3 },
+          (_, index) => (index % 17) / 32 - 0.25,
+        ),
+      },
+      {
+        version: 3,
+        from: spz.CoordinateSystem.UNSPECIFIED,
+        sh1Bits: 8,
+        shRestBits: 8,
+      },
+    );
   const aligned = Math.ceil(bytes.length / 4) * 4;
   const binary = new Uint8Array(aligned + (opacity ? 8 : 0));
   binary.set(bytes);

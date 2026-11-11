@@ -73,7 +73,9 @@ export const decodeSpzGaussian = async (
     spz.loadSpzStreaming(
       pointer,
       input.bytes.byteLength,
-      { to: spz.CoordinateSystem.LUF },
+      // Compressed coordinates are authored in the glTF node's local frame.
+      // Its matrix and the 3D Tiles up-axis transform supply the placement.
+      { to: spz.CoordinateSystem.UNSPECIFIED },
       {
         onHeader(header) {
           if (header.numPoints !== input.count)
