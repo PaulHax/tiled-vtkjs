@@ -386,12 +386,14 @@ globalThis.gaussianFixture = {
     await settle();
     return outcome;
   },
-  async setupMixed() {
+  async setupMixed(childCount = 1) {
     for (const adapter of adapters) adapter.clearTiles();
     await settle();
     const parent = field([red]);
     parent.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
-    const child = field([{ color: [0, 1, 0], z: 0 }]);
+    const child = field(
+      Array.from({ length: childCount }, () => ({ color: [0, 1, 0], z: 0 })),
+    );
     child.primitives.push(triangle(-1, [1, 1, 1, 1], "OPAQUE"));
     adapters[0].submitTile("parent", parent);
     await settle();
@@ -437,11 +439,22 @@ globalThis.gaussianFixture = {
   },
   errors: () => errors,
   pending: () => pending.length,
-  async blockWork() {
-    blockedWork.push(await blockingOwner.work(), await blockingOwner.work());
+  async blockWork(kind = "slots") {
+    if (kind !== "slots") {
+      memoryPool.configure({ workBytes: 2112 });
+      blockedWork.push(
+        await blockingOwner.work(undefined, kind === "bytes" ? 1584 : 1056),
+      );
+      if (kind === "growth") blockedWork.push(await blockingOwner.work());
+    } else {
+      blockedWork.push(await blockingOwner.work(), await blockingOwner.work());
+    }
   },
   releaseWork() {
     for (const work of blockedWork.splice(0)) work.release();
+  },
+  releaseWorkSlot() {
+    blockedWork.pop().release();
   },
   releaseNext() {
     const entry = pending.shift();
@@ -471,11 +484,11 @@ globalThis.gaussianFixture = {
     return factory.stats(renderer);
   },
   dispose() {
-    for (const work of blockedWork.splice(0)) work.release();
-    blockingOwner.close();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
     for (const memory of memoryOwners) memory.close();
+    for (const work of blockedWork.splice(0)) work.release();
+    blockingOwner.close();
     generic.delete();
   },
 };

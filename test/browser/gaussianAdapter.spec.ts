@@ -63,7 +63,7 @@ type Fixture = {
   };
   refusals(): string[];
   setWorkLimit(bytes: number): void;
-  setupMixed(): Promise<void>;
+  setupMixed(childCount?: number): Promise<void>;
   setupGroup(): Promise<void>;
   setupDemand(gaussian: boolean): Promise<void>;
   queueDemand(gaussian: boolean): string;
@@ -99,8 +99,9 @@ type Fixture = {
   dispose(): void;
   errors(): string[];
   pending(): number;
-  blockWork(): Promise<void>;
+  blockWork(kind?: "slots" | "bytes" | "growth"): Promise<void>;
   releaseWork(): void;
+  releaseWorkSlot(): void;
   releaseNext(): void;
   hold(): void;
   release(): void;
@@ -448,44 +449,91 @@ describe("coherent mixed presentations and ownership", () => {
     }
   });
 
-  it("presents the latest mixed scene with the first sort admitted after held work", async () => {
+  it.each(["slots", "bytes", "growth"] as const)(
+    "presents the latest mixed scene after held work (%s)",
+    async (kind) => {
+      const page = await open("gaussian-only");
+      try {
+        await api(page, "setupMixed", kind === "growth" ? 3 : 1);
+        const before = await pixels(page);
+        await api(page, "blockWork", kind);
+        await api(page, "moveMixed", 0.6);
+        await expect
+          .poll(async () => (await api(page, "ledger")).queuedOperations)
+          .toBe(1);
+        const waiting = await api(page, "ledger");
+        expect(waiting.activeOperations).toBe(kind === "bytes" ? 1 : 2);
+        expect(waiting.workReservedBytes).toBe(
+          kind === "bytes" ? 1584 : kind === "growth" ? 1056 : 0,
+        );
+        expect(await api(page, "errors")).toEqual([]);
+        expect(await api(page, "refusals")).toEqual([]);
+        await api(page, "moveMixed", -0.6);
+        await api(page, "selectMixed");
+        expect((await pixels(page)).data).toEqual(before.data);
+        expect((await api(page, "presentation")).picks).toEqual(["parent"]);
+        if (kind === "growth") {
+          await api(page, "releaseWorkSlot");
+          await expect
+            .poll(async () => (await api(page, "ledger")).activeOperations)
+            .toBe(1);
+          expect((await api(page, "ledger")).queuedOperations).toBe(1);
+          expect((await api(page, "ledger")).workReservedBytes).toBe(1056);
+          expect((await pixels(page)).data).toEqual(before.data);
+          expect(await api(page, "refusals")).toEqual([]);
+        }
+        await api(page, "releaseWork");
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        await api(page, "releaseNext");
+        await page.waitForFunction(
+          () => {
+            const fixture = (
+              globalThis as unknown as { gaussianFixture: Fixture }
+            ).gaussianFixture;
+            return fixture.presentation().placement[12] === -0.6;
+          },
+          null,
+          { timeout: 10000 },
+        );
+        await api(page, "settle");
+        const accepted = await api(page, "presentation");
+        expect(accepted.picks).toEqual(["child"]);
+        expect(accepted.stats.drawnTileIds).toEqual(["child"]);
+        const green = pixel(await pixels(page), 64, 128);
+        expect(green[1]).toBeGreaterThan(green[0]! * 1.8);
+        expect(green[1]).toBeGreaterThan(green[2]! * 1.8);
+        const ledger = await api(page, "ledger");
+        expect(ledger.activeOperations).toBe(0);
+        expect(ledger.queuedOperations).toBe(0);
+        expect(ledger.workReservedBytes).toBe(0);
+        expect(await api(page, "errors")).toEqual([]);
+        expect(await api(page, "refusals")).toEqual([]);
+      } finally {
+        await page.close();
+      }
+    },
+  );
+
+  it("cancels a sort waiting for byte admission on disposal", async () => {
     const page = await open("gaussian-only");
     try {
       await api(page, "setupMixed");
-      const before = await pixels(page);
-      await api(page, "blockWork");
-      await api(page, "moveMixed", 0.6);
+      await api(page, "blockWork", "bytes");
+      await api(page, "moveMixed");
       await expect
         .poll(async () => (await api(page, "ledger")).queuedOperations)
         .toBe(1);
-      await api(page, "moveMixed", -0.6);
-      await api(page, "selectMixed");
-      expect((await pixels(page)).data).toEqual(before.data);
-      expect((await api(page, "presentation")).picks).toEqual(["parent"]);
-      await api(page, "releaseWork");
-      await expect.poll(() => api(page, "pending")).toBe(1);
-      await api(page, "releaseNext");
-      await page.waitForFunction(
-        () => {
-          const fixture = (
-            globalThis as unknown as { gaussianFixture: Fixture }
-          ).gaussianFixture;
-          return fixture.presentation().placement[12] === -0.6;
-        },
-        null,
-        { timeout: 10000 },
-      );
-      await api(page, "settle");
-      const accepted = await api(page, "presentation");
-      expect(accepted.picks).toEqual(["child"]);
-      expect(accepted.stats.drawnTileIds).toEqual(["child"]);
-      const green = pixel(await pixels(page), 64, 128);
-      expect(green[1]).toBeGreaterThan(green[0]! * 1.8);
-      expect(green[1]).toBeGreaterThan(green[2]! * 1.8);
+      await api(page, "dispose");
+      await expect
+        .poll(async () => (await api(page, "ledger")).activeOperations)
+        .toBe(0);
       const ledger = await api(page, "ledger");
-      expect(ledger.activeOperations).toBe(0);
       expect(ledger.queuedOperations).toBe(0);
       expect(ledger.workReservedBytes).toBe(0);
+      expect(ledger.cpuRetainedBytes).toBe(0);
+      expect(ledger.cpuReservedBytes).toBe(0);
+      expect(ledger.rendererBytes).toBe(0);
+      expect(ledger.owners).toBe(0);
       expect(await api(page, "errors")).toEqual([]);
     } finally {
       await page.close();

@@ -15,7 +15,6 @@ import {
   ResourcePolicyError,
   resourcePolicyError,
   type MemoryLease,
-  type MemoryWork,
 } from "../core/memoryResources";
 import type { Submission } from "../core/submissionScheduler";
 import type { CameraView } from "../core/camera";
@@ -648,15 +647,29 @@ const createManager = (
         { type: "module" },
       ),
     );
-  let sortWork: MemoryWork | undefined;
+  const sortWorkBytes = (): number => {
+    const count = desiredPrimitives.reduce(
+      (sum, primitive) => sum + primitive.count,
+      0,
+    );
+    return count ? count * 32 + 1024 : 0;
+  };
   const sorter = createGaussianSortController({
     async schedule(run) {
-      const work = await memory.work(sortCancellation.signal);
+      let work = await memory.work(sortCancellation.signal, sortWorkBytes());
       try {
-        sortWork = work;
+        for (;;) {
+          const bytes = sortWorkBytes();
+          const { workReservedBytes, workBytes } = memoryPool.stats();
+          if (workReservedBytes - work.bytes() + bytes <= workBytes) {
+            work.resize(bytes);
+            break;
+          }
+          work.release();
+          work = await memory.work(sortCancellation.signal, bytes);
+        }
         await run();
       } finally {
-        sortWork = undefined;
         work.release();
       }
     },
@@ -676,7 +689,6 @@ const createManager = (
         );
         let nextWorkerMemory: MemoryLease | undefined;
         try {
-          sortWork!.resize(count ? count * 32 + 1024 : 0);
           if (count && workerSceneRevision !== job.sceneRevision)
             nextWorkerMemory = memory.retain(
               [],
