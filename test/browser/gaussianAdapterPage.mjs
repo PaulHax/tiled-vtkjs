@@ -429,9 +429,18 @@ globalThis.gaussianFixture = {
   },
   growMixed() {
     hold = true;
+    setCamera([0.1, 0, 10]);
     const content = field(Array.from({ length: 8 }, () => blue));
     adapters[0].submitTile("growth", content);
     while (scheduler.hasPending()) scheduler.prepareFrame();
+  },
+  prepareInvisible(ids) {
+    const result = adapters[0].submitTileGroup(
+      ids.map((id) => ({ id, content: field([blue]) })),
+      [],
+    );
+    while (scheduler.hasPending()) scheduler.prepareFrame();
+    return result;
   },
   removeMixed() {
     adapters[0].dispose();
@@ -461,6 +470,18 @@ globalThis.gaussianFixture = {
     entry.resolve(
       distanceSorter.sort(entry.job.ranges, entry.job.cameraPosition),
     );
+  },
+  releaseWhilePreparing(ids) {
+    const preparation = new Promise((resolve) => {
+      // Prepare between backend completion and presentation publication.
+      queueMicrotask(() =>
+        queueMicrotask(() =>
+          resolve(globalThis.gaussianFixture.prepareInvisible(ids)),
+        ),
+      );
+    });
+    globalThis.gaussianFixture.releaseNext();
+    return preparation;
   },
   hold: () => {
     hold = true;

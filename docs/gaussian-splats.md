@@ -59,6 +59,12 @@ for a sort. Changes while admission is queued coalesce into that job. Its latest
 workspace estimate must fit the shared work-byte allowance before worker dispatch;
 the slot remains owned until the scheduled work settles, including on disposal.
 
+Preparing off-frontier content preserves sorting for unchanged visible ranges.
+Storage updates can reuse a retained order when range identities, generations,
+positions, placement and camera match. A completed order arriving during a queued
+storage refresh is retained for that refresh to publish. The shared CPU ledger
+owns this retained order until its visible scene changes or the renderer is disposed.
+
 Use `createGaussianSortWorkerBackend` with a module worker resolved from
 `tiled-vtkjs/tiles3d/gaussian-sort-worker`. The backend owns and terminates that
 worker. Scene attributes are cloned once per scene revision; subsequent camera

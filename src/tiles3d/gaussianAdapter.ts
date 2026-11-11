@@ -39,6 +39,7 @@ import {
   createGaussianSortController,
   createGaussianSortWorkerBackend,
   type GaussianSortBackend,
+  type GaussianSortPresentation,
   type GaussianSortRange,
 } from "./gaussianSort";
 import {
@@ -194,6 +195,24 @@ const meshContent = (content: DecodedTileContent): DecodedMeshTileContent => {
 
 const sameIds = (left: Set<string>, right: Set<string>): boolean =>
   left.size === right.size && [...left].every((id) => right.has(id));
+
+const sameSortRanges = (
+  left: readonly GaussianSortRange[] | null,
+  right: readonly GaussianSortRange[],
+): boolean =>
+  left !== null &&
+  left.length === right.length &&
+  left.every((range, index) => {
+    const next = right[index]!;
+    return (
+      range.id === next.id &&
+      range.generation === next.generation &&
+      range.positions === next.positions &&
+      Array.from(range.modelToScene).every(
+        (value, axis) => value === next.modelToScene[axis],
+      )
+    );
+  });
 
 const validateProfile = (primitive: DecodedGaussianPrimitive): void => {
   if (primitive.profile.colorSpace !== "srgb_rec709_display")
@@ -418,6 +437,15 @@ const createManager = (
     candidate: Storage | null = null;
   let displayed = new Set<Tile>();
   let desiredPrimitives: PackedPrimitive[] = [];
+  let sortRanges: readonly GaussianSortRange[] | null = null;
+  let cachedOrder: GaussianSortPresentation | null = null;
+  let cachedOrderMemory: MemoryLease | undefined;
+  const forgetOrder = (): void => {
+    sortRanges = null;
+    cachedOrder = null;
+    cachedOrderMemory?.release();
+    cachedOrderMemory = undefined;
+  };
   let attributeUploadBytes = 0,
     orderUploadBytes = 0,
     frontierRebuilds = 0;
@@ -654,7 +682,7 @@ const createManager = (
     );
     return count ? count * 32 + 1024 : 0;
   };
-  const sorter = createGaussianSortController({
+  const sortOptions = {
     async schedule(run) {
       let work = await memory.work(sortCancellation.signal, sortWorkBytes());
       try {
@@ -718,12 +746,21 @@ const createManager = (
         workerMemory = undefined;
       },
     },
-    onOrder(presentation) {
-      if (disposed || !candidate || dirty || !presentationAllowed) {
-        if (!presentationAllowed) pendingSort = false;
-        return;
-      }
+    onOrder(presentation: GaussianSortPresentation, fromSort = true) {
+      if (disposed) return;
       try {
+        if (fromSort) {
+          const nextMemory = memory.retain([
+            presentation.order.buffer as ArrayBuffer,
+          ]);
+          cachedOrderMemory?.release();
+          cachedOrderMemory = nextMemory;
+          cachedOrder = presentation;
+        }
+        if (!candidate || dirty || !presentationAllowed) {
+          if (!presentationAllowed) pendingSort = false;
+          return;
+        }
         const next = candidate;
         const changedStorage = storage !== next;
         const changedCamera =
@@ -881,8 +918,10 @@ const createManager = (
         );
         releaseRetiredSources();
         latestColorCamera = [...presentation.cameraPosition];
-        sortMs = performance.now() - sortStarted;
-        sortCount++;
+        if (fromSort) {
+          sortMs = performance.now() - sortStarted;
+          sortCount++;
+        }
         presentationRevision++;
         pendingSort = false;
         completeAdmissions();
@@ -901,6 +940,7 @@ const createManager = (
         )
           scheduleRefresh();
       } catch (error) {
+        forgetOrder();
         pendingSort = false;
         const policy = resourcePolicyError(error);
         if (policy)
@@ -921,6 +961,7 @@ const createManager = (
       }
     },
     onError(error) {
+      forgetOrder();
       pendingSort = false;
       const policy = resourcePolicyError(error);
       if (policy)
@@ -939,7 +980,14 @@ const createManager = (
       report(error);
       notify();
     },
-  });
+  } satisfies Parameters<typeof createGaussianSortController>[0];
+  const sorter = createGaussianSortController(sortOptions);
+  const setSortScene = (ranges: readonly GaussianSortRange[]): void => {
+    if (sameSortRanges(sortRanges, ranges)) return;
+    forgetOrder();
+    sortRanges = ranges;
+    sorter.setScene(ranges, { defer: true });
+  };
 
   const trackSortIdle = (): void => {
     const serial = ++sortRequestSerial;
@@ -956,9 +1004,9 @@ const createManager = (
     if (disposed || (!camera && chargedTiles().length > 0)) return;
     try {
       presentationAllowed = false;
-      sorter.setScene([], { defer: true });
       const nextTiles = sourceTiles();
       if (!nextTiles.length) {
+        setSortScene([]);
         const empty = makeStorage([], null, arena);
         polyData.getPoints().setData(empty.positions, 3);
         scaleArray.setData(empty.scales, 3);
@@ -1072,11 +1120,22 @@ const createManager = (
       }));
       pendingSort = true;
       presentationAllowed = true;
-      sorter.setScene(ranges);
-      sorter.request(camera.position);
-      trackSortIdle();
+      setSortScene(ranges);
+      const order = cachedOrder;
+      if (
+        order &&
+        camera.position.every(
+          (value, axis) => value === order.cameraPosition[axis],
+        )
+      ) {
+        sortOptions.onOrder(order, false);
+      } else {
+        sorter.request(camera.position);
+        trackSortIdle();
+      }
       notify();
     } catch (error) {
+      forgetOrder();
       pendingSort = false;
       const policy = resourcePolicyError(error);
       if (policy)
@@ -1135,6 +1194,7 @@ const createManager = (
     if (disposed) return;
     disposed = true;
     sorter.dispose();
+    forgetOrder();
     for (const tile of [
       ...retiredSources,
       ...[...owners].flatMap((owner) => [...owner.tiles.values()]),
@@ -1169,9 +1229,10 @@ const createManager = (
   return {
     dispose,
     async whenIdle(): Promise<void> {
-      while (!disposed && (dirty || pendingSort)) {
+      while (!disposed) {
         await Promise.resolve();
         await sorter.whenIdle();
+        if (!dirty && !pendingSort) return;
       }
     },
     stats(): GaussianRendererStats {

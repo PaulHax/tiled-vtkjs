@@ -89,9 +89,10 @@ type Fixture = {
   showMixed(): void;
   clearMixed(): void;
   growMixed(): void;
+  prepareInvisible(ids: string[]): string;
   removeMixed(): void;
   presentation(): {
-    stats: { drawnTileIds: string[] };
+    stats: { drawnTileIds: string[]; submittedTileIds: string[] };
     picks: string[];
     placement: number[];
     hit: { status: string } | null;
@@ -103,6 +104,7 @@ type Fixture = {
   releaseWork(): void;
   releaseWorkSlot(): void;
   releaseNext(): void;
+  releaseWhilePreparing(ids: string[]): Promise<string>;
   hold(): void;
   release(): void;
   setCamera(position: number[]): void;
@@ -401,6 +403,83 @@ describe("coherent mixed presentations and ownership", () => {
       },
       { method, args },
     ) as Promise<Awaited<ReturnType<Fixture[K]>>>;
+
+  it.each([false, true])(
+    "presents a camera sort during off-frontier preparation (prepare at completion=%s)",
+    async (atCompletion) => {
+      const page = await open("sh");
+      const waitForOrder = () =>
+        page.waitForFunction(
+          () =>
+            !(
+              globalThis as unknown as { gaussianFixture: Fixture }
+            ).gaussianFixture.stats().pendingSort,
+          null,
+          { timeout: 10000 },
+        );
+      try {
+        const before = await pixels(page);
+        await api(page, "hold");
+        await api(page, "setCamera", [0, 0, -10]);
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        const ids = ["off-frontier-a", "off-frontier-b"];
+        if (atCompletion) {
+          expect(await api(page, "releaseWhilePreparing", ids)).toBe("queued");
+        } else {
+          expect(await api(page, "prepareInvisible", ids)).toBe("queued");
+          await api(page, "releaseNext");
+        }
+        await waitForOrder();
+        await api(page, "settle");
+        const after = await pixels(page);
+        expect(
+          pixel(after, 128, 128)[0]! - pixel(before, 128, 128)[0]!,
+        ).toBeGreaterThan(100);
+        expect(
+          (await api(page, "presentation")).stats.submittedTileIds,
+        ).toEqual(expect.arrayContaining(["off-frontier-a", "off-frontier-b"]));
+        const sorted = await api(page, "stats");
+        expect(await api(page, "prepareInvisible", ["off-frontier-c"])).toBe(
+          "queued",
+        );
+        await expect
+          .poll(
+            async () =>
+              (await api(page, "presentation")).stats.submittedTileIds,
+          )
+          .toContain("off-frontier-c");
+        await api(page, "settle");
+        expect((await pixels(page)).data).toEqual(after.data);
+        expect((await api(page, "stats")).sortCount).toBe(sorted.sortCount);
+        await api(page, "setCamera", [0, 0, 10]);
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        expect(await api(page, "prepareInvisible", ["off-frontier-d"])).toBe(
+          "queued",
+        );
+        await api(page, "releaseNext");
+        await waitForOrder();
+        await api(page, "settle");
+        expect((await pixels(page)).data).toEqual(before.data);
+        expect((await api(page, "stats")).displayedSplats).toBe(1);
+        expect(await api(page, "errors")).toEqual([]);
+        expect(await api(page, "refusals")).toEqual([]);
+        await api(page, "dispose");
+        await expect
+          .poll(async () => (await api(page, "ledger")).activeOperations)
+          .toBe(0);
+        expect(await api(page, "ledger")).toMatchObject({
+          queuedOperations: 0,
+          workReservedBytes: 0,
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          owners: 0,
+        });
+      } finally {
+        await page.close();
+      }
+    },
+  );
 
   it("accepts mesh coverage, Gaussian coverage and picking together", async () => {
     const page = await open("gaussian-only");
