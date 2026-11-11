@@ -101,6 +101,11 @@ color ranges. Capacity growth and context restoration require full uploads.
 Retired ranges become reusable only after a coherent presentation swap. Parent
 and child representations do not draw together during replacement.
 
+Reserved growth, allocated atlas arrays and the last published atlas have
+independent lifetimes. Cancelling growth restores the lease backing the current
+arrays. Superseded arrays remain charged while they are allocated or displayed;
+camera-only publications retain the lease for their actual backing arrays.
+
 `maximumVisibleSplats` constrains complete representations. Members pass their
 shared `MemoryPool` through `TileContentAdapterOptions.memoryPool`; its ledger
 owns source buffers, storage capacity, overlapping presentations, worker copies

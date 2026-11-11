@@ -568,6 +568,24 @@ globalThis.gaussianFixture = {
     adapters[0].submitTile("growth", content);
     while (scheduler.hasPending()) scheduler.prepareFrame();
   },
+  stageGrowth(id, count, restoreWork = false) {
+    if (restoreWork) {
+      memoryPool.configure({ workBytes: 1048576 });
+      for (const adapter of adapters) adapter.clearRequiredBytes();
+    }
+    return adapters[0].submitTile(
+      id,
+      field(Array.from({ length: count }, () => blue)),
+    );
+  },
+  cancelGrowth(id) {
+    return adapters[0].cancelTile(id);
+  },
+  selectGrowth(id) {
+    hold = true;
+    adapters[0].setDrawnTiles([id]);
+    renderWindow.render();
+  },
   prepareInvisible(ids) {
     const result = adapters[0].submitTileGroup(
       ids.map((id) => ({ id, content: field([blue]) })),

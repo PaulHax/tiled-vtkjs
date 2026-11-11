@@ -423,7 +423,9 @@ const createManager = (
   const memoryPool =
     firstOptions.memoryPool ?? createMemoryPool({ totalBytes: budget });
   const memory = memoryPool.createOwner();
+  // Reserved capacity, allocated arrays and published storage can differ.
   let arenaMemory: MemoryLease | undefined;
+  let realizedMemory: MemoryLease | undefined;
   let displayedMemory: MemoryLease | undefined;
   let workerMemory: MemoryLease | undefined;
   let workerSceneRevision = -1;
@@ -579,7 +581,7 @@ const createManager = (
     );
     if (order.length === previous.length) return;
     orderArray.setData(order, 1);
-    arenaMemory?.setCpu(
+    realizedMemory?.setCpu(
       [
         arena.positions.buffer,
         arena.scales.buffer,
@@ -889,7 +891,7 @@ const createManager = (
           attached = false;
         }
         orderArray.setData(order, 1);
-        arenaMemory?.setCpu(
+        realizedMemory?.setCpu(
           [
             next.positions.buffer,
             next.scales.buffer,
@@ -902,8 +904,8 @@ const createManager = (
         orderUploadBytes += order.byteLength;
         actor.setVisibility(order.length > 0);
         storage = next;
-        if (displayedMemory !== arenaMemory) displayedMemory?.release();
-        displayedMemory = arenaMemory;
+        if (displayedMemory !== realizedMemory) displayedMemory?.release();
+        displayedMemory = realizedMemory;
         releaseRetiredSources();
         for (const owner of owners) {
           owner.mesh.setBaseMatrix(owner.base);
@@ -1018,10 +1020,14 @@ const createManager = (
           firstOptions.renderer.removeActor(actor);
           attached = false;
         }
-        const oldArenaMemory = arenaMemory;
+        for (const lease of new Set([
+          arenaMemory,
+          realizedMemory,
+          displayedMemory,
+        ]))
+          lease?.release();
         arenaMemory = undefined;
-        oldArenaMemory?.release();
-        if (displayedMemory !== oldArenaMemory) displayedMemory?.release();
+        realizedMemory = undefined;
         displayedMemory = undefined;
         arenaCapacity = 0;
         storage = empty;
@@ -1065,12 +1071,12 @@ const createManager = (
         ? arena.requiredCapacity(requests)
         : 0;
       if (
-        arenaMemory !== displayedMemory &&
+        arenaMemory !== realizedMemory &&
         projectedCapacity === arena.capacity &&
         arenaCapacity !== arena.capacity
       ) {
         arenaMemory?.release();
-        arenaMemory = displayedMemory;
+        arenaMemory = realizedMemory;
         arenaCapacity = arena.capacity;
       }
       if (projectedCapacity !== arenaCapacity) {
@@ -1090,7 +1096,9 @@ const createManager = (
         arenaCapacity = projectedCapacity;
       }
       candidate = makeStorage(nextTiles, candidate, arena);
-      arenaMemory?.setCpu(
+      const previousRealizedMemory = realizedMemory;
+      realizedMemory = arenaMemory;
+      realizedMemory?.setCpu(
         [
           arena.positions.buffer,
           arena.scales.buffer,
@@ -1100,6 +1108,11 @@ const createManager = (
         ] as ArrayBuffer[],
         Math.max(0, arena.capacity * 4 - orderArray.getData().byteLength),
       );
+      if (
+        previousRealizedMemory !== realizedMemory &&
+        previousRealizedMemory !== displayedMemory
+      )
+        previousRealizedMemory?.release();
       const drawn = desiredTiles();
       desiredPrimitives = candidate.primitives.filter((primitive) =>
         drawn.has(primitive.tile),
@@ -1201,8 +1214,8 @@ const createManager = (
     ])
       tile.sourceMemory?.release();
     retiredSources.clear();
-    arenaMemory?.release();
-    if (displayedMemory !== arenaMemory) displayedMemory?.release();
+    for (const lease of new Set([arenaMemory, realizedMemory, displayedMemory]))
+      lease?.release();
     memory.close();
     for (const owner of owners) {
       owner.disposed = true;
@@ -1557,7 +1570,7 @@ const createManager = (
             grows &&
             oldArenaMemory &&
             oldArenaMemory !== displayedMemory &&
-            arena.capacity !== oldArenaCapacity
+            oldArenaMemory !== realizedMemory
           )
             oldArenaMemory.release();
           owner.workRevision++;

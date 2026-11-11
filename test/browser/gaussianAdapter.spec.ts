@@ -102,6 +102,9 @@ type Fixture = {
   showMixed(): void;
   clearMixed(): void;
   growMixed(): void;
+  stageGrowth(id: string, count: number, restoreWork?: boolean): string;
+  cancelGrowth(id: string): boolean;
+  selectGrowth(id: string): void;
   prepareInvisible(ids: string[]): string;
   removeMixed(): void;
   presentation(): {
@@ -753,6 +756,79 @@ describe("coherent mixed presentations and ownership", () => {
       await page.close();
     }
   });
+
+  it.each([false, true])(
+    "retries cancelled growth without reusing a claimed lease (sort refusal=%s)",
+    async (refusal) => {
+      const page = await open("gaussian-only");
+      try {
+        if (refusal) {
+          await api(page, "setWorkLimit", 0);
+          await api(page, "growMixed");
+          await api(page, "settle");
+          expect((await api(page, "stats")).pendingSort).toBe(false);
+        } else {
+          await api(page, "hold");
+          await api(page, "setCamera", [0.1, 0, 10]);
+          await expect.poll(() => api(page, "pending")).toBe(1);
+        }
+        expect(
+          await api(page, "stageGrowth", "cancelled", refusal ? 32 : 8),
+        ).toBe("queued");
+        const reserved = await api(page, "ledger");
+        if (!refusal) {
+          await api(page, "releaseNext");
+          await page.waitForFunction(
+            () =>
+              !(
+                globalThis as unknown as { gaussianFixture: Fixture }
+              ).gaussianFixture.stats().pendingSort,
+          );
+          expect((await api(page, "ledger")).rendererBytes).toBe(
+            reserved.rendererBytes,
+          );
+          expect((await api(page, "ledger")).cpuReservedBytes).toBe(
+            reserved.cpuReservedBytes,
+          );
+        }
+        expect(await api(page, "cancelGrowth", "cancelled")).toBe(true);
+        await api(page, "settle");
+        expect(await api(page, "stageGrowth", "retry", 32, refusal)).toBe(
+          "queued",
+        );
+        await api(page, "release");
+        await api(page, "settle");
+        expect(pixel(await pixels(page), 128, 128)[0]).toBeGreaterThan(100);
+        const accepted = await api(page, "stats");
+        expect((await api(page, "ledger")).rendererBytes).toBe(
+          accepted.residentBytes,
+        );
+        await api(page, "selectGrowth", "retry");
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        expect(pixel(await pixels(page), 128, 128)[0]).toBeGreaterThan(100);
+        await api(page, "release");
+        await api(page, "settle");
+        const blue = pixel(await pixels(page), 128, 128);
+        expect(blue[2]).toBeGreaterThan(200);
+        expect(blue[0]).toBe(0);
+        expect(await api(page, "errors")).toEqual([]);
+        await api(page, "dispose");
+        await expect
+          .poll(() => api(page, "ledger"))
+          .toMatchObject({
+            rendererBytes: 0,
+            cpuRetainedBytes: 0,
+            cpuReservedBytes: 0,
+            activeOperations: 0,
+            queuedOperations: 0,
+            workReservedBytes: 0,
+            owners: 0,
+          });
+      } finally {
+        await page.close();
+      }
+    },
+  );
 
   it("clears unaccepted capacity growth while another empty owner remains", async () => {
     const page = await open("gaussian-only");
