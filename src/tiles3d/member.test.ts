@@ -85,7 +85,12 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
   const scheduleRender = vi.fn();
   const decodedRequests: DecodeTileRequest[] = [];
   const contentRequests: string[] = [];
-  const memory = createMemoryPool({ totalBytes: 4096 });
+  const memory = createMemoryPool({
+    totalBytes: 4096,
+    cpuBytes: 1024 * 1024,
+    workBytes: 1024 * 1024,
+    maxConcurrentOperations: 5,
+  });
   const submissions = createSubmissionScheduler({
     scheduleRender,
     maxBytesPerFrame: schedulerBytes,
@@ -859,6 +864,13 @@ describe("createTiles3dMember", () => {
         irreducibleBudget: true,
         renderer: { residentBytes: 0 },
       });
+      const refusedFetches = h.contentRequests.length;
+      for (let step = 1; step <= 3; step += 1) {
+        member.setCamera({ ...view, position: [0, 0, -1 - step * 0.01] });
+        member.prepareFrame();
+        await settle();
+      }
+      expect(h.contentRequests).toHaveLength(refusedFetches);
       member.applyAllocation({
         qualityFraction: 1,
         memoryBudgetBytes: 4096,
@@ -959,6 +971,7 @@ describe("createTiles3dMember", () => {
   const replacementMember = (
     centers: readonly number[],
     fetchContent?: Tiles3dMemberConfig["fetchContent"],
+    refineFirstChild = false,
   ) => {
     const h = harness();
     const box = (x: number, half: number) => [
@@ -981,9 +994,20 @@ describe("createTiles3dMember", () => {
       boundingVolume: { box: box(0, 1) },
       content: { uri: "root.glb" },
       children: centers.map((x, index) => ({
-        geometricError: 0,
+        geometricError: refineFirstChild && index === 0 ? 0.5 : 0,
         boundingVolume: { box: box(x, 1 / centers.length) },
         content: { uri: `child-${index}.glb` },
+        ...(refineFirstChild && index === 0
+          ? {
+              children: [
+                {
+                  geometricError: 0,
+                  boundingVolume: { box: box(x, 1 / centers.length) },
+                  content: { uri: "leaf.glb" },
+                },
+              ],
+            }
+          : {}),
       })),
     };
     const twoTriangles = (): DecodedTileContent => {
@@ -1015,7 +1039,20 @@ describe("createTiles3dMember", () => {
             root,
           }),
         }),
-        ...(fetchContent ? { fetchContent } : {}),
+        fetchContent:
+          fetchContent ??
+          (async (...args) => {
+            if (refineFirstChild && args[0].endsWith("/leaf.glb")) {
+              h.contentRequests.push(args[0]);
+              return {
+                ok: false,
+                status: 404,
+                statusText: "Not Found",
+                arrayBuffer: async () => new ArrayBuffer(0),
+              };
+            }
+            return h.config.fetchContent!(...args);
+          }),
       },
       h.services,
     );
@@ -1033,33 +1070,64 @@ describe("createTiles3dMember", () => {
     return { h, member, drain };
   };
 
-  it("admits the sibling still wanted when the camera culls one of a group in flight", async () => {
-    const { h, member, drain } = replacementMember([-0.5, 0.5]);
-    member.setCamera({ ...view, position: [0, 0, -1000] });
-    await drain();
-    // Closer, both children are wanted. Each alone is refused beside the
-    // root; together they replace it, and their upload is still queued.
-    member.setCamera(view);
-    for (let round = 0; round < 15; round += 1) await settle();
-    expect((member.stats() as Tiles3dMemberStats).renderer.pendingTiles).toBe(
-      2,
-    );
-    // Pan until the second child leaves the view.
-    const panned = [...IDENTITY];
-    panned[12] = 1.2;
-    member.setCamera({ ...view, viewProj: panned });
-    await drain();
-    for (let frame = 0; frame < 5; frame += 1) {
-      member.prepareFrame();
+  it.each([
+    { evict: false, fallback: false },
+    { evict: true, fallback: false },
+    { evict: true, fallback: true },
+  ])(
+    "recovers a wanted sibling after group cancellation (evict=$evict, fallback=$fallback)",
+    async ({ evict, fallback }) => {
+      const { h, member, drain } = replacementMember(
+        [-0.5, 0.5],
+        undefined,
+        fallback,
+      );
+      member.setCamera({ ...view, position: [0, 0, -1000] });
       await drain();
-    }
-    expect(
-      (member.stats() as Tiles3dMemberStats).renderer.drawnTileIds,
-    ).toEqual(["root/0"]);
-    expect(member.governorInputs().work.operations).toBe(0);
-    expect(h.renderer.addActor).toHaveBeenCalled();
-    member.dispose();
-  });
+      // Closer, both children are wanted. Each alone is refused beside the
+      // root; together they replace it, and their upload is still queued.
+      member.setCamera(fallback ? { ...view, position: [0, 0, -10] } : view);
+      for (let round = 0; round < 15; round += 1) await settle();
+      expect((member.stats() as Tiles3dMemberStats).renderer.pendingTiles).toBe(
+        2,
+      );
+      if (evict)
+        member.setConfig({ ...h.config, cacheBytes: 0, maxAttempts: 1 });
+      if (fallback)
+        member.applyAllocation({
+          qualityFraction: 1,
+          memoryBudgetBytes: 180,
+          regime: "stationary",
+        });
+      // Pan until the second child leaves the view.
+      const panned = [...IDENTITY];
+      panned[12] = 1.2;
+      member.setCamera({ ...view, viewProj: panned });
+      await drain();
+      for (let frame = 0; frame < 5; frame += 1) {
+        member.prepareFrame();
+        await drain();
+      }
+      expect(
+        (member.stats() as Tiles3dMemberStats).renderer.drawnTileIds,
+      ).toEqual(["root/0"]);
+      expect(member.governorInputs().work.operations).toBe(0);
+      expect(
+        h.contentRequests.filter((url) => url.endsWith("/child-0.glb")),
+      ).toHaveLength(evict ? 2 : 1);
+      expect(
+        h.contentRequests.filter((url) => url.endsWith("/child-1.glb")),
+      ).toHaveLength(1);
+      if (fallback) {
+        expect((member.stats() as Tiles3dMemberStats).queue?.failed).toBe(1);
+        expect(
+          h.contentRequests.filter((url) => url.endsWith("/leaf.glb")),
+        ).toHaveLength(1);
+      }
+      expect(h.renderer.addActor).toHaveBeenCalled();
+      member.dispose();
+    },
+  );
 
   it("stops waiting on refused siblings once a third sibling has failed", async () => {
     const { member, drain } = replacementMember([-0.5, 0, 0.5], async (url) =>
@@ -1187,35 +1255,42 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
-  it("surfaces permanent adapter rejection once without retrying forever", async () => {
-    // Geometry can be split into triangles, but one triangle is indivisible.
-    const h = harness(false, 16);
-    const member = createTiles3dMember(h.context, h.config, h.services);
-    member.applyAllocation({
-      qualityFraction: 1,
-      memoryBudgetBytes: 4096,
-      regime: "stationary",
-    });
-    member.setCamera(view);
-    await settle();
-    expect((member.stats() as Tiles3dMemberStats).errorCount).toBe(1);
-    expect((member.stats() as Tiles3dMemberStats).lastError).toMatch(
-      /one mesh triangle requires .*submission cap/,
-    );
-    expect(member.governorInputs()).toMatchObject({
-      work: { operations: 0 },
-      physicalTileOperations: 0,
-    });
-    member.applyAllocation({
-      qualityFraction: 0.5,
-      memoryBudgetBytes: 4096,
-      regime: "moving",
-    });
-    await settle();
-    expect(h.decodedRequests).toHaveLength(1);
-    expect((member.stats() as Tiles3dMemberStats).errorCount).toBe(1);
-    member.dispose();
-  });
+  it.each([0, 1024])(
+    "surfaces permanent adapter rejection without refetching (cache=%s)",
+    async (cacheBytes) => {
+      // Geometry can be split into triangles, but one triangle is indivisible.
+      const h = harness(false, 16);
+      const member = createTiles3dMember(
+        h.context,
+        { ...h.config, cacheBytes },
+        h.services,
+      );
+      member.applyAllocation({
+        qualityFraction: 1,
+        memoryBudgetBytes: 4096,
+        regime: "stationary",
+      });
+      member.setCamera(view);
+      await settle();
+      expect((member.stats() as Tiles3dMemberStats).errorCount).toBe(1);
+      expect((member.stats() as Tiles3dMemberStats).lastError).toMatch(
+        /one mesh triangle requires .*submission cap/,
+      );
+      expect(member.governorInputs()).toMatchObject({
+        work: { operations: 0 },
+        physicalTileOperations: 0,
+      });
+      member.applyAllocation({
+        qualityFraction: 0.5,
+        memoryBudgetBytes: 4096,
+        regime: "moving",
+      });
+      await settle();
+      expect(h.decodedRequests).toHaveLength(1);
+      expect((member.stats() as Tiles3dMemberStats).errorCount).toBe(1);
+      member.dispose();
+    },
+  );
 
   it("drops old submitted/pick currency before revision, endpoint, or placement reload", async () => {
     const h = harness();

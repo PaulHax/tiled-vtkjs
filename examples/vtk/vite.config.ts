@@ -124,6 +124,7 @@ export default defineConfig({
         instrumented: resolve(exampleRoot, "instrumented/index.html"),
         simple: resolve(exampleRoot, "simple/index.html"),
         mesh: resolve(exampleRoot, "mesh/index.html"),
+        memory: resolve(exampleRoot, "memory/index.html"),
         combined: resolve(exampleRoot, "combined/index.html"),
       },
     },

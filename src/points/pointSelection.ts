@@ -97,6 +97,7 @@ export type PointSelection = {
   /** Visible page references the walk stopped at, in the order it met them. */
   readonly neededPages: readonly string[];
   readonly targetPoints: number;
+  readonly memoryDemandBytes: number;
   readonly consideredNodes: number;
   readonly availableNodes: number;
   readonly sseStoppedNodes: number;
@@ -116,6 +117,7 @@ export const EMPTY_SELECTION: PointSelection = {
   target: new Set(),
   neededPages: [],
   targetPoints: 0,
+  memoryDemandBytes: 0,
   consideredNodes: 0,
   availableNodes: 0,
   sseStoppedNodes: 0,
@@ -197,6 +199,7 @@ export const selectPoints = (input: {
     target: selection.selected,
     neededPages,
     targetPoints: selection.totalPoints,
+    memoryDemandBytes: selection.demandBytes,
     consideredNodes: selection.consideredNodes,
     availableNodes: selection.availableNodes,
     sseStoppedNodes,

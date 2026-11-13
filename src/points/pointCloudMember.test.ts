@@ -280,6 +280,51 @@ describe("createPointCloudMember", () => {
     member.dispose();
   });
 
+  it("keeps displayed points and a persistent refusal when a lower limit cannot fit their root", async () => {
+    const memory = createMemoryPool({ totalBytes: 1024 });
+    const coordinator = createStreamedSceneCoordinator({
+      memory,
+      scheduleRender: vi.fn(),
+    });
+    const onResourceState = vi.fn();
+    const member = createPointCloudMember(
+      coordinator.context({ addActor: vi.fn(), removeActor: vi.fn() }),
+      config({
+        source: source(1),
+        pointCount: 1,
+        pointBudget: 1,
+        adaptive: false,
+        onResourceState,
+      }),
+    );
+    coordinator.register(member).setCamera(VIEW);
+    await settle();
+    coordinator.prepareFrame(1);
+    await settle();
+    coordinator.prepareFrame(2);
+    expect((member.stats() as PointCloudMemberStats).renderer.drawnPoints).toBe(
+      1,
+    );
+    memory.configure({ totalBytes: 50 });
+    coordinator.prepareFrame(3);
+    await settle();
+    coordinator.prepareFrame(4);
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "blocked", domain: "renderer" },
+      renderer: { drawnPoints: 1 },
+    });
+    memory.configure({ totalBytes: 1024 });
+    coordinator.prepareFrame(5);
+    await settle();
+    coordinator.prepareFrame(6);
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "ready" },
+      renderer: { drawnPoints: 1 },
+    });
+    expect(onResourceState).toHaveBeenLastCalledWith({ status: "ready" });
+    coordinator.dispose();
+  });
+
   it("integrates coordinator quality, memory, live DPR, and config lifecycle", async () => {
     const memory = createMemoryPool({ totalBytes: 16_000 });
     const scheduleRender = vi.fn();
@@ -288,7 +333,12 @@ describe("createPointCloudMember", () => {
       scheduleRender,
       memory,
     });
-    const initial = config({ adaptive: false, pointBudget: 1_000 });
+    const initial = config({
+      source: source(1_000),
+      pointCount: 1_000,
+      adaptive: false,
+      pointBudget: 1_000,
+    });
     const member = createPointCloudMember(
       coordinator.context(renderer, 1),
       initial,
@@ -304,7 +354,7 @@ describe("createPointCloudMember", () => {
     expect(memory.memberCount()).toBe(1);
     expect(stats.allocation).toMatchObject({
       qualityFraction: 1,
-      memoryBudgetBytes: 16_000,
+      memoryBudgetBytes: 15_064,
     });
     expect(stats.controller).toMatchObject({
       pointBudget: 1_000,

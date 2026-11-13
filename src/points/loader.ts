@@ -22,6 +22,7 @@ import {
   type FailureRecord,
   type RetryPolicy,
 } from "../core/retryPolicy";
+import { resourcePolicyError } from "../core/memoryResources";
 
 export type LoaderCounts = {
   /** Keys waiting for a slot. */
@@ -63,6 +64,7 @@ export type Loader = {
   /** Keys inside a rest; walks every failure record. */
   restingCount(): number;
   counts(): LoaderCounts;
+  retryBlocked(): void;
 };
 
 type Read = {
@@ -91,6 +93,7 @@ export const createLoader = <T>(options: {
   readonly cancelGraceMs: number;
   /** A read delivered; the owner decides where the payload goes. */
   readonly onLoaded: (key: string, value: T) => void;
+  readonly onDiscarded?: (value: T) => void;
   /** A read failed with anything but an abort. */
   readonly onFailed: (key: string, error: unknown) => void;
   /** A read started or settled. */
@@ -99,6 +102,7 @@ export const createLoader = <T>(options: {
   const { concurrency, retry, cancelGraceMs } = options;
   const reads = new Map<string, Read>();
   const failures = new Map<string, FailureRecord>();
+  const blocked = new Set<string>();
   const retries = new Map<string, Retry>();
   let wanted = new Set<string>();
   let queue: string[] = [];
@@ -182,6 +186,7 @@ export const createLoader = <T>(options: {
         options.onChange();
         // A reset forgot this read; its result belongs to nobody now.
         if (reads.get(key) !== read) {
+          options.onDiscarded?.(value);
           pump();
           return;
         }
@@ -201,7 +206,10 @@ export const createLoader = <T>(options: {
         }
         clearGrace(read);
         reads.delete(key);
-        if (!isAbortError(error)) {
+        if (resourcePolicyError(error)) {
+          blocked.add(key);
+          options.onFailed(key, error);
+        } else if (!isAbortError(error)) {
           failures.set(
             key,
             recordFailure(failures.get(key), retry, Date.now()),
@@ -221,7 +229,7 @@ export const createLoader = <T>(options: {
   const pump = (): void => {
     while (physical < concurrency && queue.length > 0) {
       const key = queue.shift()!;
-      if (!wanted.has(key) || reads.has(key)) continue;
+      if (!wanted.has(key) || reads.has(key) || blocked.has(key)) continue;
       start(key);
     }
   };
@@ -260,11 +268,17 @@ export const createLoader = <T>(options: {
       for (const armed of retries.values()) clearTimeout(armed.timer);
       retries.clear();
       failures.clear();
+      blocked.clear();
       wanted = new Set();
       queue = [];
     },
 
     resting,
+    retryBlocked() {
+      for (const key of blocked) if (wanted.has(key)) queue.push(key);
+      blocked.clear();
+      pump();
+    },
 
     restingCount() {
       let count = 0;

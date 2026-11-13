@@ -13,6 +13,13 @@ import {
 } from "../core/mat4";
 import { safeCall } from "../core/observers";
 import {
+  ResourcePolicyError,
+  resourcePolicyError,
+  type MemoryLease,
+  type MemoryDomain,
+} from "../core/memoryResources";
+import { buildTransferList } from "./decode/transfer";
+import {
   CULLED,
   importanceFromRootSseCssPx,
   type Allocation,
@@ -166,10 +173,56 @@ export const createTiles3dMember = (
   let refreshing = false;
   let refreshAgain = false;
   let drawSetDirty = true;
+  let rootMemoryBytes = 0;
+  let sourceMemory: MemoryLease | undefined;
+  let lastPolicyRevision = context.memory.stats().revision;
+  let lastAvailability = context.memory.stats().availabilityRevision;
+  let retryOnAvailability = false;
+  let resourceState: Tiles3dMemberStats["resourceState"] = { status: "ready" };
+  const setResourceState = (
+    next: Tiles3dMemberStats["resourceState"],
+  ): void => {
+    resourceState = next;
+    safeCall(() => config.onResourceState?.(next));
+    context.onWorkChange?.();
+  };
+  const policyRefused = (error: ResourcePolicyError): void => {
+    retryOnAvailability = error.retryable;
+    lastAvailability = context.memory.stats().availabilityRevision;
+    queueMicrotask(() => {
+      lastAvailability = context.memory.stats().availabilityRevision;
+    });
+    setResourceState({
+      status: "blocked",
+      domain: error.domain,
+      requestedBytes: error.requestedBytes,
+      limitBytes: error.limitBytes,
+      retryable: error.retryable,
+      reason:
+        adapter.workState().residentBytes > 0
+          ? "transition-unavailable"
+          : "configured-limit",
+    });
+  };
+  const memory = context.memory.createOwner({
+    reclaim(domain: MemoryDomain) {
+      if (domain === "cpu") {
+        queue?.trimCache(0);
+        subtreeQueue?.trimCache(0);
+        adapter.trimReuse();
+      }
+      if (domain === "renderer") adapter.trimReuse();
+    },
+  });
 
   const report = (error: unknown): void => {
     errorCount += 1;
     lastError = errorMessage(error);
+    setResourceState({
+      status: "error",
+      errorName: error instanceof Error ? error.name : "Error",
+      message: lastError,
+    });
     safeCall(() => config.onError?.(error));
     context.onWorkChange?.();
   };
@@ -183,6 +236,8 @@ export const createTiles3dMember = (
     submissions: context.submissions,
     visible: active,
     onError: report,
+    memory,
+    onPolicyRefusal: policyRefused,
   });
   const pickSet = createMeshPickSet();
 
@@ -457,6 +512,9 @@ export const createTiles3dMember = (
     blockedGroupAncestors.clear();
     irreducibleBudget = false;
     constrainedDesiredSignature = null;
+    adapter.clearRequiredBytes();
+    if (resourceState.status === "blocked")
+      setResourceState({ status: "ready" });
   };
 
   const clearAdmissionState = (): void => {
@@ -517,7 +575,8 @@ export const createTiles3dMember = (
       return "failed" as const;
     if (decoded.has(id)) return "decoded" as const;
     const entry = queueEntryById.get(id);
-    if (entry?.status === "failed") return "failed" as const;
+    if (entry?.status === "failed" || entry?.status === "blocked")
+      return "failed" as const;
     if (entry) return "loading" as const;
     return "unloaded" as const;
   };
@@ -533,6 +592,7 @@ export const createTiles3dMember = (
   const latchIrreducibleBudget = (): void => {
     if (irreducibleBudget) return;
     irreducibleBudget = true;
+    if (adapter.workState().residentBytes > 0) return;
     adapter.clearTiles();
     pickSet.replaceDrawn([]);
   };
@@ -542,6 +602,7 @@ export const createTiles3dMember = (
     // Publish coverage once that batch has finished, not once per callback.
     if (!drawSetDirty || (refreshing && !selectionComplete)) return;
     drawSetDirty = false;
+    if (irreducibleBudget && adapter.workState().residentBytes > 0) return;
     if (!source || !camera || !active || disposed) {
       adapter.setDrawnTiles([]);
       pickSet.replaceDrawn([]);
@@ -605,6 +666,21 @@ export const createTiles3dMember = (
       for (const id of nextRequested) {
         if (adapter.restoreTile(id) === "failed") admissionFailed.add(id);
       }
+      // Delivery records can outlive both cached payloads and cancelled
+      // realizations. Existing refusal latches still govern their own retries.
+      const requeueUncached = new Set(newlyDesired);
+      if (!irreducibleBudget) {
+        for (const id of nextRequested) {
+          if (
+            adapter.tileState(id) === "absent" &&
+            !admissionBlocked.has(id) &&
+            !admissionFailed.has(id) &&
+            queueEntryById.get(id)?.status === "ready" &&
+            queue.get(id) === undefined
+          )
+            requeueUncached.add(id);
+        }
+      }
       // Cancelling a deselected tile cancels its whole replacement group, so
       // a decoded sibling that is still wanted goes back through admission
       // below with the refused ones.
@@ -621,7 +697,7 @@ export const createTiles3dMember = (
         nextContentRequests.filter(
           (request) => adapter.tileState(request.id) !== "submitted",
         ),
-        { requeueUncached: newlyDesired },
+        { requeueUncached },
       );
       for (const id of nextRequested) {
         if (!admissionBlocked.has(id) || adapter.tileState(id) !== "absent")
@@ -693,21 +769,26 @@ export const createTiles3dMember = (
       configGeneration,
       maxConcurrency: config.concurrency,
       maxDecodedBytes: config.cacheBytes,
+      memory,
+      decodedBuffers: buildTransferList,
       fetch: config.fetchContent,
       maxAttempts: config.maxAttempts,
       decode: async (bytes, request, decodeContext) => {
         const tile = materializedTileById.get(request.id);
         if (!tile) throw new Error(`unknown 3D tile ${request.id}`);
-        const job = services.workers.decode({
-          content: bytes,
-          contentUrl: workerUrl(request.url),
-          dependencyRootUrl: workerUrl(`${config.endpoint}/`),
-          revision: decodeContext.revision,
-          accumulatedTransform: [...tile.worldTransform] as any,
-          tilesetToScene: [...config.tilesetToScene] as any,
-          textureCapabilities: services.textureCapabilities,
-          wasm: config.wasm,
-        });
+        const job = services.workers.decode(
+          {
+            content: bytes,
+            contentUrl: workerUrl(request.url),
+            dependencyRootUrl: workerUrl(`${config.endpoint}/`),
+            revision: decodeContext.revision,
+            accumulatedTransform: [...tile.worldTransform] as any,
+            tilesetToScene: [...config.tilesetToScene] as any,
+            textureCapabilities: services.textureCapabilities,
+            wasm: config.wasm,
+          },
+          { memory: decodeContext.work },
+        );
         const abort = () => job.cancel();
         decodeContext.signal.addEventListener("abort", abort, { once: true });
         try {
@@ -720,6 +801,8 @@ export const createTiles3dMember = (
       onContent: (request, content) => {
         workProgressSerial += 1;
         if (disposed || !active || !requested.has(request.id)) return;
+        if (request.id === tileset.root.id)
+          rootMemoryBytes = adapter.estimateTileBytes(content);
         decoded.add(request.id);
         const groupOutcome = trySubmitDesiredGroup(request.id);
         if (groupOutcome === "queued") {
@@ -772,6 +855,14 @@ export const createTiles3dMember = (
         workProgressSerial += 1;
         report(error);
       },
+      onPolicyRefusal: (request, error) => {
+        workProgressSerial += 1;
+        policyRefused(error);
+        admissionFailed.add(request.id);
+        if (request.id === tileset.root.id) latchIrreducibleBudget();
+        else blockGroupUnder(request.id);
+        refreshSelection();
+      },
       onStateChange: (snapshot) => {
         workProgressSerial += 1;
         setQueueSnapshot(snapshot);
@@ -791,11 +882,18 @@ export const createTiles3dMember = (
       configGeneration,
       maxConcurrency: config.concurrency,
       maxDecodedBytes: DEFAULT_TILES3D_SUBTREE_CACHE_BYTES,
+      memory,
       fetch: config.fetchSubtree,
       maxAttempts: config.maxAttempts,
       decode: (bytes) =>
         parseSubtree(bytes, implicit.subtreeLevels, implicit.metadataSchema),
       decodedByteLength: (subtree) => subtree.byteLength,
+      onPolicyRefusal: (_request, error) => {
+        workProgressSerial += 1;
+        policyRefused(error);
+        setSubtreeSnapshot(subtreeQueue?.snapshot() ?? null);
+        refreshSelection();
+      },
       onContent: () => {
         workProgressSerial += 1;
         if (disposed || !active) return;
@@ -824,23 +922,38 @@ export const createTiles3dMember = (
     const controller = new AbortController();
     loadController = controller;
     sourceState = "loading";
+    sourceMemory?.release();
+    sourceMemory = undefined;
     source = null;
     materializedTileById.clear();
     traversal = null;
     setQueueSnapshot(null);
     context.onWorkChange?.();
-    void loadTileset({
-      endpoint: config.endpoint,
-      fetch: config.fetchTileset,
-      signal: controller.signal,
-    }).then(
-      (loaded) => {
+    const load = async () => {
+      const work = await memory.work(controller.signal);
+      try {
+        const loaded = await loadTileset({
+          endpoint: config.endpoint,
+          fetch: config.fetchTileset,
+          signal: controller.signal,
+          memory: work,
+        });
+        return { loaded, lease: work.commit([], loaded.tileById.size * 1024) };
+      } finally {
+        work.release();
+      }
+    };
+    void load().then(
+      ({ loaded, lease }) => {
         if (
           disposed ||
           generation !== loadGeneration ||
           controller.signal.aborted
-        )
+        ) {
+          lease.release();
           return;
+        }
+        sourceMemory = lease;
         source = loaded;
         materializedTileById = new Map(loaded.tileById);
         workProgressSerial += 1;
@@ -859,7 +972,9 @@ export const createTiles3dMember = (
           return;
         sourceState = "failed";
         workProgressSerial += 1;
-        report(error);
+        const refusal = resourcePolicyError(error);
+        if (refusal) policyRefused(refusal);
+        else report(error);
       },
     );
   };
@@ -983,6 +1098,38 @@ export const createTiles3dMember = (
       if (!disposed && interactionDepth > 0) interactionDepth -= 1;
     },
     prepareFrame() {
+      const revision = context.memory.stats().revision;
+      const availability = context.memory.stats().availabilityRevision;
+      const policyChanged = revision !== lastPolicyRevision;
+      if (
+        !disposed &&
+        active &&
+        (policyChanged ||
+          (retryOnAvailability && availability !== lastAvailability))
+      ) {
+        lastPolicyRevision = revision;
+        lastAvailability = availability;
+        if (sourceState === "failed" && resourceState.status === "blocked")
+          beginLoad();
+        clearBudgetConstraint();
+        admissionFailed.clear();
+        queue?.retryBlocked(!policyChanged);
+        subtreeQueue?.retryBlocked(!policyChanged);
+        const uncached = new Set(
+          [...admissionBlocked].filter(
+            (id) => requested.has(id) && queue?.get(id) === undefined,
+          ),
+        );
+        for (const id of uncached) {
+          admissionBlocked.delete(id);
+          decoded.delete(id);
+        }
+        queue?.setSelection(
+          contentRequests(materializedTileById, [...requested]),
+          { requeueUncached: uncached },
+        );
+        refreshSelection();
+      }
       if (!disposed && drawSetDirty) updateDrawSet();
     },
 
@@ -1024,11 +1171,22 @@ export const createTiles3dMember = (
           ? (sourceState === "loading" ? 1 : 0) + (subtreeSnapshot?.active ?? 0)
           : 0,
         residentBytes: renderer.residentBytes,
+        memoryDemand: {
+          minimumBytes: rootMemoryBytes,
+          desiredBytes: queueSnapshot?.workPending
+            ? Number.POSITIVE_INFINITY
+            : Math.max(
+                rootMemoryBytes,
+                renderer.residentBytes,
+                adapter.requiredBytes(),
+              ),
+        },
       };
     },
 
     onStall(error) {
-      if (!disposed) report(error);
+      if (!disposed)
+        setResourceState({ status: "stalled", message: errorMessage(error) });
     },
 
     applyAllocation(next) {
@@ -1043,12 +1201,24 @@ export const createTiles3dMember = (
       );
       if (allocation.memoryBudgetBytes > previousMemoryBudgetBytes) {
         clearBudgetConstraint();
+        admissionFailed.clear();
+        queue?.retryBlocked();
       } else if (
         adapter.workState().residentBytes > allocation.memoryBudgetBytes
       ) {
         memoryConstrained = true;
         irreducibleBudget = false;
         constrainedDesiredSignature = unconstrainedDesiredSignature();
+        if (rootMemoryBytes > allocation.memoryBudgetBytes) {
+          policyRefused(
+            new ResourcePolicyError(
+              "renderer",
+              rootMemoryBytes,
+              allocation.memoryBudgetBytes,
+            ),
+          );
+          irreducibleBudget = true;
+        }
       } else {
         retryIfDesiredSelectionChanged();
       }
@@ -1114,6 +1284,7 @@ export const createTiles3dMember = (
         effectiveScreenSpaceErrorPx: effectiveSse,
         sseMultiplier: effectiveSse / config.maximumScreenSpaceErrorPx,
         memoryConstrained,
+        resourceState,
         blockedGroups: blockedGroupAncestors.size,
         selectedTiles: traversal?.desiredTileIds.length ?? 0,
         requestedTiles: traversal?.requestedTileIds.length ?? 0,
@@ -1151,6 +1322,9 @@ export const createTiles3dMember = (
       clearAdmissionState();
       blockedGroupAncestors.clear();
       adapter.dispose();
+      sourceMemory?.release();
+      sourceMemory = undefined;
+      memory.close();
       pickSet.dispose();
       source = null;
       materializedTileById.clear();

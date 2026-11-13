@@ -26,6 +26,7 @@ import {
   createStreamedSceneCoordinator,
   type CameraView,
   type StreamedSceneCoordinator,
+  type MemoryPool,
 } from "../../../src";
 import type { TextureCapabilities } from "../../../src/tiles3d/decode";
 import type { Tiles3dMemberServices } from "../../../src/tiles3d/memberTypes";
@@ -158,7 +159,10 @@ const probeTextureCapabilities = (
   };
 };
 
-export const createSceneHost = (container: HTMLElement): SceneHost => {
+export const createSceneHost = (
+  container: HTMLElement,
+  memory: MemoryPool = createMemoryPool(),
+): SceneHost => {
   const fullScreen = vtkFullScreenRenderWindow.newInstance({
     rootContainer: container,
     containerStyle: { height: "100%", width: "100%", position: "relative" },
@@ -349,7 +353,7 @@ export const createSceneHost = (container: HTMLElement): SceneHost => {
 
   const coordinator = createStreamedSceneCoordinator({
     scheduleRender,
-    memory: createMemoryPool(),
+    memory,
     devicePixelRatio: currentDevicePixelRatio,
   });
 

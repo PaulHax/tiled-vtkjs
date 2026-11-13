@@ -361,7 +361,9 @@ const implicitHierarchy = (
 
     // A failed selected entry remains an unknown boundary and is deliberately
     // not converted to empty availability.
-    if (entryById.get(request.id)?.status === "failed") {
+    if (
+      ["failed", "blocked"].includes(entryById.get(request.id)?.status ?? "")
+    ) {
       return proxy(subtreeRoot, fallbackBounds);
     }
     return buildTile(0, 0, 0, subtreeRoot);
@@ -397,7 +399,9 @@ const sameHierarchy = (
   const failed = (snapshot: SubtreeHierarchyState) =>
     new Set(
       snapshot.entries
-        .filter((entry) => entry.status === "failed")
+        .filter(
+          (entry) => entry.status === "failed" || entry.status === "blocked",
+        )
         .map((entry) => entry.id),
     );
   const a = failed(left),

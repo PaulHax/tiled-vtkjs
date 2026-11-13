@@ -2,6 +2,17 @@
 
 import { finiteAtLeast, integerAtLeast } from "../core/numeric";
 import { safeCall } from "../core/observers";
+import {
+  resourcePolicyError,
+  type MemoryOwner,
+  type MemoryLease,
+  type MemoryWork,
+  type ResourcePolicyError,
+} from "../core/memoryResources";
+import {
+  readMemoryResponse,
+  type BufferedResponse,
+} from "../core/memoryResponse";
 
 const MAX_EVICTION_HISTORY = 4_096;
 
@@ -10,7 +21,7 @@ export type TileContentRequest = {
   readonly url: string;
 };
 
-export type ContentQueueFetchResponse = {
+export type ContentQueueFetchResponse = BufferedResponse & {
   readonly ok: boolean;
   readonly status: number;
   readonly statusText: string;
@@ -26,6 +37,7 @@ export type ContentDecodeContext = {
   readonly signal: AbortSignal;
   readonly revision: string;
   readonly configGeneration: number;
+  readonly work?: MemoryWork;
 };
 
 export type ContentQueueClock = {
@@ -39,6 +51,7 @@ export type ContentQueueEntryStatus =
   | "fetching"
   | "retrying"
   | "ready"
+  | "blocked"
   | "failed";
 
 export type ContentQueueEntrySnapshot = TileContentRequest & {
@@ -57,6 +70,7 @@ export type ContentQueueSnapshot = {
   readonly retrying: number;
   readonly ready: number;
   readonly failed: number;
+  readonly blocked: number;
   readonly cached: number;
   readonly decodedBytes: number;
   readonly cacheHits: number;
@@ -74,6 +88,8 @@ export type ContentQueueOptions<T> = {
   readonly maxConcurrency: number;
   readonly maxDecodedBytes: number;
   readonly fetch?: ContentQueueFetch;
+  readonly memory?: MemoryOwner;
+  readonly decodedBuffers?: (content: T) => Iterable<ArrayBuffer>;
   readonly decode: (
     bytes: ArrayBuffer,
     request: TileContentRequest,
@@ -88,6 +104,10 @@ export type ContentQueueOptions<T> = {
   readonly clock?: ContentQueueClock;
   readonly onContent?: (request: TileContentRequest, content: T) => void;
   readonly onError?: (request: TileContentRequest, error: Error) => void;
+  readonly onPolicyRefusal?: (
+    request: TileContentRequest,
+    error: ResourcePolicyError,
+  ) => void;
   readonly onEvict?: (request: TileContentRequest, content: T) => void;
   readonly onStateChange?: (snapshot: ContentQueueSnapshot) => void;
 };
@@ -110,6 +130,8 @@ export type ContentQueue<T> = {
   /** Every cached decode, in least-recently-used order. */
   contents(): ReadonlyMap<string, T>;
   snapshot(): ContentQueueSnapshot;
+  trimCache(bytes: number): void;
+  retryBlocked(availabilityOnly?: boolean): void;
   dispose(): void;
 };
 
@@ -163,6 +185,7 @@ export class ContentQueueRetryError extends ContentQueueError {
 type SelectedEntry = {
   readonly request: TileContentRequest;
   status: ContentQueueEntryStatus;
+  refusal?: ResourcePolicyError;
   attempt: number;
 };
 
@@ -179,6 +202,7 @@ type CacheEntry<T> = {
   readonly request: TileContentRequest;
   readonly content: T;
   readonly bytes: number;
+  readonly memory?: MemoryLease;
 };
 
 const systemClock: ContentQueueClock = {
@@ -257,12 +281,13 @@ export const createContentQueue = <T>(
       fetching: 0,
       ready: 0,
       failed: 0,
+      blocked: 0,
     };
     for (const { request, status, attempt } of selected.values()) {
       entries.push(Object.freeze({ ...request, status, attempt }));
       counts[status] += 1;
     }
-    const { queued, retrying, fetching, ready, failed } = counts;
+    const { queued, retrying, fetching, ready, failed, blocked } = counts;
     return Object.freeze({
       revision,
       configGeneration,
@@ -274,6 +299,7 @@ export const createContentQueue = <T>(
       retrying,
       ready,
       failed,
+      blocked,
       cached: cache.size,
       decodedBytes,
       cacheHits,
@@ -296,6 +322,7 @@ export const createContentQueue = <T>(
     const entry = cache.get(id);
     if (!entry) return false;
     cache.delete(id);
+    entry.memory?.release();
     decodedBytes -= entry.bytes;
     cacheEvictions += 1;
     previouslyEvicted.add(id);
@@ -320,13 +347,14 @@ export const createContentQueue = <T>(
     request: TileContentRequest,
     content: T,
     bytes: number,
+    memory?: MemoryLease,
   ): void => {
     evict(request.id);
     // Oversize content is still delivered to the submission consumer, but is
     // never transiently charged to the CPU cache. Existing LRU entries remain
     // intact and the uncached value never produces an eviction notification.
     if (bytes > maxDecodedBytes) return;
-    cache.set(request.id, { request, content, bytes });
+    cache.set(request.id, { request, content, bytes, memory });
     decodedBytes += bytes;
     enforceCacheBudget();
   };
@@ -376,7 +404,11 @@ export const createContentQueue = <T>(
 
     void (async () => {
       let failure: Error | undefined;
+      let work: MemoryWork | undefined;
+      let outputMemory: MemoryLease | undefined;
       try {
+        if (options.memory) work = await options.memory.work(controller.signal);
+        controller.signal.throwIfAborted();
         let response: ContentQueueFetchResponse;
         try {
           response = await fetcher(request.url, { signal: controller.signal });
@@ -389,6 +421,7 @@ export const createContentQueue = <T>(
           );
         }
         if (!response.ok) {
+          if (response.body) await response.body.cancel().catch(() => {});
           throw new ContentQueueFetchError(
             request,
             `HTTP ${response.status} ${response.statusText}`.trim(),
@@ -397,7 +430,9 @@ export const createContentQueue = <T>(
         }
         let bytes: ArrayBuffer;
         try {
-          bytes = await response.arrayBuffer();
+          bytes = work
+            ? await readMemoryResponse(response, work, controller.signal)
+            : await response.arrayBuffer();
         } catch (error) {
           throw new ContentQueueFetchError(
             request,
@@ -412,6 +447,7 @@ export const createContentQueue = <T>(
             signal: controller.signal,
             revision: operationRevision,
             configGeneration: operationGeneration,
+            work,
           });
         } catch (error) {
           throw new ContentQueueDecodeError(request, { cause: error });
@@ -424,9 +460,16 @@ export const createContentQueue = <T>(
           } catch (error) {
             throw new ContentQueueDecodeError(request, { cause: error });
           }
-          putCache(request, content, byteLength);
+          const buffers = options.decodedBuffers?.(content) ?? [];
+          outputMemory = work?.commit(
+            buffers,
+            options.decodedBuffers ? 0 : byteLength,
+          );
+          putCache(request, content, byteLength, outputMemory);
           entry.status = "ready";
           safeCall(() => options.onContent?.(request, content));
+          if (cache.get(request.id)?.memory === outputMemory)
+            outputMemory = undefined;
         }
       } catch (error) {
         failure =
@@ -438,6 +481,8 @@ export const createContentQueue = <T>(
                 "operation failed with a non-Error value",
               );
       } finally {
+        outputMemory?.release();
+        work?.release();
         if (active.get(request.id) === operation) active.delete(request.id);
       }
 
@@ -447,7 +492,12 @@ export const createContentQueue = <T>(
         return;
       }
       if (failure) {
-        if (entry.attempt < maxAttempts) {
+        const refusal = resourcePolicyError(failure);
+        if (refusal) {
+          entry.status = "blocked";
+          entry.refusal = refusal;
+          safeCall(() => options.onPolicyRefusal?.(request, refusal));
+        } else if (entry.attempt < maxAttempts) {
           const retry: RetryEntry = {
             handleAssigned: false,
           };
@@ -505,6 +555,27 @@ export const createContentQueue = <T>(
   };
 
   return {
+    trimCache(bytes) {
+      for (const id of cache.keys()) {
+        if (decodedBytes <= bytes) break;
+        evict(id);
+      }
+      emit();
+    },
+    retryBlocked(availabilityOnly = false) {
+      if (disposed) return;
+      for (const entry of selected.values())
+        if (
+          entry.status === "blocked" &&
+          (!availabilityOnly || entry.refusal?.retryable)
+        ) {
+          entry.status = "queued";
+          entry.refusal = undefined;
+          entry.attempt = 0;
+        }
+      pump();
+      emit();
+    },
     setSelection(requests, selectionOptions) {
       if (disposed) throw new Error("content queue is disposed");
       const normalized = new Map<string, TileContentRequest>();

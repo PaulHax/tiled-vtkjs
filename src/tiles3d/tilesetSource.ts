@@ -9,8 +9,13 @@ import {
   linearDeterminant,
   multiply,
 } from "../core/mat4";
+import {
+  readMemoryResponse,
+  type BufferedResponse,
+} from "../core/memoryResponse";
+import type { MemoryWork } from "../core/memoryResources";
 
-export type TilesetFetchResponse = {
+export type TilesetFetchResponse = Partial<BufferedResponse> & {
   readonly ok: boolean;
   readonly status: number;
   readonly statusText: string;
@@ -86,6 +91,7 @@ export type LoadTilesetOptions = {
   readonly endpoint: string;
   readonly fetch?: TilesetFetch;
   readonly signal?: AbortSignal;
+  readonly memory?: MemoryWork;
 };
 
 /** Base class for errors which identify a constrained-profile path. */
@@ -686,6 +692,7 @@ export const loadTileset = async (
     });
   }
   if (!response.ok) {
+    if (response.body) await response.body.cancel().catch(() => {});
     throw new TilesetFetchError(
       url,
       `HTTP ${response.status} ${response.statusText}`.trim(),
@@ -695,11 +702,26 @@ export const loadTileset = async (
 
   let document: unknown;
   try {
-    document = await response.json();
+    document =
+      options.memory && response.arrayBuffer
+        ? JSON.parse(
+            new TextDecoder().decode(
+              await readMemoryResponse(
+                response as BufferedResponse,
+                options.memory,
+                options.signal,
+              ),
+            ),
+          )
+        : await response.json();
   } catch (error) {
     throw new TilesetFetchError(url, "response is not valid JSON", undefined, {
       cause: error,
     });
   }
-  return parseTileset(document, endpoint);
+  const parsed = parseTileset(document, endpoint);
+  options.memory?.resize(
+    Math.max(options.memory.bytes(), parsed.tileById.size * 2048),
+  );
+  return parsed;
 };

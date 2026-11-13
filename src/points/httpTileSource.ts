@@ -12,6 +12,7 @@
 
 import { keyFromString, keyToString, type VoxelKey } from "./octree";
 import { orderTileForProgressiveDrawing } from "./progressiveOrder";
+import { readMemoryResponse } from "../core/memoryResponse";
 import type {
   LoadOptions,
   NodeInfo,
@@ -118,7 +119,15 @@ export const createHttpTileSource = (
         `${endpoint}/hierarchy/${keyToString(key)}.json`,
         opts?.signal,
       );
-      const body = (await response.json()) as {
+      const body = (
+        opts?.memory
+          ? JSON.parse(
+              new TextDecoder().decode(
+                await readMemoryResponse(response, opts.memory, opts.signal),
+              ),
+            )
+          : await response.json()
+      ) as {
         nodes: Record<string, HierarchyEntryJson>;
       };
       return Object.entries(body.nodes).map(([keyString, entry]) => ({
@@ -137,7 +146,11 @@ export const createHttpTileSource = (
         `${endpoint}/tile/${keyString}.bin`,
         opts?.signal,
       );
-      const buffer = await response.arrayBuffer();
+      const buffer = await readMemoryResponse(
+        response,
+        opts?.memory,
+        opts?.signal,
+      );
       return orderTileForProgressiveDrawing(parsePct1(buffer), keyString);
     },
   };
