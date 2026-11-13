@@ -121,6 +121,9 @@ refusals from `error` failures; mesh members also report `stalled`. Blocked stat
 include the domain, requested estimate, configured limit and whether competing
 ownership can make the request feasible. Limit changes retry blocked work;
 intrinsically oversized work does not repeatedly decode under unchanged limits.
+Wanted content whose realization was cancelled and whose decoded payload was
+evicted is fetched again, including content retained only for fallback coverage.
+Recorded admission failures and budget refusals retain their existing retry rules.
 Errors retain their error name and are also delivered to `onError`, preserving
 the distinction between decode/validation errors and allocation failures.
 Cancellation remains an operation-lifetime event. WebGL context loss belongs

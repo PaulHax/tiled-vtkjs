@@ -666,6 +666,21 @@ export const createTiles3dMember = (
       for (const id of nextRequested) {
         if (adapter.restoreTile(id) === "failed") admissionFailed.add(id);
       }
+      // Delivery records can outlive both cached payloads and cancelled
+      // realizations. Existing refusal latches still govern their own retries.
+      const requeueUncached = new Set(newlyDesired);
+      if (!irreducibleBudget) {
+        for (const id of nextRequested) {
+          if (
+            adapter.tileState(id) === "absent" &&
+            !admissionBlocked.has(id) &&
+            !admissionFailed.has(id) &&
+            queueEntryById.get(id)?.status === "ready" &&
+            queue.get(id) === undefined
+          )
+            requeueUncached.add(id);
+        }
+      }
       // Cancelling a deselected tile cancels its whole replacement group, so
       // a decoded sibling that is still wanted goes back through admission
       // below with the refused ones.
@@ -682,7 +697,7 @@ export const createTiles3dMember = (
         nextContentRequests.filter(
           (request) => adapter.tileState(request.id) !== "submitted",
         ),
-        { requeueUncached: newlyDesired },
+        { requeueUncached },
       );
       for (const id of nextRequested) {
         if (!admissionBlocked.has(id) || adapter.tileState(id) !== "absent")
