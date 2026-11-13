@@ -6,6 +6,9 @@ Adaptive level of detail for large 3D datasets in
 **Status: early development.** APIs are provisional and will change without
 notice.
 
+**Gaussian loading is experimental and not production-ready.** See the
+[Gaussian profiles and limitations](./docs/gaussian-splats.md).
+
 ## What it is
 
 A standalone LOD runtime for large point clouds and supported explicit or implicit

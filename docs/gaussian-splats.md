@@ -1,5 +1,7 @@
 # Gaussian 3D Tiles
 
+**Status: experimental.** Gaussian loading and rendering are not production-ready.
+
 The tiles member accepts Gaussian glTF content alongside triangle meshes.
 `createGaussianContentAdapterFactory` supplies one shared Gaussian presentation
 per VTK renderer, using the existing tile hierarchy, queues and residency
