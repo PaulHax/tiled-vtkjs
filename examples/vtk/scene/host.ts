@@ -18,6 +18,8 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
 import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
+import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
+import type { vtkRenderPass } from "@kitware/vtk.js/Rendering/SceneGraph/RenderPass";
 import type { Bounds as VtkBounds } from "@kitware/vtk.js/types";
 import { getCompressedTextureCapabilities } from "@kitware/vtk.js/Rendering/OpenGL/Texture/compressedFormats";
 
@@ -76,12 +78,13 @@ export type FrameProbe = {
 
 export type SceneHost = {
   readonly coordinator: StreamedSceneCoordinator;
-  readonly renderer: unknown;
+  readonly renderer: object;
   readonly camera: any;
   readonly tiles3dServices: Tiles3dMemberServices;
   readonly rendererName: string;
   /** The live WebGL context, for callers that report on the machine drawing. */
   glContext(): WebGL2RenderingContext | null;
+  setTranslucentPass(pass: object | null): void;
   /** Coalesced repaint request; the only way anything here paints. */
   scheduleRender(): void;
   cameraView(): CameraView;
@@ -108,6 +111,7 @@ export type SceneHost = {
   lastFrameMs(): number;
   paintCount(): number;
   devicePixelRatio(): number;
+  dispose(): void;
 };
 
 const transpose = (m: ArrayLike<number>): number[] => [
@@ -173,9 +177,16 @@ export const createSceneHost = (
     fullScreen.getApiSpecificRenderWindow() as ReturnType<
       typeof fullScreen.getApiSpecificRenderWindow
     > &
-      Pick<vtkOpenGLRenderWindow, "getCanvas"> & {
+      Pick<
+        vtkOpenGLRenderWindow,
+        "getCanvas" | "getRenderPasses" | "setRenderPasses"
+      > & {
         getContext(): WebGL2RenderingContext | null;
       };
+  const defaultRenderPasses = openGlRenderWindow.getRenderPasses();
+  let customForwardPass: ReturnType<typeof vtkForwardPass.newInstance> | null =
+    null;
+  let customTranslucentPass: object | null = null;
   const interactor = fullScreen.getInteractor();
   const camera = renderer.getActiveCamera();
 
@@ -217,6 +228,7 @@ export const createSceneHost = (
   );
 
   let currentDevicePixelRatio = window.devicePixelRatio;
+  let disposed = false;
   let frameQueued = false;
   let paintStartedAt: number | null = null;
   let lastFrameMs = 0;
@@ -328,10 +340,11 @@ export const createSceneHost = (
   };
 
   const scheduleRender = (): void => {
-    if (frameQueued) return;
+    if (disposed || frameQueued) return;
     frameQueued = true;
     requestAnimationFrame(() => {
       frameQueued = false;
+      if (disposed) return;
       // A gesture's own animation loop is already painting, and it drains
       // admission itself; a second paint here would double the drain.
       if (interactor.isAnimating()) return;
@@ -400,6 +413,7 @@ export const createSceneHost = (
     presentationQueued = true;
     requestAnimationFrame((presentedAt) => {
       presentationQueued = false;
+      if (disposed) return;
       for (const listener of presentationListeners) listener(presentedAt);
       const interval =
         lastPresentedAt === null ? null : presentedAt - lastPresentedAt;
@@ -478,10 +492,11 @@ export const createSceneHost = (
     paintStartedAt = performance.now();
   });
 
-  window.addEventListener("resize", () => {
+  const onResize = (): void => {
     currentDevicePixelRatio = window.devicePixelRatio;
     scheduleRender();
-  });
+  };
+  window.addEventListener("resize", onResize);
 
   return {
     coordinator,
@@ -490,6 +505,21 @@ export const createSceneHost = (
     tiles3dServices,
     rendererName,
     glContext: () => openGlRenderWindow.getContext(),
+    setTranslucentPass(pass) {
+      if (pass === null) {
+        openGlRenderWindow.setRenderPasses(defaultRenderPasses);
+      } else {
+        if (pass !== customTranslucentPass) {
+          customForwardPass?.delete();
+          customTranslucentPass = pass;
+          customForwardPass = vtkForwardPass.newInstance({
+            translucentPass: pass as vtkRenderPass,
+          });
+        }
+        openGlRenderWindow.setRenderPasses([customForwardPass!]);
+      }
+      scheduleRender();
+    },
     scheduleRender,
     cameraView,
     onBeforeFrame: (listener) => beforeFrameListeners.push(listener),
@@ -570,5 +600,18 @@ export const createSceneHost = (
     lastFrameMs: () => lastFrameMs,
     paintCount: () => paints,
     devicePixelRatio: () => currentDevicePixelRatio,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      window.removeEventListener("resize", onResize);
+      beforeFrameListeners.length = 0;
+      frameListeners.length = 0;
+      presentationListeners.length = 0;
+      coordinator.dispose();
+      tiles3dServices.workers.dispose?.();
+      gpuTimer.dispose();
+      customForwardPass?.delete();
+      fullScreen.delete();
+    },
   };
 };

@@ -83,6 +83,43 @@ const response = (body: unknown, status = 200) => ({
 });
 
 describe("loadTileset", () => {
+  it.each([1e-6, 1, 1e6])(
+    "accepts full-rank box axes at a %i-meter scale",
+    async (scale) => {
+      const body = document();
+      body.root.boundingVolume.box = [
+        0,
+        0,
+        0,
+        scale,
+        0,
+        0,
+        0,
+        0,
+        -scale,
+        0,
+        scale,
+        0,
+      ];
+      const source = await loadTileset({
+        endpoint: "/tiles",
+        fetch: async () => response(body),
+      });
+      expect(source.root.boundingVolume.halfAxes).toEqual([
+        scale,
+        0,
+        0,
+        0,
+        0,
+        -scale,
+        0,
+        scale,
+        0,
+      ]);
+      expect(source.tileById.size).toBe(3);
+    },
+  );
+
   it("inherits REPLACE into children while still rejecting explicit ADD", async () => {
     const inherited = document();
     delete (inherited.root.children![0] as { refine?: string }).refine;

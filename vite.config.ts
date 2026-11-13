@@ -15,6 +15,7 @@ export default defineConfig({
         copcWorker: "src/points/copcWorker.ts",
         tiles3d: "src/tiles3d/index.ts",
         "tiles3d-vtk": "src/tiles3d/vtk.ts",
+        gaussianSortWorker: "src/tiles3d/gaussianSort.worker.ts",
       },
       formats: ["es"],
     },
@@ -33,8 +34,8 @@ export default defineConfig({
     // suite records adapter calls; the packed consumer browser gate uses VTK.
     alias: {
       "@kitware/vtk.js/Rendering/Core/Actor": stub("vtkActor"),
-      "@kitware/vtk.js/Rendering/Core/PointGaussianMapper": stub(
-        "vtkPointGaussianMapper",
+      "@kitware/vtk.js/Rendering/Core/PointSpriteMapper": stub(
+        "vtkPointSpriteMapper",
       ),
       "@kitware/vtk.js/Common/DataModel/PolyData": stub("vtkPolyData"),
       "@kitware/vtk.js/Common/Core/DataArray": stub("vtkDataArray"),

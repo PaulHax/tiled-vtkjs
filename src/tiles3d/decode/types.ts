@@ -94,6 +94,23 @@ export class TileUnsupportedExtensionError extends TileDecodeError {
   }
 }
 
+/** A Gaussian primitive declares a rendering profile this decoder cannot carry. */
+export class TileUnsupportedGaussianProfileError extends TileDecodeError {
+  readonly property: string;
+  readonly value: unknown;
+
+  constructor(tileUri: string, property: string, value: unknown) {
+    super(
+      tileUri,
+      "profile",
+      `unsupported KHR_gaussian_splatting ${property}: ${JSON.stringify(value)}`,
+    );
+    this.name = "TileUnsupportedGaussianProfileError";
+    this.property = property;
+    this.value = value;
+  }
+}
+
 export type CompressedTextureLevel = {
   width: number;
   height: number;
@@ -128,7 +145,8 @@ export type DecodedMaterial = {
   raw: SerializableMaterial;
 };
 
-export type DecodedPrimitive = {
+export type DecodedMeshPrimitive = {
+  kind: "mesh";
   positions: Float32Array;
   normals?: Float32Array;
   colors?: Float32Array;
@@ -136,6 +154,34 @@ export type DecodedPrimitive = {
   indices?: Uint16Array | Uint32Array;
   material: DecodedMaterial;
 };
+
+export type GaussianAppearanceProfile = {
+  kernel: "ellipse";
+  colorSpace: "srgb_rec709_display" | "lin_rec709_display";
+  projection: "perspective";
+  sortingMethod: "cameraDistance";
+};
+
+/** Gaussian attributes stay in the primitive's model frame. */
+export type DecodedGaussianPrimitive = {
+  kind: "gaussian";
+  positions: Float32Array;
+  /** Unit quaternions in glTF XYZW order. */
+  rotations: Float32Array;
+  /** Linear standard deviations, without logarithmic activation. */
+  scales: Float32Array;
+  opacities: Float32Array;
+  /** EXT_splat_opacity uses a power kernel for semantic opacity above one. */
+  opacityKernel?: "power";
+  /** Splat-major, then coefficient in degree/order sequence, then RGB. */
+  sphericalHarmonics: Float32Array;
+  harmonicDegree: 0 | 1 | 2 | 3;
+  profile: GaussianAppearanceProfile;
+  /** Full column-major placement, independent of the tile's mesh RTC origin. */
+  modelToScene: Float64Array;
+};
+
+export type DecodedPrimitive = DecodedMeshPrimitive | DecodedGaussianPrimitive;
 
 export type DecodedTileContent = {
   primitives: DecodedPrimitive[];
@@ -156,6 +202,10 @@ export type DecodedTileContent = {
     basisTextures: number;
     basisTarget: DecodeTextureTarget | null;
   };
+};
+
+export type DecodedMeshTileContent = Omit<DecodedTileContent, "primitives"> & {
+  primitives: DecodedMeshPrimitive[];
 };
 
 export type BasisTargetTimingStats = {

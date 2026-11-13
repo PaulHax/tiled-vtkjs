@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vite";
+import { defineConfig, type Connect, type ProxyOptions } from "vite";
 
 const require = createRequire(import.meta.url);
 const exampleRoot = dirname(fileURLToPath(import.meta.url));
@@ -68,9 +68,57 @@ const servedAssets = (): Map<string, () => Buffer> =>
 const contentType = (path: string): string =>
   path.endsWith(".wasm") ? "application/wasm" : "text/javascript";
 
+const cityProxy: Record<string, ProxyOptions> = {
+  "/gaussian-city/": {
+    target: "https://3d-tiles-rendererjs-3dgs-plugin.vercel.app",
+    changeOrigin: true,
+    followRedirects: true,
+    proxyTimeout: 120_000,
+    rewrite: (path) =>
+      path.replace(/^\/gaussian-city\//, "/api/blob/JastrebiaGora/"),
+  },
+};
+
+const cityProxyRequests: Connect.NextHandleFunction = (
+  request,
+  response,
+  next,
+) => {
+  const path = request.url?.split("?")[0] ?? "";
+  if (!path.startsWith("/gaussian-city/")) return next();
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    response.writeHead(405, { Allow: "GET, HEAD" });
+    response.end();
+    return;
+  }
+  if (
+    !/^\/gaussian-city\/(?:tileset\.json|build_summary\.json|tiles\/\d+\/\d+\.glb)$/.test(
+      path,
+    )
+  ) {
+    response.writeHead(404);
+    response.end();
+    return;
+  }
+  delete request.headers.cookie;
+  delete request.headers.authorization;
+  next();
+};
+
 export default defineConfig({
   root: exampleRoot,
+  server: { proxy: cityProxy },
+  preview: { proxy: cityProxy },
   plugins: [
+    {
+      name: "gaussian-city-read-only-proxy",
+      configureServer(server) {
+        server.middlewares.use(cityProxyRequests);
+      },
+      configurePreviewServer(server) {
+        server.middlewares.use(cityProxyRequests);
+      },
+    },
     {
       name: "example-runtime-assets",
       configureServer(server) {

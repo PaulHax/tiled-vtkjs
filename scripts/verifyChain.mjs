@@ -1,6 +1,6 @@
 // Prove the standalone example was built from the vtk.js the adapter requires.
 //
-// The adapter needs `vtkPointGaussianMapper`, its OpenGL override, and the
+// The adapter needs `vtkPointSpriteMapper`, its OpenGL override, and the
 // Geometry profile that registers them. All three are silent failures: a bundle
 // missing them builds fine and draws nothing. So assert them in the built
 // bundle, against a vtk.js checkout pinned to the commit in vtkjs-fork.env.
@@ -76,7 +76,7 @@ const checkVtkJs = (pin) => {
   return head;
 };
 
-// Every released @kitware/vtk.js lacks vtkPointGaussianMapper, so a declared
+// Every released @kitware/vtk.js lacks vtkPointSpriteMapper, so a declared
 // range is a promise npm could satisfy with a build the adapter cannot use.
 const checkNoVtkJsRange = () => {
   const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -89,7 +89,7 @@ const checkNoVtkJsRange = () => {
     const spec = manifest[field]?.["@kitware/vtk.js"];
     if (spec) {
       fail(
-        `package.json declares ${field}['@kitware/vtk.js'] = '${spec}'; no released version carries vtkPointGaussianMapper, so the range would resolve to a build the adapter cannot use`,
+        `package.json declares ${field}['@kitware/vtk.js'] = '${spec}'; no released version carries vtkPointSpriteMapper, so the range would resolve to a build the adapter cannot use`,
       );
     }
   }
@@ -135,12 +135,9 @@ const checkExampleBundle = () => {
 
   const requiredFeatures = (text) => ({
     // The mapper the renderer adapter instantiates.
-    vtkPointGaussianMapper: registers(text, "vtkPointGaussianMapper"),
+    vtkPointSpriteMapper: registers(text, "vtkPointSpriteMapper"),
     // Without the OpenGL override the mapper draws nothing.
-    vtkOpenGLPointGaussianMapper: registers(
-      text,
-      "vtkOpenGLPointGaussianMapper",
-    ),
+    vtkOpenGLPointSpriteMapper: registers(text, "vtkOpenGLPointSpriteMapper"),
     // Both arrive with the Geometry profile the example must import.
     vtkOpenGLPolyDataMapper: registers(text, "vtkOpenGLPolyDataMapper"),
     vtkOpenGLActor: registers(text, "vtkOpenGLActor"),
@@ -164,7 +161,7 @@ const checkExampleBundle = () => {
       .map(([feature]) => feature);
     if (missing.length) {
       fail(
-        `${name} example is missing ${missing.join(", ")} — built against a vtk.js without the point-gaussian work, or the Geometry profile import was dropped`,
+        `${name} example is missing ${missing.join(", ")}: built against a vtk.js without the point-sprite mapper, or the Geometry profile import was dropped`,
       );
     }
   }

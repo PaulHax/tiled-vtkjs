@@ -28,6 +28,16 @@ const codecSources = new Map([
 export default defineConfig({
   plugins: [
     {
+      name: "classic-worker-module-url",
+      transform(code, id) {
+        if (!id.endsWith("/@adobe/spz/dist/spz.js")) return null;
+        return {
+          code: code.replaceAll("import.meta.url", "globalThis.location.href"),
+          map: null,
+        };
+      },
+    },
+    {
       name: "disable-worker-remote-codec-defaults",
       renderChunk(code) {
         return {

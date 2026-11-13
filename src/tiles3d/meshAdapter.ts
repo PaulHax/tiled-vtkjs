@@ -28,9 +28,9 @@ import {
 } from "../core/memoryResources";
 import { buildTransferList } from "./decode/transfer";
 import type {
-  DecodedPrimitive,
+  DecodedMeshPrimitive,
   DecodedTexture,
-  DecodedTileContent,
+  DecodedMeshTileContent,
 } from "./decode";
 import {
   triangleCount,
@@ -50,6 +50,8 @@ export type MeshAdapterOptions = {
   readonly visible?: boolean;
   readonly onError?: (error: unknown) => void;
   readonly memory?: MemoryOwner;
+  /** Composite content retires replacements after its complete presentation is accepted. */
+  readonly retainReplacements?: boolean;
   readonly onPolicyRefusal?: (error: ResourcePolicyError) => void;
 };
 
@@ -101,23 +103,29 @@ export type MeshTileState = "absent" | "queued" | "submitted" | "failed";
 export type MeshSubmitOutcome = "queued" | "budget-blocked" | "failed";
 
 export type MeshAdapter = {
-  estimateTileBytes(content: DecodedTileContent): number;
+  resourcePlan(content: DecodedMeshTileContent): {
+    rendererBytes: number;
+    cpuBytes: number;
+  };
+  resourceLeases(ids: readonly string[]): readonly MemoryLease[];
+  estimateTileBytes(content: DecodedMeshTileContent): number;
   requiredBytes(): number;
   clearRequiredBytes(): void;
   trimReuse(): void;
   submitTile(
     id: string,
-    content: DecodedTileContent,
+    content: DecodedMeshTileContent,
     onSubmitted?: () => void,
     replacementIds?: readonly string[],
   ): MeshSubmitOutcome;
   submitTileGroup(
     entries: readonly {
       readonly id: string;
-      readonly content: DecodedTileContent;
+      readonly content: DecodedMeshTileContent;
       readonly onSubmitted?: () => void;
     }[],
     replacementIds: readonly string[],
+    reservations?: readonly MemoryLease[],
   ): MeshSubmitOutcome;
   cancelTile(id: string): boolean;
   retireTile(id: string): boolean;
@@ -211,7 +219,7 @@ const glslFloat = (value: number): string => {
 };
 
 const alphaShaderReplacement = (
-  material: DecodedPrimitive["material"]["raw"],
+  material: DecodedMeshPrimitive["material"]["raw"],
 ): VtkShaderReplacement | undefined => {
   let statement: string;
   if (material.alphaMode === "MASK") {
@@ -276,7 +284,7 @@ const vtkSampler = (sampler: DecodedTexture["sampler"]): TextureSampler => ({
 });
 
 /** Attribute arrays submitted to VTK plus its `[3, i0, i1, i2]` cells. */
-const wholeGeometryBytes = (primitive: DecodedPrimitive): number =>
+const wholeGeometryBytes = (primitive: DecodedMeshPrimitive): number =>
   triangleCount(primitive) * 4 * Uint32Array.BYTES_PER_ELEMENT +
   primitive.positions.byteLength +
   (primitive.normals?.byteLength ?? 0) +
@@ -285,7 +293,7 @@ const wholeGeometryBytes = (primitive: DecodedPrimitive): number =>
 
 /** Compacted chunks own only the vertices named by their triangle interval. */
 const retainedGeometryBytes = (
-  primitive: DecodedPrimitive,
+  primitive: DecodedMeshPrimitive,
   maxJobBytes: number,
 ): number =>
   splits(primitive, maxJobBytes)
@@ -309,7 +317,7 @@ const textureByteLength = (texture: DecodedTexture): number =>
 
 /** Shared textures are analyzed once within this synchronous admission. */
 const realizationPlan = (
-  content: DecodedTileContent,
+  content: DecodedMeshTileContent,
   maxJobBytes: number,
 ): RealizationPlan => {
   const textures = new Set<DecodedTexture>();
@@ -358,7 +366,7 @@ const includeBounds = (tile: TileResources, positions: Float32Array): void => {
   }
 };
 
-const cellsFor = (primitive: DecodedPrimitive): Uint32Array => {
+const cellsFor = (primitive: DecodedMeshPrimitive): Uint32Array => {
   const count = triangleCount(primitive);
   const cells = new Uint32Array(count * 4);
   for (let triangle = 0; triangle < count; triangle += 1) {
@@ -374,10 +382,12 @@ const cellsFor = (primitive: DecodedPrimitive): Uint32Array => {
 /** Preserve authored indices only when the complete representation fits a job.
  * A sparse accessor may need compaction even when it names just one triangle.
  */
-const splits = (primitive: DecodedPrimitive, maxJobBytes: number): boolean =>
-  wholeGeometryBytes(primitive) > maxJobBytes;
+const splits = (
+  primitive: DecodedMeshPrimitive,
+  maxJobBytes: number,
+): boolean => wholeGeometryBytes(primitive) > maxJobBytes;
 
-const bytesPerTriangle = (primitive: DecodedPrimitive): number =>
+const bytesPerTriangle = (primitive: DecodedMeshPrimitive): number =>
   9 * Float32Array.BYTES_PER_ELEMENT +
   (primitive.normals ? 9 * Float32Array.BYTES_PER_ELEMENT : 0) +
   (primitive.colors ? 12 * Float32Array.BYTES_PER_ELEMENT : 0) +
@@ -388,7 +398,7 @@ const bytesPerTriangle = (primitive: DecodedPrimitive): number =>
 const gather = (
   source: Float32Array,
   width: number,
-  primitive: DecodedPrimitive,
+  primitive: DecodedMeshPrimitive,
   firstTriangle: number,
   count: number,
 ): Float32Array => {
@@ -408,14 +418,15 @@ const gather = (
 
 /** Copy one bounded triangle interval; called only inside its charged job. */
 const primitiveChunk = (
-  primitive: DecodedPrimitive,
+  primitive: DecodedMeshPrimitive,
   firstTriangle: number,
   count: number,
-): DecodedPrimitive => {
+): DecodedMeshPrimitive => {
   const chunk = (source: Float32Array, width: number): Float32Array =>
     gather(source, width, primitive, firstTriangle, count);
   const { normals, colors, uvs } = primitive;
   return {
+    kind: "mesh",
     positions: chunk(primitive.positions, 3),
     ...(normals ? { normals: chunk(normals, 3) } : {}),
     ...(colors ? { colors: chunk(colors, 4) } : {}),
@@ -572,7 +583,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
 
   const createPrimitive = (
     tile: TileResources,
-    primitive: DecodedPrimitive,
+    primitive: DecodedMeshPrimitive,
     textures: Map<DecodedTexture, VtkTexture>,
     pickAlphaTextures: Map<DecodedTexture, PickAlphaTexture>,
   ): void => {
@@ -829,7 +840,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
 
   const submitTile = (
     id: string,
-    content: DecodedTileContent,
+    content: DecodedMeshTileContent,
     onSubmitted?: () => void,
     replacementIds: readonly string[] = [],
     preapprovedPlan?: RealizationPlan,
@@ -1083,11 +1094,22 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   };
 
   const api: MeshAdapter = {
+    resourcePlan(content) {
+      const plan = realizationPlan(content, maxJobBytes);
+      return {
+        rendererBytes: plan.geometryBytes + plan.textureBytes,
+        cpuBytes: plan.geometryBytes,
+      };
+    },
+    resourceLeases: (ids) =>
+      ids.flatMap((id) =>
+        submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
+      ),
     estimateTileBytes(content) {
       const plan = realizationPlan(content, maxJobBytes);
       return plan.geometryBytes + plan.textureBytes;
     },
-    requiredBytes: () => requiredBytes,
+    requiredBytes: () => Math.max(requiredBytes, committedBytes()),
     clearRequiredBytes() {
       requiredBytes = 0;
     },
@@ -1124,7 +1146,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       return submitTile(id, content, onSubmitted, replacementIds);
     },
 
-    submitTileGroup(entries, replacementIds) {
+    submitTileGroup(entries, replacementIds, reservations) {
       if (disposed || entries.length === 0) return "failed";
       const ids = new Set(entries.map((entry) => entry.id));
       if (
@@ -1175,9 +1197,10 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         return "budget-blocked";
       }
 
-      let groupMemory: MemoryLease[] = [];
+      let groupMemory: readonly MemoryLease[] = [];
       try {
         groupMemory =
+          reservations ??
           options.memory?.reserveRendererGroup(
             plans.map((plan) => ({
               rendererBytes: plan.geometryBytes + plan.textureBytes,
@@ -1186,7 +1209,8 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
             normalizedReplacements.flatMap((id) =>
               submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
             ),
-          ) ?? [];
+          ) ??
+          [];
       } catch (error) {
         if (!(error instanceof ResourcePolicyError)) throw error;
         requiredBytes = Math.max(
@@ -1232,7 +1256,9 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         // ready. Then the displayed frontier swaps synchronously: no paint
         // can observe the gap, and replacement residency is released before
         // any child becomes submitted.
-        for (const id of normalizedReplacements) {
+        for (const id of options.retainReplacements
+          ? []
+          : normalizedReplacements) {
           const tile = withdraw(id);
           if (!tile) continue;
           drawn.delete(id);
@@ -1270,8 +1296,11 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       // destroys vtk render nodes and forces GPU uploads on cache reuse.
       // Pool eviction still releases the actors under the residency ceiling.
       for (const primitive of tile.primitives) setActorState(tile, primitive);
-      pool(id, tile);
-      trimPool();
+      if (options.retainReplacements) release(tile);
+      else {
+        pool(id, tile);
+        trimPool();
+      }
       workRevision += 1;
       options.scheduleRender();
       return true;

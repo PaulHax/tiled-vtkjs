@@ -14,6 +14,7 @@ const yFor = (fps: number): number =>
   HEIGHT * (1 - Math.min(Math.max(fps, 0), MAX_FPS) / MAX_FPS);
 
 export type FrameRateMonitor = {
+  dispose(): void;
   setTargetFrameMs(frameMs: number | null): void;
 };
 
@@ -120,7 +121,7 @@ export const createFrameRateMonitor = (
     );
   });
 
-  setInterval(() => {
+  const idleTimer = setInterval(() => {
     if (
       idle ||
       lastActiveAt === null ||
@@ -140,6 +141,7 @@ export const createFrameRateMonitor = (
   }, 100);
 
   return {
+    dispose: () => clearInterval(idleTimer),
     setTargetFrameMs(frameMs) {
       if (frameMs === null || !Number.isFinite(frameMs) || frameMs <= 0) {
         targetLine.setAttribute("hidden", "");

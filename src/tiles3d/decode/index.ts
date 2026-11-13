@@ -1,6 +1,10 @@
 export { capabilityTarget } from "./capabilities";
 export { buildTransferList } from "./transfer";
-export { TileDecodeError, TileUnsupportedExtensionError } from "./types";
+export {
+  TileDecodeError,
+  TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
+} from "./types";
 export {
   DecodeWorkerError,
   DecodeWorkerPool,
@@ -17,12 +21,16 @@ export type {
   DecodeTileRequest,
   DecodedCompressedTexture,
   DecodedMaterial,
+  DecodedGaussianPrimitive,
+  DecodedMeshPrimitive,
+  DecodedMeshTileContent,
   DecodedPrimitive,
   DecodedRgbaTexture,
   DecodedTexture,
   DecodedTileContent,
   DecodeWasmUrls,
   DecodeWorkerPoolHandle,
+  GaussianAppearanceProfile,
   SerializableMaterial,
   SerializableSampler,
   TextureCapabilities,

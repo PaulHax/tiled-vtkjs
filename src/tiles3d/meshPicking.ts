@@ -14,7 +14,7 @@ import {
 } from "../core/streamedMember";
 import type { Bounds } from "../core/geometry";
 import { scenePoint as makeScenePoint } from "../core/frames";
-import type { DecodedPrimitive, SerializableSampler } from "./decode";
+import type { DecodedMeshPrimitive, SerializableSampler } from "./decode";
 
 export type PickAlphaTexture = {
   readonly width: number;
@@ -24,7 +24,7 @@ export type PickAlphaTexture = {
 };
 
 export type SubmittedMeshPrimitive = Pick<
-  DecodedPrimitive,
+  DecodedMeshPrimitive,
   "positions" | "indices" | "uvs"
 > & {
   readonly alphaMask?: {
@@ -40,13 +40,13 @@ export type SubmittedMeshPrimitive = Pick<
 
 /** Triangles a primitive draws: indexed triples, or consecutive vertex triples. */
 export const triangleCount = (
-  primitive: Pick<DecodedPrimitive, "positions" | "indices">,
+  primitive: Pick<DecodedMeshPrimitive, "positions" | "indices">,
 ): number =>
   Math.floor((primitive.indices?.length ?? primitive.positions.length / 3) / 3);
 
 /** The vertex one corner of a triangle names. */
 export const vertexAt = (
-  primitive: Pick<DecodedPrimitive, "indices">,
+  primitive: Pick<DecodedMeshPrimitive, "indices">,
   triangle: number,
   corner: number,
 ): number =>

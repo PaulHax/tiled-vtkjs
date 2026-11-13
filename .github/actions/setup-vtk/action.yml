@@ -47,6 +47,7 @@ runs:
       run: |
         set -euo pipefail
         test -s "$VTK_JS_DIR/Rendering/Core/PointGaussianMapper.d.ts"
+        test -s "$VTK_JS_DIR/Rendering/Core/PointSpriteMapper.d.ts"
         test -s "$VTK_JS_DIR/Rendering/Core/Texture.d.ts"
         mkdir -p node_modules/@kitware
         ln -s "$VTK_JS_DIR" node_modules/@kitware/vtk.js

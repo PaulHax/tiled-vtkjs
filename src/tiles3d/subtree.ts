@@ -2,6 +2,7 @@
 
 import {
   integerAtLeast,
+  boxAxesSpanVolume,
   TilesetUnsupportedError,
   TilesetValidationError,
   type TilesetBox,
@@ -47,11 +48,6 @@ const uint64 = (view: DataView, offset: number, path: string): number => {
   return Number(value);
 };
 
-const determinant3 = (m: readonly number[]): number =>
-  m[0]! * (m[4]! * m[8]! - m[7]! * m[5]!) -
-  m[3]! * (m[1]! * m[8]! - m[7]! * m[2]!) +
-  m[6]! * (m[1]! * m[5]! - m[4]! * m[2]!);
-
 const boxFrom = (values: readonly number[], path: string): TilesetBox => {
   if (values.length !== 12 || values.some((value) => !Number.isFinite(value))) {
     throw new TilesetValidationError(
@@ -60,7 +56,7 @@ const boxFrom = (values: readonly number[], path: string): TilesetBox => {
     );
   }
   const halfAxes = values.slice(3);
-  if (Math.abs(determinant3(halfAxes)) <= Number.EPSILON) {
+  if (!boxAxesSpanVolume(halfAxes)) {
     throw new TilesetValidationError(path, "box half axes must span a volume");
   }
   return Object.freeze({

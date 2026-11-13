@@ -15,11 +15,18 @@ import { capabilityTarget, loadersBasisFormat } from "./capabilities";
 import { repairMeshoptFallbackOffsets } from "./meshoptFallback";
 import { collectContentBuffers } from "./transfer";
 import { ResourcePolicyError } from "../../core/memoryResources";
+import { decodeGaussian, GAUSSIAN_EXTENSION } from "./gaussian";
+import {
+  decodeSpzGaussian,
+  SPZ_EXTENSION,
+  SPLAT_OPACITY_EXTENSION,
+} from "./spz";
 import type {
   CompressedTextureFormat,
   DecodeTextureTarget,
   DecodeTileRequest,
   DecodedMaterial,
+  DecodedGaussianPrimitive,
   DecodedPrimitive,
   DecodedTexture,
   DecodedTileContent,
@@ -149,6 +156,8 @@ const REQUIRED_EXTENSION_ALLOWLIST = new Set([
   "KHR_materials_unlit",
   "KHR_mesh_quantization",
   "EXT_meshopt_compression",
+  "KHR_gaussian_splatting",
+  SPZ_EXTENSION,
 ]);
 
 const validateRequiredExtensions = (json: GltfJson, tileUri: string): void => {
@@ -177,6 +186,8 @@ type GltfPrimitive = {
   indices?: number | ExpandedAccessor;
   material?: number;
   mode?: number;
+  extensions?: Record<string, unknown>;
+  targets?: unknown;
 };
 
 type GltfMesh = {
@@ -190,6 +201,7 @@ type GltfNode = {
   translation?: number[];
   rotation?: number[];
   scale?: number[];
+  skin?: number;
 };
 
 type GltfScene = {
@@ -257,11 +269,14 @@ type TextureResult = {
   sourceColorSpace: "srgb" | "linear";
 };
 
-type PendingPrimitive = {
+type PendingMeshPrimitive = {
+  kind: "mesh";
   rtc: RtcPrimitiveResult;
   colors?: Float32Array;
   materialIndex?: number;
 };
+
+type PendingPrimitive = PendingMeshPrimitive | DecodedGaussianPrimitive;
 
 const GLB_MAGIC = 0x46546c67;
 const GLB_JSON_CHUNK = 0x4e4f534a;
@@ -822,7 +837,7 @@ const integerComponentType = (value: ArrayBufferView): number | null =>
  */
 const accessorFloats = (
   reference: number | ExpandedAccessor | undefined,
-  expectedType: "VEC2" | "VEC3" | "VEC4",
+  expectedType: "SCALAR" | "VEC2" | "VEC3" | "VEC4",
   gltf: ParsedGltf,
   normalized = false,
 ): Float32Array | undefined => {
@@ -1087,11 +1102,12 @@ const vertexColors = (
   return colors;
 };
 
-const applySceneRtc = (
+const applySceneRtc = async (
   gltf: ParsedGltf,
   authored: GltfJson,
   sceneTransform: Mat4,
-): PendingPrimitive[] => {
+  tileUri: string,
+): Promise<PendingPrimitive[]> => {
   const scene = requireIndex(
     gltf.json.scenes,
     gltf.json.scene ?? 0,
@@ -1099,7 +1115,10 @@ const applySceneRtc = (
   );
   const pending: PendingPrimitive[] = [];
   const visiting = new Set<number>();
-  const visit = (nodeIndex: number, parent: readonly number[]): void => {
+  const visit = async (
+    nodeIndex: number,
+    parent: readonly number[],
+  ): Promise<void> => {
     if (visiting.has(nodeIndex))
       throw new Error("glTF node graph contains a cycle");
     const node = requireIndex(gltf.json.nodes, nodeIndex, "node");
@@ -1108,6 +1127,228 @@ const applySceneRtc = (
     if (node.mesh !== undefined) {
       const mesh = requireIndex(gltf.json.meshes, node.mesh, "mesh");
       for (const [primitiveIndex, primitive] of mesh.primitives.entries()) {
+        const authoredPrimitive =
+          authored.meshes?.[node.mesh]?.primitives[primitiveIndex];
+        const gaussianExtension =
+          authoredPrimitive?.extensions?.[GAUSSIAN_EXTENSION];
+        if (gaussianExtension !== undefined) {
+          if (
+            node.skin !== undefined ||
+            authoredPrimitive?.targets !== undefined
+          ) {
+            throw new TileDecodeError(
+              tileUri,
+              "profile",
+              `${GAUSSIAN_EXTENSION}: skinning and morph targets are not supported`,
+            );
+          }
+          const extension = gaussianExtension as Record<string, unknown>;
+          const nested = extension?.extensions as
+            | Record<string, unknown>
+            | undefined;
+          if (nested?.[SPZ_EXTENSION] !== undefined) {
+            if (primitive.mode !== 0 || primitive.indices !== undefined) {
+              throw new TileDecodeError(
+                tileUri,
+                "profile",
+                `${SPZ_EXTENSION} requires non-indexed POINTS`,
+              );
+            }
+            const compressed = nested[SPZ_EXTENSION] as {
+              bufferView?: unknown;
+            };
+            if (
+              !compressed ||
+              !Number.isSafeInteger(compressed.bufferView) ||
+              (compressed.bufferView as number) < 0
+            ) {
+              throw new TileDecodeError(
+                tileUri,
+                "decode",
+                `${SPZ_EXTENSION} requires a valid bufferView`,
+              );
+            }
+            const view = requireIndex(
+              gltf.json.bufferViews,
+              compressed.bufferView as number,
+              "SPZ bufferView",
+            );
+            const buffer = requireIndex(
+              gltf.buffers,
+              view.buffer,
+              "SPZ buffer",
+            );
+            const offset = buffer.byteOffset + (view.byteOffset ?? 0);
+            if (
+              !Number.isSafeInteger(offset) ||
+              !Number.isSafeInteger(view.byteLength) ||
+              offset < buffer.byteOffset ||
+              view.byteLength <= 0 ||
+              offset + view.byteLength >
+                buffer.byteOffset + buffer.byteLength ||
+              offset + view.byteLength > buffer.arrayBuffer.byteLength
+            ) {
+              throw new TileDecodeError(
+                tileUri,
+                "decode",
+                `${SPZ_EXTENSION} bufferView exceeds its buffer`,
+              );
+            }
+            const positionIndex = authoredPrimitive?.attributes.POSITION;
+            if (typeof positionIndex !== "number")
+              throw new Error(`${SPZ_EXTENSION}: missing POSITION accessor`);
+            const position = requireIndex(
+              authored.accessors,
+              positionIndex,
+              "SPZ POSITION",
+            );
+            for (const reference of Object.values(
+              authoredPrimitive!.attributes,
+            )) {
+              if (
+                typeof reference !== "number" ||
+                requireIndex(authored.accessors, reference, "SPZ attribute")
+                  .count !== position.count
+              ) {
+                throw new Error(
+                  `${SPZ_EXTENSION}: inconsistent attribute counts`,
+                );
+              }
+            }
+            const opacity = nested[SPLAT_OPACITY_EXTENSION];
+            pending.push(
+              await decodeSpzGaussian({
+                bytes: new Uint8Array(
+                  buffer.arrayBuffer,
+                  offset,
+                  view.byteLength,
+                ),
+                extension,
+                count: position.count,
+                modelToScene: multiplyMat4(sceneTransform, world),
+                tileUri,
+                ...(opacity && typeof opacity === "object"
+                  ? {
+                      opacity: {
+                        extension: opacity as Record<string, unknown>,
+                        readAccessor(index, encoding) {
+                          const descriptor = requireIndex(
+                            authored.accessors,
+                            index,
+                            "splat opacity accessor",
+                          );
+                          const normalized = encoding === "unorm16";
+                          if (
+                            descriptor.type !== "SCALAR" ||
+                            descriptor.sparse ||
+                            descriptor.componentType !==
+                              (encoding === "float32" ? 5126 : 5123) ||
+                            (descriptor.normalized === true) !== normalized ||
+                            descriptor.count !== position.count
+                          ) {
+                            throw new Error(
+                              "invalid EXT_splat_opacity accessor",
+                            );
+                          }
+                          const values = accessorFloats(
+                            index,
+                            "SCALAR",
+                            gltf,
+                            normalized,
+                          );
+                          if (!values)
+                            throw new Error(
+                              "missing EXT_splat_opacity accessor",
+                            );
+                          if (encoding !== "float16") return values;
+                          return Float32Array.from(values, (bits) => {
+                            const sign = bits & 0x8000 ? -1 : 1;
+                            const exponent = (bits >> 10) & 31;
+                            const fraction = bits & 1023;
+                            return exponent === 31
+                              ? fraction
+                                ? NaN
+                                : sign * Infinity
+                              : sign *
+                                  (exponent === 0
+                                    ? fraction * 2 ** -24
+                                    : (1 + fraction / 1024) *
+                                      2 ** (exponent - 15));
+                          });
+                        },
+                      },
+                    }
+                  : {}),
+              }),
+            );
+            continue;
+          }
+          pending.push(
+            decodeGaussian({
+              extension: gaussianExtension,
+              mode: primitive.mode,
+              indexed: primitive.indices !== undefined,
+              attributeNames: Object.keys(primitive.attributes),
+              modelToScene: multiplyMat4(sceneTransform, world),
+              tileUri,
+              readAttribute: (semantic, expectedType, encodings) => {
+                const reference = authoredPrimitive?.attributes[semantic];
+                if (typeof reference !== "number") {
+                  throw new Error(
+                    `${GAUSSIAN_EXTENSION}: missing ${semantic} accessor`,
+                  );
+                }
+                const descriptor = requireIndex(
+                  authored.accessors,
+                  reference,
+                  semantic,
+                );
+                if (
+                  !Number.isSafeInteger(descriptor.count) ||
+                  descriptor.count <= 0 ||
+                  descriptor.sparse !== undefined
+                ) {
+                  throw new Error(
+                    `${GAUSSIAN_EXTENSION}: ${semantic} must be a non-sparse accessor with a positive count`,
+                  );
+                }
+                if (
+                  descriptor.type !== expectedType ||
+                  !encodings.some(
+                    (encoding) =>
+                      descriptor.componentType === encoding.componentType &&
+                      (descriptor.normalized === true) === encoding.normalized,
+                  )
+                ) {
+                  throw new Error(
+                    `${GAUSSIAN_EXTENSION}: unsupported ${semantic} accessor encoding`,
+                  );
+                }
+                if (
+                  semantic === "POSITION" &&
+                  descriptor.componentType !== 5126 &&
+                  !hasExtension(authored, "KHR_mesh_quantization")
+                ) {
+                  throw new Error(
+                    `${GAUSSIAN_EXTENSION}: integer POSITION requires KHR_mesh_quantization`,
+                  );
+                }
+                const values = accessorFloats(
+                  primitive.attributes[semantic],
+                  expectedType,
+                  gltf,
+                  descriptor.normalized,
+                );
+                if (!values)
+                  throw new Error(
+                    `${GAUSSIAN_EXTENSION}: missing ${semantic} attribute`,
+                  );
+                return values;
+              },
+            }),
+          );
+          continue;
+        }
         if (![4, 5].includes(primitive.mode ?? 4)) {
           throw new Error(
             "only glTF TRIANGLES and TRIANGLE_STRIP primitives are supported",
@@ -1177,6 +1418,7 @@ const applySceneRtc = (
           vertexCount,
         );
         pending.push({
+          kind: "mesh",
           ...(colors ? { colors } : {}),
           rtc: flattenPrimitiveToRtc(
             {
@@ -1194,10 +1436,10 @@ const applySceneRtc = (
         });
       }
     }
-    for (const child of node.children ?? []) visit(child, world);
+    for (const child of node.children ?? []) await visit(child, world);
     visiting.delete(nodeIndex);
   };
-  for (const root of scene.nodes ?? []) visit(root, IDENTITY);
+  for (const root of scene.nodes ?? []) await visit(root, IDENTITY);
   if (pending.length === 0)
     throw new Error("active glTF scene has no primitives");
   return pending;
@@ -1208,10 +1450,20 @@ const commonOrigin = (
 ): [number, number, number] => {
   const minimum: [number, number, number] = [Infinity, Infinity, Infinity];
   const maximum: [number, number, number] = [-Infinity, -Infinity, -Infinity];
-  for (const { rtc } of primitives) {
-    for (let offset = 0; offset < rtc.positions.length; offset += 3) {
+  for (const primitive of primitives) {
+    const rtc = primitive.kind === "mesh" ? primitive.rtc : undefined;
+    const transform =
+      primitive.kind === "gaussian" ? primitive.modelToScene : undefined;
+    const positions =
+      primitive.kind === "mesh" ? primitive.rtc.positions : primitive.positions;
+    for (let offset = 0; offset < positions.length; offset += 3) {
       for (let axis = 0; axis < 3; axis += 1) {
-        const absolute = rtc.origin[axis]! + rtc.positions[offset + axis]!;
+        const absolute = rtc
+          ? rtc.origin[axis]! + positions[offset + axis]!
+          : transform![axis]! * positions[offset]! +
+            transform![axis + 4]! * positions[offset + 1]! +
+            transform![axis + 8]! * positions[offset + 2]! +
+            transform![axis + 12]!;
         minimum[axis] = Math.min(minimum[axis]!, absolute);
         maximum[axis] = Math.max(maximum[axis]!, absolute);
       }
@@ -1742,6 +1994,27 @@ const decodeTileContentInner = async (
       }
       geometry += accessor.count * components * 4 * 3;
     }
+    for (const mesh of originalJson.meshes ?? [])
+      for (const primitive of mesh.primitives) {
+        const extension = primitive.extensions?.[GAUSSIAN_EXTENSION] as
+          | Record<string, unknown>
+          | undefined;
+        if (!extension) continue;
+        const position = primitive.attributes.POSITION;
+        if (typeof position !== "number") continue;
+        const count = requireIndex(
+          originalJson.accessors,
+          position,
+          "Gaussian POSITION",
+        ).count;
+        // SPZ harmonics are carried inside the stream, beyond its glTF accessors.
+        // Reserve degree-three output and overlapping codec/chunk arrays before WASM.
+        geometry += count * (44 + 16 * 12) * 3 + 128;
+      }
+    if (!Number.isSafeInteger(geometry))
+      throw new Error(
+        "decoded geometry estimate exceeds the safe integer range",
+      );
     await options.reserveMemory(geometry);
   }
   validateRequiredExtensions(originalJson, request.contentUrl);
@@ -1831,7 +2104,12 @@ const decodeTileContentInner = async (
     multiplyMat4(request.tilesetToScene, request.accumulatedTransform),
     Y_UP_TO_Z_UP,
   );
-  const pending = applySceneRtc(parsed, originalJson, sceneTransform);
+  const pending = await applySceneRtc(
+    parsed,
+    originalJson,
+    sceneTransform,
+    request.contentUrl,
+  );
   const origin = commonOrigin(pending);
   const context: DecodeContext = {
     gltf: parsed,
@@ -1842,14 +2120,19 @@ const decodeTileContentInner = async (
     textureCache: new Map(),
   };
   const results = await Promise.allSettled(
-    pending.map(async ({ rtc, materialIndex, colors }) => ({
-      ...(colors ? { colors } : {}),
-      positions: rebasePositions(rtc, origin),
-      ...(rtc.normals ? { normals: rtc.normals } : {}),
-      ...(rtc.uvs ? { uvs: rtc.uvs } : {}),
-      ...(rtc.indices ? { indices: rtc.indices } : {}),
-      material: await materialFor(materialIndex, rtc, context),
-    })),
+    pending.map(async (primitive) => {
+      if (primitive.kind === "gaussian") return primitive;
+      const { rtc, materialIndex, colors } = primitive;
+      return {
+        kind: "mesh" as const,
+        ...(colors ? { colors } : {}),
+        positions: rebasePositions(rtc, origin),
+        ...(rtc.normals ? { normals: rtc.normals } : {}),
+        ...(rtc.uvs ? { uvs: rtc.uvs } : {}),
+        ...(rtc.indices ? { indices: rtc.indices } : {}),
+        material: await materialFor(materialIndex, rtc, context),
+      };
+    }),
   );
   const failed = results.find((result) => result.status === "rejected");
   if (failed?.status === "rejected") throw failed.reason;

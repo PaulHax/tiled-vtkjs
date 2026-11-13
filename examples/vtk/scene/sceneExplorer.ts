@@ -1,3 +1,4 @@
+import { createDatasetOperations } from "./datasetOperations";
 import { createFreemanSource, FREEMAN_URL } from "./freeman";
 import type { StreamedMemberRegistration } from "../../../src";
 import {
@@ -5,9 +6,22 @@ import {
   type PointPresentation,
   type TileSource,
 } from "../../../src/points";
-import { wgs84ToEcef } from "../../../src/tiles3d";
+import {
+  createGaussianSortWorkerBackend,
+  wgs84ToEcef,
+} from "../../../src/tiles3d";
 import { createPointCloudMember } from "../../../src/points/vtk";
-import { createTiles3dMember } from "../../../src/tiles3d/vtk";
+import {
+  createGaussianAlphaPass,
+  createGaussianContentAdapterFactory,
+  createTiles3dMember,
+} from "../../../src/tiles3d/vtk";
+import {
+  createMemoryPool,
+  defaultMemoryBudgetBytes,
+} from "../../../src/core/memoryPool";
+import { createGaussianSource, GAUSSIAN_CITY } from "./gaussian";
+import type { GaussianDataset } from "./gaussianDatasets";
 import type {
   PointCloudMemberConfig,
   PointCloudMemberStats,
@@ -92,6 +106,8 @@ type TilesSource = {
   readonly tilesetToScene?: Tiles3dMemberConfig["tilesetToScene"];
   readonly view?: ViewTarget;
   readonly place?: Place;
+  readonly prepare?: (signal: AbortSignal) => Promise<TilesSource>;
+  readonly attribution?: GaussianDataset;
   readonly fetchTileset?: Tiles3dMemberConfig["fetchTileset"];
   readonly fetchContent?: Tiles3dMemberConfig["fetchContent"];
   readonly location: DatasetLocation | null;
@@ -126,6 +142,7 @@ const tilesPreset = (place: Place, radiusMeters = 3_000): TilesSource => ({
 const tilePresets: readonly TilesSource[] = [
   ...PLACES.map((place) => tilesPreset(place)),
   createFreemanSource(),
+  createGaussianSource(),
 ];
 
 const basename = (value: string): string => {
@@ -371,6 +388,7 @@ const sourceForLocation = (
   }
   if (location.kind === "tiles-url") {
     if (location.value === FREEMAN_URL) return createFreemanSource();
+    if (location.value === GAUSSIAN_CITY.url) return createGaussianSource();
     return {
       endpoint: tilesEndpoint(location.value),
       label: basename(location.value) || "3D Tiles",
@@ -397,7 +415,30 @@ const pointPresentation = (
 
 export const startSceneExplorer = (preset: ExplorerPreset): void => {
   renderExplorerShell(preset);
-  const host = createSceneHost(element<HTMLElement>("#viewer"));
+  const resourceBudgetBytes = defaultMemoryBudgetBytes();
+  const host = createSceneHost(
+    element<HTMLElement>("#viewer"),
+    createMemoryPool({ totalBytes: resourceBudgetBytes }),
+  );
+  const gaussian = createGaussianContentAdapterFactory({
+    resourceBudgetBytes,
+    createSortBackend: () =>
+      createGaussianSortWorkerBackend(
+        new Worker(
+          new URL(
+            "../../../src/tiles3d/gaussianSort.worker.ts",
+            import.meta.url,
+          ),
+          { type: "module" },
+        ),
+      ),
+  });
+  const gaussianPass = createGaussianAlphaPass(() => {
+    const context = host.glContext();
+    if (!context) throw new Error("WebGL2 is unavailable");
+    return context;
+  });
+  let gaussianPassActive = false;
   const frameRate = createFrameRateMonitor(
     host,
     element<HTMLElement>("#frame-rate"),
@@ -424,6 +465,8 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   const dialogDescription = element<HTMLElement>("#add-dataset-description");
   const submitDataset = element<HTMLButtonElement>("#submit-dataset");
   const datasets: Dataset[] = [];
+  const operations = createDatasetOperations();
+  let disposed = false;
   let nextDatasetId = 1;
   let loading = 0;
   let sceneError: string | null = null;
@@ -476,6 +519,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       : host.frameVisible();
 
   const removeDataset = (dataset: Dataset, frameRemaining = true): void => {
+    operations.cancel(dataset.card);
     const index = datasets.indexOf(dataset);
     if (index >= 0) datasets.splice(index, 1);
     pendingTilesFrames.delete(dataset);
@@ -492,9 +536,12 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     frame = datasets.length === 0,
     before: Element | null = null,
   ): Promise<Dataset> => {
+    const operation = operations.begin(before);
     loading += 1;
     try {
+      operation.check();
       const source = await createCopcWorkerTileSource({
+        signal: operation.signal,
         source: input.source,
         createWorker: () =>
           new Worker(new URL("../copc.worker.ts", import.meta.url), {
@@ -502,6 +549,12 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           }),
         lazPerfWasmUrl: new URL("/laz-perf.wasm", window.location.href).href,
       });
+      try {
+        operation.check();
+      } catch (error) {
+        source.dispose?.();
+        throw error;
+      }
       const id = `dataset-${nextDatasetId++}`;
       const built = makeCard(id, displayName, "Point cloud · COPC");
       built.card.open = preset !== "combined" && datasets.length === 0;
@@ -671,20 +724,27 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       if (frame) frameDataset(dataset);
       return dataset;
     } finally {
+      operation.finish();
       loading -= 1;
     }
   };
 
-  const addTilesDataset = (
+  const addTilesDataset = async (
     input: TilesSource,
     displayName = input.label,
     frame = datasets.length === 0,
     before: Element | null = null,
-  ): Dataset => {
-    const id = `dataset-${nextDatasetId++}`;
-    const built = makeCard(id, displayName, "3D Tiles 1.1");
-    built.card.open = preset !== "combined" && datasets.length === 0;
-    built.body.innerHTML = `
+  ): Promise<Dataset> => {
+    const operation = operations.begin(before);
+    loading += 1;
+    try {
+      operation.check();
+      input = input.prepare ? await input.prepare(operation.signal) : input;
+      operation.check();
+      const id = `dataset-${nextDatasetId++}`;
+      const built = makeCard(id, displayName, "3D Tiles 1.1");
+      built.card.open = preset !== "combined" && datasets.length === 0;
+      built.body.innerHTML = `
       <div class="toggle-row">
         <label><input data-role="visible" type="checkbox" checked /> Visible</label>
         <button data-role="remove" class="text-button danger" type="button">Remove</button>
@@ -697,86 +757,128 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
         </div>
       </div>
     `;
-    built.body.append(built.stats);
-    datasetList.insertBefore(built.card, before);
-    const query = <T extends Element>(role: string): T =>
-      built.body.querySelector<T>(`[data-role="${role}"]`)!;
-    const visible = query<HTMLInputElement>("visible");
-    const sse = query<HTMLInputElement>("sse");
-    const sseValue = query<HTMLOutputElement>("sse-value");
-    let config: Tiles3dMemberConfig = {
-      endpoint: input.endpoint,
-      revision: `${id}:${Date.now()}`,
-      tilesetToScene:
-        input.tilesetToScene ??
-        (input.place ? ecefToEnu(input.place) : IDENTITY),
-      maximumScreenSpaceErrorPx: Number(sse.value),
-      wasm: decodeWasmUrls(),
-      ...(input.fetchTileset ? { fetchTileset: input.fetchTileset } : {}),
-      ...(input.fetchContent ? { fetchContent: input.fetchContent } : {}),
-    };
-    const member = createTiles3dMember(
-      host.coordinator.context(host.renderer),
-      config,
-      host.tiles3dServices,
-    );
-    const registration = host.coordinator.register(member, {
-      id,
-      qualityManaged: true,
-    });
-    registration.setCamera(host.cameraView());
-    const dataset: Dataset = {
-      id,
-      kind: "tiles",
-      label: displayName,
-      card: built.card,
-      statsElement: built.stats,
-      registration,
-      location: input.location,
-      view:
-        input.view ??
-        (input.place
-          ? { center: [0, 0, 30], distance: input.place.viewDistance }
-          : null),
-      controls: {
-        setVisible: (next) => {
-          visible.checked = next;
-          fire(visible, "change");
-        },
-        setScreenSpaceErrorPx: (px) => {
-          sse.value = String(px);
-          fire(sse, "input");
-        },
-      },
-      stats: () => member.stats() as Tiles3dMemberStats,
-      release: () => registration.release(),
-    };
-    datasets.push(dataset);
-    installPresetSwitcher(dataset, built.title);
-    syncUrl();
-    visible.addEventListener("change", () =>
-      registration.setActive(visible.checked),
-    );
-    sse.addEventListener("input", () => {
-      sseValue.textContent = `${Number(sse.value)} px`;
-      config = { ...config, maximumScreenSpaceErrorPx: Number(sse.value) };
-      registration.setConfig(config);
-    });
-    query<HTMLButtonElement>("remove").addEventListener("click", () =>
-      removeDataset(dataset),
-    );
-    if (frame) {
-      if (dataset.view) {
-        frameDataset(dataset);
-      } else {
-        pendingTilesFrames.add(dataset);
-        host.lookAt([0, 0, 0], 1_000);
+      if (input.attribution) {
+        const attribution = document.createElement("p");
+        attribution.className = "field-note";
+        attribution.dataset.role = "attribution";
+        attribution.append(`${input.attribution.attribution}. `);
+        for (const [text, url] of [
+          ["Source scene", input.attribution.source],
+          ["CC BY 4.0", input.attribution.license],
+        ]) {
+          const link = document.createElement("a");
+          link.textContent = text!;
+          link.href = url!;
+          link.target = "_blank";
+          link.rel = "noopener";
+          attribution.append(link, " ");
+        }
+        built.body.append(attribution);
       }
+      built.body.append(built.stats);
+      datasetList.insertBefore(built.card, before);
+      const query = <T extends Element>(role: string): T =>
+        built.body.querySelector<T>(`[data-role="${role}"]`)!;
+      const visible = query<HTMLInputElement>("visible");
+      const sse = query<HTMLInputElement>("sse");
+      const sseValue = query<HTMLOutputElement>("sse-value");
+      let config: Tiles3dMemberConfig = {
+        endpoint: input.endpoint,
+        revision: `${id}:${Date.now()}`,
+        tilesetToScene:
+          input.tilesetToScene ??
+          (input.place ? ecefToEnu(input.place) : IDENTITY),
+        maximumScreenSpaceErrorPx: Number(sse.value),
+        wasm: decodeWasmUrls(),
+        ...(input.fetchTileset ? { fetchTileset: input.fetchTileset } : {}),
+        ...(input.fetchContent ? { fetchContent: input.fetchContent } : {}),
+      };
+      const member = createTiles3dMember(
+        host.coordinator.context(host.renderer),
+        config,
+        { ...host.tiles3dServices, createContentAdapter: gaussian },
+      );
+      const registration = host.coordinator.register(member, {
+        id,
+        qualityManaged: true,
+      });
+      registration.setCamera(host.cameraView());
+      const dataset: Dataset = {
+        id,
+        kind: "tiles",
+        label: displayName,
+        card: built.card,
+        statsElement: built.stats,
+        registration,
+        location: input.location,
+        view:
+          input.view ??
+          (input.place
+            ? { center: [0, 0, 30], distance: input.place.viewDistance }
+            : null),
+        controls: {
+          setVisible: (next) => {
+            visible.checked = next;
+            fire(visible, "change");
+          },
+          setScreenSpaceErrorPx: (px) => {
+            sse.value = String(px);
+            fire(sse, "input");
+          },
+        },
+        stats: () => member.stats() as Tiles3dMemberStats,
+        release: () => registration.release(),
+      };
+      datasets.push(dataset);
+      installPresetSwitcher(dataset, built.title);
+      syncUrl();
+      visible.addEventListener("change", () =>
+        registration.setActive(visible.checked),
+      );
+      sse.addEventListener("input", () => {
+        sseValue.textContent = `${Number(sse.value)} px`;
+        config = { ...config, maximumScreenSpaceErrorPx: Number(sse.value) };
+        registration.setConfig(config);
+      });
+      query<HTMLButtonElement>("remove").addEventListener("click", () =>
+        removeDataset(dataset),
+      );
+      if (frame) {
+        if (dataset.view) {
+          frameDataset(dataset);
+        } else {
+          pendingTilesFrames.add(dataset);
+          host.lookAt([0, 0, 0], 1_000);
+        }
+      }
+      return dataset;
+    } finally {
+      operation.finish();
+      loading -= 1;
     }
-    return dataset;
   };
 
+  const onPageHide = (event: PageTransitionEvent): void => {
+    if (event.persisted || disposed) return;
+    disposed = true;
+    window.removeEventListener("pagehide", onPageHide);
+    operations.dispose();
+    clearInterval(diagnosticsTimer);
+    frameRate.dispose();
+    for (const dataset of datasets) dataset.release();
+    gaussian.dispose(host.renderer);
+    gaussianPass.delete();
+    host.dispose();
+  };
+  window.addEventListener("pagehide", onPageHide);
+
   host.onBeforeFrame((view, devicePixelRatio) => {
+    const showingGaussians =
+      (gaussian.stats(host.renderer)?.displayedSplats ?? 0) > 0;
+    if (showingGaussians !== gaussianPassActive) {
+      gaussianPassActive = showingGaussians;
+      host.setTranslucentPass(showingGaussians ? gaussianPass : null);
+    }
     for (const dataset of datasets) {
       dataset.registration.setCamera(view);
       dataset.registration.setDevicePixelRatio(devicePixelRatio);
@@ -850,6 +952,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       {
         coordinator,
         rows,
+        gaussian: gaussian.stats(host.renderer),
         frameMs: host.lastFrameMs(),
         rendererName: host.rendererName,
         textureFormat:
@@ -893,7 +996,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     }
   };
   updateDiagnostics();
-  setInterval(updateDiagnostics, 250);
+  const diagnosticsTimer = setInterval(updateDiagnostics, 250);
 
   const syncPresetChoices = (): void => {
     presetSelect.replaceChildren();
@@ -944,11 +1047,11 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     source: PointSource | TilesSource,
     displayName = source.label,
   ): Promise<void> {
-    const currentIndex = datasets.indexOf(current);
     const replacement =
       "source" in source
         ? await addPointDataset(source, displayName, true, current.card)
-        : addTilesDataset(source, displayName, true, current.card);
+        : await addTilesDataset(source, displayName, true, current.card);
+    const currentIndex = datasets.indexOf(current);
     const appendedIndex = datasets.indexOf(replacement);
     if (currentIndex >= 0 && appendedIndex >= 0) {
       datasets.splice(appendedIndex, 1);
@@ -1029,6 +1132,8 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       if (!source) return;
       sceneError = null;
       void replaceDataset(dataset, source).catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError")
+          return;
         sceneError = error instanceof Error ? error.message : String(error);
       });
     });
@@ -1091,14 +1196,10 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           source = tilePresets[Number(presetSelect.value)]!;
         } else if (sourceType.value === "url") {
           if (!urlInput.value.trim()) throw new Error("Enter a 3D Tiles URL.");
-          source = {
-            endpoint: tilesEndpoint(urlInput.value.trim()),
-            label: basename(urlInput.value.trim()) || "3D Tiles",
-            location: {
-              kind: "tiles-url",
-              value: urlInput.value.trim(),
-            },
-          };
+          source = sourceForLocation({
+            kind: "tiles-url",
+            value: urlInput.value.trim(),
+          }) as TilesSource;
         } else {
           const local = createLocalTilesSource([...(filesInput.files ?? [])]);
           source = { ...local, location: null };
@@ -1106,13 +1207,14 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
         if (target) {
           await replaceDataset(target, source, customName || source.label);
         } else {
-          addTilesDataset(source, customName || source.label);
+          await addTilesDataset(source, customName || source.label);
         }
       }
       nameInput.value = "";
       closeDialog();
     };
     void add().catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       addError.textContent =
         error instanceof Error ? error.message : String(error);
     });
@@ -1131,7 +1233,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
         if ("source" in source) {
           await addPointDataset(source, undefined, index === 0);
         } else {
-          addTilesDataset(source, undefined, index === 0);
+          await addTilesDataset(source, undefined, index === 0);
         }
       }
       syncUrl();
@@ -1141,7 +1243,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       PLACES.find((candidate) =>
         candidate.label.startsWith(parameters.get("place") ?? ""),
       ) ?? PLACES[0]!;
-    if (preset === "points") {
+    if (preset === "points" && !parameters.has("tiles")) {
       const url = parameters.get("url");
       const pointPlace = parameters.get("pointPlace");
       const pointPlaceSource = pointPlace
@@ -1157,9 +1259,9 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           ? pointPlaceSource
           : pointPresets[0]!;
       await addPointDataset(source);
-    } else if (preset === "tiles") {
+    } else if (preset === "tiles" || parameters.has("tiles")) {
       const tiles = parameters.get("tiles");
-      addTilesDataset(
+      await addTilesDataset(
         tiles
           ? (sourceForLocation({
               kind: "tiles-url",
@@ -1168,7 +1270,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           : tilesPreset(place),
       );
     } else {
-      addTilesDataset(tilesPreset(place), undefined, true);
+      await addTilesDataset(tilesPreset(place), undefined, true);
       await addPointDataset(
         {
           source: place.copcUrl,
@@ -1224,6 +1326,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   }
 
   void initial().catch((error: unknown) => {
+    if (error instanceof DOMException && error.name === "AbortError") return;
     sceneError = error instanceof Error ? error.message : String(error);
   });
 };
