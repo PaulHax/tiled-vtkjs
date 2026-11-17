@@ -323,8 +323,15 @@ window.packedScene = {
     camera.setViewUp(0, 1, 0);
     camera.setParallelScale(1);
     camera.setClippingRange(0.01, 10);
+    let preparationFrame = null;
     const submissions = createSubmissionScheduler({
-      scheduleRender() {},
+      scheduleRender() {
+        if (preparationFrame !== null) return;
+        preparationFrame = requestAnimationFrame(() => {
+          preparationFrame = null;
+          submissions.prepareFrame();
+        });
+      },
       maxBytesPerFrame: 1_000_000,
       maxTimeMsPerFrame: 100,
       now: () => 0,
@@ -437,6 +444,7 @@ window.packedScene = {
     far.dispose();
     near.dispose();
     submissions.dispose();
+    if (preparationFrame !== null) cancelAnimationFrame(preparationFrame);
     renderWindow.render();
     const disposed = {
       actors: renderer.getActors().length,
