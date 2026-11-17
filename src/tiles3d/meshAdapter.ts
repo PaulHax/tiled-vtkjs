@@ -10,8 +10,6 @@ import vtkActor, {
 import vtkMapper, {
   type vtkMapper as VtkMapper,
 } from "@kitware/vtk.js/Rendering/Core/Mapper";
-import type vtkRenderer from "@kitware/vtk.js/Rendering/Core/Renderer";
-import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
 import vtkTexture, {
   type vtkTexture as VtkTexture,
   type TextureSampler,
@@ -42,6 +40,15 @@ import {
   type SubmittedMeshTile,
 } from "./meshPicking";
 
+type OpenGLRenderWindow = {
+  getContext(): WebGL2RenderingContext | null;
+  getGraphicsResourceGeneration(): number;
+  preparePolygonalGeometry(
+    renderer: unknown,
+    actor: unknown,
+  ): { bytes: number; release(): void };
+};
+
 export type MeshAdapterOptions = {
   readonly renderer: {
     addActor(actor: unknown): void;
@@ -51,10 +58,7 @@ export type MeshAdapterOptions = {
   /** Optional owning view for pre-uploading new triangle vertex/index chunks.
    * Material textures and recovery of resident mesh buffers use VTK's render path.
    */
-  readonly getOpenGLRenderWindow?: () =>
-    | vtkOpenGLRenderWindow
-    | null
-    | undefined;
+  readonly getOpenGLRenderWindow?: () => OpenGLRenderWindow | null | undefined;
   /** Physical renderer behind any per-layer wrappers. */
   readonly realizationRenderer?: MeshAdapterOptions["renderer"];
   readonly submissions: SubmissionScheduler;
@@ -734,7 +738,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         options.renderer.addActor(actor);
         resources.attached = true;
         const prepared = window.preparePolygonalGeometry(
-          (options.realizationRenderer ?? options.renderer) as vtkRenderer,
+          options.realizationRenderer ?? options.renderer,
           actor,
         );
         resources.releaseViewResources = prepared.release;

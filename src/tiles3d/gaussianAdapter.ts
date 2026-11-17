@@ -10,7 +10,6 @@ import {
   createPointTextureBank,
   type PointTextureBank,
 } from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
-import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
 import vtkRenderPass, {
   type vtkRenderPass as RenderPass,
 } from "@kitware/vtk.js/Rendering/SceneGraph/RenderPass";
@@ -167,7 +166,7 @@ export type GaussianContentAdapterFactoryOptions = {
   ) => GaussianSortBackend;
   maximumVisibleSplats?: number;
   resourceBudgetBytes?: number;
-  getOpenGLRenderWindow?: () => vtkOpenGLRenderWindow | null | undefined;
+  getOpenGLRenderWindow?: TileContentAdapterOptions["getOpenGLRenderWindow"];
 };
 
 /** Host render-pass hook without requiring the optional VTK peer declarations. */
@@ -610,7 +609,7 @@ const createManager = (
   maximum: number,
   budget: number,
   createBackend?: GaussianContentAdapterFactoryOptions["createSortBackend"],
-  getOpenGLRenderWindow?: () => vtkOpenGLRenderWindow | null | undefined,
+  getOpenGLRenderWindow?: TileContentAdapterOptions["getOpenGLRenderWindow"],
 ) => {
   const owners = new Set<Owner>();
   const submissions = firstOptions.submissions;
@@ -2371,7 +2370,11 @@ const createManager = (
           context.generation === generation
         )
           return;
-        context = { window, context: gl, generation };
+        context = {
+          window: window as GaussianGpuContext["window"],
+          context: gl,
+          generation,
+        };
       } else {
         if (!context) return;
         context = null;
