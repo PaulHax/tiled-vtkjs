@@ -985,16 +985,15 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       sceneError ?? "Add a point cloud or 3D Tiles dataset.";
     for (const dataset of pendingTilesFrames) {
       if (
-        (dataset.stats() as Tiles3dMemberStats).renderer.submittedActors > 0
+        (dataset.stats() as Tiles3dMemberStats).renderer.drawnActors > 0 &&
+        host.frameVisible()
       ) {
         pendingTilesFrames.delete(dataset);
-        if (host.frameVisible()) {
-          const camera = host.camera;
-          dataset.view = {
-            center: [...camera.getFocalPoint()] as [number, number, number],
-            distance: camera.getDistance(),
-          };
-        }
+        const camera = host.camera;
+        dataset.view = {
+          center: [...camera.getFocalPoint()] as [number, number, number],
+          distance: camera.getDistance(),
+        };
       }
     }
   };
