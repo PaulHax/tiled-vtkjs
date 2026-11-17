@@ -173,6 +173,68 @@ const triangle = (z, color, alphaMode) => ({
     },
   },
 });
+// Reuse decoded payload identities across the cold and warm visibility cycle.
+const meshCache = new Map();
+const meshCacheReads = [];
+let meshCacheLease;
+let meshCacheOwner;
+if (mode === "mesh-cache-restoration") {
+  const texture = {
+    kind: "rgba",
+    width: 2,
+    height: 2,
+    colorSpace: "srgb",
+    rgba: new Uint8Array([
+      0, 180, 220, 255, 0, 230, 180, 255, 0, 230, 180, 255, 0, 180, 220, 255,
+    ]),
+    sampler: { magFilter: 9728, minFilter: 9728, wrapS: 33071, wrapT: 33071 },
+  };
+  const patch = (left, right, bottom, top, z) => {
+    const primitive = triangle(z, [1, 1, 1, 1], "OPAQUE");
+    primitive.positions = new Float32Array([
+      left,
+      bottom,
+      z,
+      right,
+      bottom,
+      z,
+      right,
+      top,
+      z,
+      left,
+      bottom,
+      z,
+      right,
+      top,
+      z,
+      left,
+      top,
+      z,
+    ]);
+    primitive.uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
+    primitive.material.baseColorTexture = texture;
+    return {
+      origin: [0, 0, 0],
+      primitives: [primitive],
+      byteEstimate: { geometry: 120, textures: texture.rgba.byteLength },
+    };
+  };
+  meshCache.set("cache-parent", patch(-1, 1, -1, 1, -0.2));
+  meshCache.set("cache-a", patch(-0.8, -0.15, -0.55, 0.55, 0));
+  meshCache.set("cache-b", patch(0.15, 0.8, -0.55, 0.55, 0));
+  meshCacheOwner = memoryPool.createOwner();
+  meshCacheLease = meshCacheOwner.retain([
+    texture.rgba.buffer,
+    ...[...meshCache.values()].flatMap((content) => [
+      content.primitives[0].positions.buffer,
+      content.primitives[0].uvs.buffer,
+    ]),
+  ]);
+}
+const cachedMesh = (id) => {
+  meshCacheReads.push(id);
+  return meshCache.get(id);
+};
 const translucentMesh = {
   origin: [0, 0, 0],
   primitives: [
@@ -181,7 +243,11 @@ const translucentMesh = {
   ],
   byteEstimate: { geometry: 72, textures: 0 },
 };
-if (mode === "no-camera" || mode === "member-recovery") {
+if (
+  mode === "no-camera" ||
+  mode === "member-recovery" ||
+  mode === "mesh-cache-restoration"
+) {
 } else if (mode === "blend") {
   const content = field([red]);
   content.primitives.push(triangle(1, [1, 1, 1, 0.5], "BLEND"));
@@ -241,6 +307,94 @@ let recoveryMember;
 let recoveryConfig;
 const recoveryFetches = [];
 globalThis.gaussianFixture = {
+  async showCachedMeshParent() {
+    adapters[0].setVisible(true);
+    const outcome = adapters[0].submitTile(
+      "cache-parent",
+      cachedMesh("cache-parent"),
+    );
+    await settle();
+    adapters[0].setDrawnTiles(["cache-parent"]);
+    await settle();
+    return outcome;
+  },
+  async refineCachedMeshesCold() {
+    const outcome = adapters[0].submitTileGroup(
+      ["cache-a", "cache-b"].map((id) => ({ id, content: cachedMesh(id) })),
+      ["cache-parent"],
+    );
+    await settle();
+    adapters[0].setDrawnTiles(["cache-a", "cache-b"]);
+    adapters[0].retireTile("cache-parent");
+    await settle();
+    return outcome;
+  },
+  async hideCachedMeshes() {
+    adapters[0].setVisible(false);
+    adapters[0].clearTiles();
+    await settle();
+  },
+  async refineCachedMeshesWarm() {
+    const first = adapters[0].submitTile(
+      "cache-a",
+      cachedMesh("cache-a"),
+      undefined,
+      ["cache-parent"],
+    );
+    await settle();
+    const retainedAfterFirst = adapters[0].stats().drawnTileIds;
+    const second = adapters[0].submitTile(
+      "cache-b",
+      cachedMesh("cache-b"),
+      undefined,
+      ["cache-parent"],
+    );
+    await settle();
+    if (
+      ["cache-a", "cache-b"].every(
+        (id) => adapters[0].tileState(id) === "submitted",
+      )
+    ) {
+      adapters[0].setDrawnTiles(["cache-a", "cache-b"]);
+      adapters[0].retireTile("cache-parent");
+      await settle();
+    }
+    return { first, second, retainedAfterFirst };
+  },
+  cachedMeshState() {
+    const adapter = adapters[0];
+    const picks = adapter.pickableMeshTiles();
+    const pickSet = createMeshPickSet();
+    const placement = adapter.presentationMatrix();
+    pickSet.replaceDrawn(picks);
+    pickSet.setPlacement({ drawn: placement, scene: placement });
+    const hits = [80, 176].map((x) => pickSet.pick(view(), x, 128));
+    const gap = pickSet.pick(view(), 128, 128);
+    pickSet.dispose();
+    const stats = adapter.stats();
+    return {
+      drawn: [...stats.drawnTileIds].sort(),
+      picks: picks.map((tile) => tile.id).sort(),
+      pendingJobs: stats.pendingJobs,
+      pendingTiles: stats.pendingTiles,
+      queuedJobs: scheduler.stats().queuedJobs,
+      residentBytes: stats.residentBytes,
+      residentTextureBytes: stats.residentTextureBytes,
+      textureRepresentation: stats.textureRepresentation,
+      hits,
+      gap,
+      camera: {
+        position: Array.from(camera.getPosition()),
+        focalPoint: Array.from(camera.getFocalPoint()),
+        parallelScale: camera.getParallelScale(),
+        viewport: Array.from(openGL.getSize()),
+      },
+      cached: [...meshCache.keys()],
+      cacheReads: [...meshCacheReads],
+      errors: [...errors],
+      refusals: [...refusals],
+    };
+  },
   setupRecovery() {
     const box = (x, half) => [x, 0, 0, half, 0, 0, 0, half, 0, 0, 0, half];
     recoveryConfig = {
@@ -657,6 +811,9 @@ globalThis.gaussianFixture = {
     return factory.stats(renderer);
   },
   dispose() {
+    meshCacheLease?.release();
+    meshCacheOwner?.close();
+    meshCache.clear();
     recoveryMember?.dispose();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();

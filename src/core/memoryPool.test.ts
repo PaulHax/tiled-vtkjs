@@ -128,6 +128,58 @@ describe("createMemoryPool", () => {
     expect(pool.stats().owners).toBe(0);
   });
 
+  it("reports replacement eligibility for the complete composite lease lifetime and shared handles", () => {
+    const pool = createMemoryPool({ totalBytes: 100, transitionBytes: 40 });
+    const owner = pool.createOwner();
+    const old = owner.reserveRenderer(40);
+    expect(owner.replacementAvailable(old)).toBe(true);
+    const [mesh, arena] = owner.reserveRendererGroup(
+      [
+        { rendererBytes: 30, cpuBytes: 0 },
+        { rendererBytes: 30, cpuBytes: 0 },
+      ],
+      [old],
+    );
+    const retainedArena = arena!.share();
+    expect(owner.replacementAvailable(old)).toBe(false);
+    expect(() => owner.reserveRenderer(1, { replacing: [old] })).toThrow(
+      /unclaimed/,
+    );
+    mesh!.release();
+    expect(owner.replacementAvailable(old)).toBe(false);
+    arena!.shrinkRenderer(0);
+    arena!.release();
+    expect(pool.stats().rendererBytes).toBe(40);
+    expect(owner.replacementAvailable(old)).toBe(false);
+    retainedArena.release();
+    expect(owner.replacementAvailable(old)).toBe(true);
+    old.release();
+    owner.close();
+    expect(pool.stats()).toMatchObject({ rendererBytes: 0, owners: 0 });
+  });
+
+  it("keeps released, foreign and unknown replacement allocations as hard errors", () => {
+    const pool = createMemoryPool({ totalBytes: 100 });
+    const owner = pool.createOwner();
+    const other = pool.createOwner();
+    const foreign = other.reserveRenderer(20);
+    const released = owner.reserveRenderer(20);
+    released.release();
+    const unknown = {} as Parameters<typeof owner.replacementAvailable>[0];
+    for (const lease of [foreign, released, unknown]) {
+      expect(() => owner.replacementAvailable(lease)).toThrow(
+        /replacement must own/,
+      );
+      expect(() => owner.reserveRenderer(1, { replacing: [lease] })).toThrow(
+        /replacement must own/,
+      );
+    }
+    foreign.release();
+    owner.close();
+    other.close();
+    expect(pool.stats()).toMatchObject({ rendererBytes: 0, owners: 0 });
+  });
+
   it("retains canceled physical slots and removes aborted waiting operations", async () => {
     const pool = createMemoryPool({
       totalBytes: 100,

@@ -763,6 +763,18 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     return reservedBytes() - replaced;
   };
 
+  const replacementLeases = (ids: readonly string[]): readonly MemoryLease[] =>
+    ids.flatMap((id) => {
+      const lease = submitted.get(id)?.memory;
+      // Pending swap accounting ends at submission, but shared credit stays
+      // claimed until every actual successor lease (including composite
+      // Gaussian storage) releases it.
+      return lease &&
+        (!options.memory || options.memory.replacementAvailable(lease))
+        ? [lease]
+        : [];
+    });
+
   const trimPool = (additionalBytes = 0): void => {
     for (const [id, tile] of pooled) {
       if (reservedBytes() + additionalBytes <= resourceCeilingBytes) return;
@@ -919,9 +931,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         geometryBytes + textureBytes,
         {
           cpuBytes: geometryBytes,
-          replacing: normalizedReplacements.flatMap((key) =>
-            submitted.get(key)?.memory ? [submitted.get(key)!.memory!] : [],
-          ),
+          replacing: replacementLeases(normalizedReplacements),
         },
       );
       sourceMemory = options.memory?.retain(buildTransferList(content));
@@ -1101,10 +1111,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         cpuBytes: plan.geometryBytes,
       };
     },
-    resourceLeases: (ids) =>
-      ids.flatMap((id) =>
-        submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
-      ),
+    resourceLeases: replacementLeases,
     estimateTileBytes(content) {
       const plan = realizationPlan(content, maxJobBytes);
       return plan.geometryBytes + plan.textureBytes;
@@ -1206,9 +1213,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
               rendererBytes: plan.geometryBytes + plan.textureBytes,
               cpuBytes: plan.geometryBytes,
             })),
-            normalizedReplacements.flatMap((id) =>
-              submitted.get(id)?.memory ? [submitted.get(id)!.memory!] : [],
-            ),
+            replacementLeases(normalizedReplacements),
           ) ??
           [];
       } catch (error) {

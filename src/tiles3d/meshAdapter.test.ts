@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createSubmissionScheduler } from "../core/submissionScheduler";
+import { createMemoryPool } from "../core/memoryPool";
+import type { MemoryOwner } from "../core/memoryResources";
 import type { CameraView } from "../core/camera";
 import type { DecodedTexture, DecodedMeshTileContent } from "./decode";
 import { createMeshAdapter } from "./meshAdapter";
@@ -62,6 +64,8 @@ const makeAdapter = ({
   renderer = { addActor: vi.fn(), removeActor: vi.fn() },
   scheduleRender = vi.fn(),
   onError,
+  memory,
+  retainReplacements,
 }: {
   readonly maxBytesPerFrame?: number;
   readonly renderer?: {
@@ -70,6 +74,8 @@ const makeAdapter = ({
   };
   readonly scheduleRender?: () => void;
   readonly onError?: (error: unknown) => void;
+  readonly memory?: MemoryOwner;
+  readonly retainReplacements?: boolean;
 } = {}) => {
   const scheduler = createSubmissionScheduler({
     scheduleRender,
@@ -81,6 +87,8 @@ const makeAdapter = ({
     scheduleRender,
     submissions: scheduler,
     onError,
+    memory,
+    retainReplacements,
   });
   return { adapter, scheduler };
 };
@@ -130,6 +138,62 @@ const coloredMask = (
 
 describe("vtk mesh adapter", () => {
   beforeEach(resetStubs);
+
+  it("filters shared replacement credit in direct mesh submissions without changing pending swap totals", () => {
+    const pool = createMemoryPool({ totalBytes: 10000 });
+    const memory = pool.createOwner();
+    const errors: unknown[] = [];
+    const { adapter, scheduler } = makeAdapter({
+      memory,
+      retainReplacements: true,
+      onError: (error) => errors.push(error),
+    });
+    try {
+      const payload = content();
+      payload.primitives.splice(1);
+      delete payload.primitives[0]!.material.baseColorTexture;
+      const bytes = adapter.estimateTileBytes(payload);
+      const flush = () => {
+        while (scheduler.hasPending()) scheduler.prepareFrame();
+      };
+      expect(adapter.submitTile("parent", payload)).toBe("queued");
+      flush();
+      adapter.setDrawnTiles(["parent"]);
+      expect(adapter.resourceLeases(["parent"])).toHaveLength(1);
+      expect(adapter.submitTile("a", payload, undefined, ["parent"])).toBe(
+        "queued",
+      );
+      expect(adapter.requiredBytes()).toBe(bytes);
+      flush();
+      expect(adapter.requiredBytes()).toBe(bytes * 2);
+      expect(adapter.resourceLeases(["parent"])).toEqual([]);
+      expect(adapter.submitTile("b", payload, undefined, ["parent"])).toBe(
+        "queued",
+      );
+      flush();
+      expect(
+        adapter.submitTileGroup(
+          ["c", "d"].map((id) => ({ id, content: payload })),
+          ["parent"],
+        ),
+      ).toBe("queued");
+      expect(adapter.requiredBytes()).toBe(bytes * 4);
+      flush();
+      expect(adapter.requiredBytes()).toBe(bytes * 5);
+      expect(pool.stats().rendererBytes).toBe(bytes * 5);
+      expect(errors).toEqual([]);
+    } finally {
+      adapter.dispose();
+      memory.close();
+      scheduler.dispose();
+    }
+    expect(pool.stats()).toMatchObject({
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+      cpuReservedBytes: 0,
+      owners: 0,
+    });
+  });
 
   it("preserves indexed attributes and aggregate bounds through scheduled chunks", () => {
     const { adapter, scheduler } = makeAdapter({ maxBytesPerFrame: 160 });

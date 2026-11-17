@@ -68,6 +68,11 @@ export type MemoryOwner = {
       replacing?: readonly MemoryLease[];
     },
   ): MemoryLease;
+  /**
+   * False when a live owned allocation's replacement credit is already claimed.
+   * Foreign, released, or unknown allocations throw.
+   */
+  replacementAvailable(lease: MemoryLease): boolean;
   reserveRendererGroup(
     amounts: readonly {
       readonly rendererBytes: number;
@@ -472,6 +477,13 @@ export const createMemoryResources = (
             [{ rendererBytes: value, cpuBytes: options.cpuBytes ?? 0 }],
             options.replacing,
           )[0]!;
+        },
+        replacementAvailable(lease) {
+          assertOpen();
+          const entry = leases.get(lease);
+          if (!entry || entry.owner !== owner || entry.released)
+            throw new Error("replacement must own unclaimed live allocations");
+          return !claimedReplacements.has(entry);
         },
         reserveRendererGroup(amounts, replacing) {
           assertOpen();
