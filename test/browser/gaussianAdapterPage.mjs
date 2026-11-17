@@ -63,15 +63,17 @@ camera.setParallelScale(1.2);
 camera.setClippingRange(0.1, 100);
 let frameQueued = false;
 let suspendSubmissions = mode === "member-recovery";
+const paintChannel = new MessageChannel();
+paintChannel.port1.onmessage = () => {
+  frameQueued = false;
+  if (suspendSubmissions) return;
+  scheduler.prepareFrame();
+  renderWindow.render();
+};
 const scheduleFrame = () => {
   if (frameQueued || measureUploads || suspendSubmissions) return;
   frameQueued = true;
-  requestAnimationFrame(() => {
-    frameQueued = false;
-    if (suspendSubmissions) return;
-    scheduler.prepareFrame();
-    renderWindow.render();
-  });
+  paintChannel.port2.postMessage(null);
 };
 const scheduler = createSubmissionScheduler({
   scheduleRender: scheduleFrame,
@@ -631,6 +633,7 @@ globalThis.gaussianFixture = {
   },
   stats: () => factory.stats(renderer),
   submitWithoutCamera(prepared) {
+    suspendSubmissions = true;
     const content = field([red]);
     content.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
     const outcome = adapters[0].submitTile("unplaced", content);
@@ -923,6 +926,8 @@ globalThis.gaussianFixture = {
     recoveryMember?.dispose();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
+    paintChannel.port1.close();
+    paintChannel.port2.close();
     for (const memory of memoryOwners) memory.close();
     for (const work of blockedWork.splice(0)) work.release();
     blockingOwner.close();

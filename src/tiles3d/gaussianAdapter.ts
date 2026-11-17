@@ -1776,7 +1776,10 @@ const createManager = (
 
   const refresh = (allocating = false): void => {
     dirty = false;
-    if (disposed || (!camera && chargedTiles().length > 0)) return;
+    if (disposed || (!camera && chargedTiles().length > 0)) {
+      wakeIdle();
+      return;
+    }
     try {
       // A compact swap already holds the final atlas reservation. While
       // its mesh chunks finish, keep that reservation and the accepted draw.

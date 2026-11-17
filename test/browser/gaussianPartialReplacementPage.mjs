@@ -49,12 +49,11 @@ const pool = createMemoryPool({
   workBytes: 8192,
 });
 const memory = pool.createOwner();
-let frameQueued = false;
+let frame = null;
 const scheduleFrame = () => {
-  if (frameQueued) return;
-  frameQueued = true;
-  requestAnimationFrame(() => {
-    frameQueued = false;
+  if (frame !== null) return;
+  frame = requestAnimationFrame(() => {
+    frame = null;
     scheduler.prepareFrame();
     renderWindow.render();
   });
@@ -274,6 +273,8 @@ window.fixture = {
     factory.dispose(renderer);
     memory.close();
     scheduler.dispose();
+    if (frame !== null) cancelAnimationFrame(frame);
+    frame = null;
     await idle;
     renderWindow.render();
     const result = { ...pool.stats(), actors: renderer.getActors().length };
