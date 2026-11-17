@@ -3,7 +3,7 @@ import { safeCall } from "./observers";
 
 const MiB = 1024 * 1024;
 
-/** Default main-thread/GPU admission limits applied before each paint. */
+/** Default main-thread/GPU admission limits per animation frame. */
 export const DEFAULT_SUBMISSION_BYTES_PER_FRAME = 16 * MiB;
 export const DEFAULT_SUBMISSION_TIME_MS_PER_FRAME = 4;
 
@@ -13,6 +13,8 @@ export type SubmissionJob = {
   /** Indivisible resource already checked against its owner's memory budget.
    * If larger than the byte slice, admit it alone; all other work waits. */
   readonly atomic?: boolean;
+  /** Publish visible state only when a paint will follow. */
+  readonly requiresPaint?: boolean;
   /** Synchronous VTK construction or GPU-admission work. */
   readonly run: () => void;
   readonly onError?: (error: unknown) => void;
@@ -25,6 +27,7 @@ export type Submission = {
 
 export type SubmissionSchedulerOptions = {
   readonly scheduleRender: () => void;
+  readonly schedulePreparation?: () => void;
   readonly maxBytesPerFrame?: number;
   readonly maxTimeMsPerFrame?: number;
   /** Injectable monotonic clock for deterministic tests. */
@@ -46,8 +49,8 @@ export type SubmissionSchedulerStats = {
 
 export type SubmissionScheduler = {
   enqueue(job: SubmissionJob): Submission;
-  /** Drain one bounded admission slice immediately before a view paint. */
-  prepareFrame(pageFrame?: number): void;
+  /** Drain one bounded slice, leaving publication for a paint if needed. */
+  prepareFrame(pageFrame?: number, painting?: boolean): void;
   hasPending(): boolean;
   stats(): SubmissionSchedulerStats;
   dispose(): void;
@@ -149,9 +152,16 @@ export const createSubmissionScheduler = (
   let peakQueuedJobs = 0;
   let peakFrameAdmittedBytes = 0;
   let disposed = false;
+  let draining = false;
 
   const discardCancelledHead = (): void => {
     while (queue.length && !queue[0]!.job) queue.shift();
+  };
+
+  const requestHead = (): void => {
+    if (queue[0]?.job?.requiresPaint || !options.schedulePreparation)
+      options.scheduleRender();
+    else options.schedulePreparation();
   };
 
   return {
@@ -172,7 +182,7 @@ export const createSubmissionScheduler = (
         queue.push(queued);
         queuedBytes += bytes;
         peakQueuedJobs = Math.max(peakQueuedJobs, queue.length);
-        if (wasEmpty) options.scheduleRender();
+        if (wasEmpty && !draining) requestHead();
       } else {
         queued.job = null;
         queued.settled = true;
@@ -189,7 +199,7 @@ export const createSubmissionScheduler = (
       };
     },
 
-    prepareFrame(pageFrame = ++ownFrame) {
+    prepareFrame(pageFrame = ++ownFrame, painting = true) {
       lastFrameAdmittedJobs = 0;
       lastFrameAdmittedBytes = 0;
       lastFrameElapsedMs = 0;
@@ -199,9 +209,14 @@ export const createSubmissionScheduler = (
       let frameBytes = 0;
       let frameJobs = 0;
       discardCancelledHead();
+      draining = true;
       while (queue.length > 0) {
         const next = queue[0]!;
-        if (!budget.admit(view, next.bytes)) break;
+        if (
+          (!painting && next.job!.requiresPaint) ||
+          !budget.admit(view, next.bytes)
+        )
+          break;
         queue.shift();
         next.settled = true;
         queuedBytes -= next.bytes;
@@ -220,11 +235,12 @@ export const createSubmissionScheduler = (
         frameBytes += next.bytes;
         discardCancelledHead();
       }
+      draining = false;
       lastFrameAdmittedJobs = frameJobs;
       lastFrameAdmittedBytes = frameBytes;
       lastFrameElapsedMs = elapsed;
       peakFrameAdmittedBytes = Math.max(peakFrameAdmittedBytes, frameBytes);
-      if (queue.length > 0) options.scheduleRender();
+      if (queue.length > 0) requestHead();
       else budget.withdraw(view);
     },
 
@@ -262,7 +278,7 @@ export const createSubmissionScheduler = (
 /** Keep one continuation in the shared admission queue per preparation. */
 export const enqueueSubmissionSteps = (
   scheduler: SubmissionScheduler,
-  steps: Iterable<Pick<SubmissionJob, "bytes" | "run">>,
+  steps: Iterable<Pick<SubmissionJob, "bytes" | "run" | "requiresPaint">>,
   onError: (error: unknown) => void,
   onProgress: () => void,
 ): Submission => {
@@ -277,6 +293,7 @@ export const enqueueSubmissionSteps = (
       pending = scheduler.enqueue({
         bytes: step.value.bytes,
         atomic: step.value.bytes > frameCap,
+        requiresPaint: step.value.requiresPaint,
         run() {
           step.value.run();
           onProgress();

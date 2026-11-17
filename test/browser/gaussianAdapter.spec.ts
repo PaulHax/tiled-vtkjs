@@ -77,7 +77,7 @@ type Fixture = {
     triangles: number,
     replacement?: string[],
   ): string;
-  stepMixedProbe(): ProbeFrame;
+  stepMixedProbe(painting?: boolean): ProbeFrame;
   addInvisibleProbe(id: string): string;
   cancelMixedProbe(id: string): void;
   restoreMixedProbeContext(): Promise<{ before: number; after: number }>;
@@ -172,6 +172,7 @@ type Fixture = {
 
 type ProbeFrame = {
   pixel: number[];
+  paints: number;
   uploadStateReads: number;
   stateRestored: boolean;
   uploads: Array<{
@@ -484,9 +485,10 @@ describe("coherent mixed presentations and ownership", () => {
     page: Page,
     condition: (frame: ProbeFrame) => boolean,
     frames: ProbeFrame[] = [],
+    painting = true,
   ) => {
     for (let i = 0; i < 200; i++) {
-      const frame = await api(page, "stepMixedProbe");
+      const frame = await api(page, "stepMixedProbe", painting);
       frames.push(frame);
       if (condition(frame)) return frame;
     }
@@ -595,6 +597,55 @@ describe("coherent mixed presentations and ownership", () => {
           frame.uploads.some((upload) => (upload.x ?? 0) > 0),
         ),
       ).toBe(true);
+      expect(await api(page, "errors")).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("stages a mixed successor without repainting or replacing the pickable predecessor", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      const publish = (
+        id: string,
+        count: number,
+        replacements: string[] = [],
+      ) => api(page, "stageMixedProbe", id, count, 1, replacements);
+      expect(await publish("parent", 1)).toBe("queued");
+      const parent = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 1,
+      );
+      const frames: ProbeFrame[] = [];
+      expect(await publish("child", 80, ["parent"])).toBe("queued");
+      await stepUntil(
+        page,
+        (frame) =>
+          frame.stats.orderUploadBytes ===
+          parent.stats.orderUploadBytes + 80 * 4,
+        frames,
+        false,
+      );
+      expect(frames.every((frame) => frame.paints === parent.paints)).toBe(
+        true,
+      );
+      expect(frames.every((frame) => frame.picks.join() === "parent")).toBe(
+        true,
+      );
+      expect(frames.every((frame) => frame.stats.displayedSplats === 1)).toBe(
+        true,
+      );
+      expect(
+        frames
+          .flatMap(({ uploads }) => uploads)
+          .some(({ kind }) => kind === "attributes"),
+      ).toBe(true);
+
+      const child = await api(page, "stepMixedProbe");
+      expect(child.paints).toBe(parent.paints + 1);
+      expect(child.stats.displayedSplats).toBe(80);
+      expect(child.picks).toEqual(["child"]);
+      expect(child.pixel[2]).toBeGreaterThan(150);
       expect(await api(page, "errors")).toEqual([]);
     } finally {
       await page.close();

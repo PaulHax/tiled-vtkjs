@@ -944,7 +944,7 @@ const createManager = (
     actor.setVisibility(order.length > 0);
     presentationRevision++;
     for (const owner of owners) safeCall(owner.options.onPresentationChange);
-    notify();
+    notify(true);
   };
   const refuse = (
     error: TileSubmissionRefusal,
@@ -985,9 +985,11 @@ const createManager = (
   const noteProgress = () => {
     workRevision++;
   };
-  const notify = (): void => {
+  const notify = (paint = false): void => {
     workRevision++;
-    for (const owner of owners) owner.options.scheduleRender();
+    for (const { options } of owners)
+      if (paint || !options.onWorkChange) options.scheduleRender();
+      else options.onWorkChange();
     wakeIdle();
   };
   const completeAdmissions = (): void => {
@@ -1299,7 +1301,7 @@ const createManager = (
     completeAdmissions();
     releaseRetiredSources();
     for (const owner of owners) safeCall(owner.options.onPresentationChange);
-    notify();
+    notify(!snapshot.count);
     const retained = sourceTiles();
     if (
       next === candidate &&
@@ -1594,6 +1596,7 @@ const createManager = (
       }
       yield {
         bytes: 0,
+        requiresPaint: true,
         run() {
           if (
             !compatible(snapshot, target) ||
@@ -2135,7 +2138,7 @@ const createManager = (
         presentationRevision++;
         if (camera && (workerMemory || pendingSort))
           requestSort(camera.position);
-        notify();
+        notify(true);
         return;
       }
       if (!camera) return;

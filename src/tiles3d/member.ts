@@ -295,6 +295,7 @@ export const createTiles3dMember = (
       removeActor(actor: unknown): void;
     },
     scheduleRender: context.scheduleRender,
+    onWorkChange: context.onWorkChange,
     submissions: context.submissions,
     visible: active,
     onError(error) {

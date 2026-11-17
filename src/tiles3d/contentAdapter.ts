@@ -30,6 +30,7 @@ export type TileSubmissionOutcome =
 export type TileContentAdapterOptions = MeshAdapterOptions & {
   readonly memoryPool?: MemoryPool;
   readonly onPresentationChange?: () => void;
+  readonly onWorkChange?: () => void;
   readonly onPolicyRefusal?: (refusal: TileSubmissionRefusal) => void;
   readonly onAdmissionRefusal?: (
     ids: readonly string[],

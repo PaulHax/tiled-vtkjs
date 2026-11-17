@@ -52,6 +52,8 @@ export type StreamedMemberRegistration = {
 
 export type StreamedSceneCoordinatorOptions = {
   readonly scheduleRender: () => void;
+  /** Schedule an owning-context work tick independent of visible repaint. */
+  readonly schedulePreparation?: () => void;
   /** Required page-wide pool shared by every view coordinator on the GPU. */
   readonly memory: MemoryPool;
   readonly devicePixelRatio?: number;
@@ -103,9 +105,11 @@ export type StreamedSceneCoordinator = {
   /**
    * Run immediately before each paint: member preparation, the shared
    * admission drain, one read of every member's inputs, and the frame's
-   * allocations. This is the only place members receive allocations.
+   * allocations. Shares the current frame's allowance with background work.
    */
   prepareFrame(frameSerial: number, pageFrame?: number): void;
+  /** Prepare on the owning live view without reporting a paint. */
+  prepareWork(pageFrame: number): void;
   /**
    * Report one presented frame. The verdict says whether the governor took it
    * as a capacity sample, whether that sample may train quality, and the
@@ -114,8 +118,8 @@ export type StreamedSceneCoordinator = {
    */
   recordHostFrame(metrics: HostFrameMetrics): FrameVerdict;
   /**
-   * Whether the view owes another frame: queued submissions, a governor that
-   * is still measuring, or an allocation that has changed since it was applied.
+   * Whether the view owes another paint, including preparation if the host
+   * has no separate preparation callback.
    */
   needsFrame(): boolean;
   /** Diagnostics as last observed. Reading them calls no member. */
@@ -278,8 +282,11 @@ export const createStreamedSceneCoordinator = (
     budget = createSubmissionFrameBudget();
     preparationBudgets.set(memory, budget);
   }
+  const requestPreparation =
+    options.schedulePreparation ?? options.scheduleRender;
   const submissions = createSubmissionScheduler({
     scheduleRender: options.scheduleRender,
+    schedulePreparation: options.schedulePreparation,
     budget,
   });
   const members = new Set<MemberState>();
@@ -287,6 +294,7 @@ export const createStreamedSceneCoordinator = (
   const now = options.now ?? Date.now;
   let stallTimer: ReturnType<typeof setTimeout> | null = null;
   let lastPreparedFrameSerial = -1;
+  let lastPreparedPageFrame: number | undefined;
   let capacityWorkSinceLastReport = false;
   // Some member may now report different inputs than the ones last read.
   let inputsStale = false;
@@ -485,13 +493,12 @@ export const createStreamedSceneCoordinator = (
     try {
       if (disposed || !inputsStale) return;
       const drained = observe();
-      if (
-        owesMeasurement(drained) ||
+      if (owesMeasurement(drained)) options.scheduleRender();
+      else if (
         allocationOutdated() ||
         preparedAvailability !== memory.availability()
-      ) {
-        options.scheduleRender();
-      }
+      )
+        requestPreparation();
     } finally {
       checkQueued = false;
     }
@@ -507,6 +514,29 @@ export const createStreamedSceneCoordinator = (
     if (checkQueued) return;
     checkQueued = true;
     queueMicrotask(checkInputs);
+  };
+
+  const prepare = (pageFrame: number, painting: boolean): void => {
+    if (disposed) return;
+    const first =
+      !options.schedulePreparation || lastPreparedPageFrame !== pageFrame;
+    if (!first && !painting) return;
+    if (first) {
+      lastPreparedPageFrame = pageFrame;
+      for (const state of members) {
+        if (state.active) state.member.prepareFrame();
+      }
+      preparedAvailability = memory.availability();
+    }
+    submissions.prepareFrame(pageFrame, painting);
+    const submitted = submissions.stats().lastFrameAdmittedJobs > 0;
+    capacityWorkSinceLastReport ||= submitted;
+    if (first || submitted) {
+      const owed = owesMeasurement(observe());
+      // One allocation application per animation frame, even if it also paints.
+      if (first) applyAllocations();
+      if (owed) options.scheduleRender();
+    }
   };
 
   return {
@@ -676,25 +706,15 @@ export const createStreamedSceneCoordinator = (
       }
       if (frameSerial <= lastPreparedFrameSerial) return;
       lastPreparedFrameSerial = frameSerial;
-      for (const state of members) {
-        if (state.active) state.member.prepareFrame();
-      }
-      preparedAvailability = memory.availability();
-      // The document timeline is shared by independently scheduled paint
-      // callbacks and external-context renders in the same browser frame.
+      // The document timeline is shared by browser work and paint callbacks.
       const timeline = globalThis.document?.timeline?.currentTime;
-      submissions.prepareFrame(
+      prepare(
         pageFrame ?? (typeof timeline === "number" ? timeline : frameSerial),
+        true,
       );
-
-      capacityWorkSinceLastReport ||=
-        submissions.stats().lastFrameAdmittedJobs > 0;
-      const owed = owesMeasurement(observe());
-      // One application per frame and no loop: whatever a member reports in
-      // answer is read by the next check and applied at the next frame.
-      applyAllocations();
-      if (owed) options.scheduleRender();
     },
+
+    prepareWork: (pageFrame) => prepare(pageFrame, false),
 
     recordHostFrame(metrics) {
       const unsampled = (): FrameVerdict => ({
@@ -724,10 +744,11 @@ export const createStreamedSceneCoordinator = (
 
     needsFrame: () =>
       !disposed &&
-      (submissions.hasPending() ||
-        preparedAvailability !== memory.availability() ||
-        (hasAdaptiveMember() && governor.needsFrame()) ||
-        allocationOutdated()),
+      ((hasAdaptiveMember() && governor.needsFrame()) ||
+        (!options.schedulePreparation &&
+          (submissions.hasPending() ||
+            preparedAvailability !== memory.availability() ||
+            allocationOutdated()))),
 
     stats() {
       return {

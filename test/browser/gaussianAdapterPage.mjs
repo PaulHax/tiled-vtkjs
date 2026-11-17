@@ -22,6 +22,8 @@ const measureUploads = mode === "budgeted-uploads";
 let uploads = [];
 let phase = "prepare";
 let uploadStateReads = 0;
+let probePaints = 0;
+let probePixel = [0, 0, 0, 0];
 let externalTexture;
 if (measureUploads) {
   const prototype = WebGL2RenderingContext.prototype;
@@ -396,7 +398,7 @@ globalThis.gaussianFixture = {
   addInvisibleProbe(id) {
     return adapters[0].submitTile(id, field([blue]));
   },
-  stepMixedProbe() {
+  stepMixedProbe(painting = true) {
     uploads = [];
     uploadStateReads = 0;
     const gl = openGL.getContext();
@@ -410,19 +412,26 @@ globalThis.gaussianFixture = {
     gl.bindTexture(gl.TEXTURE_2D, externalTexture);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 8);
     factory.noteContext(renderer);
-    withPointTextureUploads(openGL, () => scheduler.prepareFrame());
+    withPointTextureUploads(openGL, () =>
+      scheduler.prepareFrame(undefined, painting),
+    );
     const stateRestored =
       gl.getParameter(gl.UNPACK_ALIGNMENT) === 8 &&
       gl.getParameter(gl.ACTIVE_TEXTURE) === active &&
       gl.getParameter(gl.TEXTURE_BINDING_2D) === externalTexture;
     gl.bindTexture(gl.TEXTURE_2D, bound && gl.isTexture(bound) ? bound : null);
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
-    phase = "draw";
-    renderWindow.render();
-    const pixel = new Uint8Array(4);
-    gl.readPixels(128, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    if (painting) {
+      phase = "draw";
+      renderWindow.render();
+      const pixel = new Uint8Array(4);
+      gl.readPixels(128, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      probePixel = [...pixel];
+      probePaints++;
+    }
     return {
-      pixel: [...pixel],
+      pixel: probePixel,
+      paints: probePaints,
       uploads,
       uploadStateReads,
       stateRestored,
