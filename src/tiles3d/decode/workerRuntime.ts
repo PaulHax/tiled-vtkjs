@@ -1,5 +1,9 @@
 import { decodeTileContent } from "./decoder";
-import { TileDecodeError, TileUnsupportedExtensionError } from "./types";
+import {
+  TileDecodeError,
+  TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
+} from "./types";
 import { buildTransferList } from "./transfer";
 import { ResourcePolicyError } from "../../core/memoryResources";
 import type {
@@ -38,6 +42,9 @@ const errorMessage = (
             reason: error.reason,
             ...(error instanceof TileUnsupportedExtensionError
               ? { extension: error.extension }
+              : {}),
+            ...(error instanceof TileUnsupportedGaussianProfileError
+              ? { property: error.property, value: error.value }
               : {}),
           }
         : {

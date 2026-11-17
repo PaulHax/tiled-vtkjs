@@ -1,12 +1,18 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkGenericRenderWindow from "@kitware/vtk.js/Rendering/Misc/GenericRenderWindow";
+import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
 import {
   createMemoryPool,
+  createSubmissionScheduler,
   createStreamedSceneCoordinator,
 } from "__PACKAGE__/core";
 import { createPointCloudMember } from "__PACKAGE__/points/vtk";
 import { DecodeWorkerPool } from "__PACKAGE__/tiles3d";
-import { createTiles3dMember } from "__PACKAGE__/tiles3d/vtk";
+import {
+  createGaussianAlphaPass,
+  createGaussianContentAdapterFactory,
+  createTiles3dMember,
+} from "__PACKAGE__/tiles3d/vtk";
 
 const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
 const size = 128;
@@ -293,6 +299,153 @@ window.packedScene = {
     const result = snapshot();
     generic.delete();
     return result;
+  },
+  gaussian: async () => {
+    const window = vtkGenericRenderWindow.newInstance({
+      background: [0, 0, 0],
+    });
+    window.setContainer(document.querySelector("#view"));
+    window.resize();
+    const renderer = window.getRenderer();
+    const renderWindow = window.getRenderWindow();
+    const openGlWindow = renderWindow.getViews()[0];
+    openGlWindow.setRenderPasses([
+      vtkForwardPass.newInstance({
+        translucentPass: createGaussianAlphaPass(() =>
+          openGlWindow.getContext(),
+        ),
+      }),
+    ]);
+    const camera = renderer.getActiveCamera();
+    camera.setParallelProjection(true);
+    camera.setPosition(0, 0, 2);
+    camera.setFocalPoint(0, 0, 0);
+    camera.setViewUp(0, 1, 0);
+    camera.setParallelScale(1);
+    camera.setClippingRange(0.01, 10);
+    const submissions = createSubmissionScheduler({
+      scheduleRender() {},
+      maxBytesPerFrame: 1_000_000,
+      maxTimeMsPerFrame: 100,
+      now: () => 0,
+    });
+    const factory = createGaussianContentAdapterFactory({
+      maximumVisibleSplats: 16,
+      resourceBudgetBytes: 16 * 1024 * 1024,
+    });
+    const owner = () =>
+      factory({
+        renderer,
+        submissions,
+        scheduleRender() {},
+        onError(error) {
+          errors.push(String(error));
+        },
+      });
+    const far = owner();
+    const near = owner();
+    const gaussian = (positions, color) => ({
+      kind: "gaussian",
+      positions: new Float32Array(positions),
+      rotations: new Float32Array(
+        Array.from({ length: positions.length / 3 }, () => [0, 0, 0, 1]).flat(),
+      ),
+      scales: new Float32Array(positions.map(() => 0.16)),
+      opacities: new Float32Array(positions.length / 3).fill(0.5),
+      sphericalHarmonics: new Float32Array(
+        Array.from({ length: positions.length / 3 }, () =>
+          color.map((channel) => (channel - 0.5) / 0.28209479177387814),
+        ).flat(),
+      ),
+      harmonicDegree: 0,
+      profile: {
+        kernel: "ellipse",
+        colorSpace: "srgb_rec709_display",
+        projection: "perspective",
+        sortingMethod: "cameraDistance",
+      },
+      modelToScene: new Float64Array(identity),
+    });
+    const content = (primitives) => ({
+      origin: [0, 0, 0],
+      primitives,
+      byteEstimate: { geometry: 1024, textures: 0 },
+    });
+    const outcomes = [
+      far.submitTile(
+        "far",
+        content([
+          gaussian([-0.45, 0, -0.2, 0.45, 0, -0.2], [1, 0, 0]),
+          {
+            kind: "mesh",
+            positions: new Float32Array([
+              0.1, -0.5, 0, 0.8, -0.5, 0, 0.8, 0.5, 0, 0.1, 0.5, 0,
+            ]),
+            indices: new Uint16Array([0, 1, 2, 0, 2, 3]),
+            material: {
+              baseColorFactor: [0, 1, 0, 1],
+              raw: {
+                version: 1,
+                kind: "gltf-material",
+                alphaMode: "OPAQUE",
+                doubleSided: true,
+                unlit: true,
+                metallicFactor: 0,
+                roughnessFactor: 1,
+                emissiveFactor: [0, 0, 0],
+              },
+            },
+          },
+        ]),
+      ),
+      near.submitTile("near", content([gaussian([-0.45, 0, 0.2], [0, 0, 1])])),
+    ];
+    if (outcomes.some((outcome) => outcome !== "queued"))
+      throw new Error(`packed Gaussian submission failed: ${outcomes}`);
+    far.setCamera(view);
+    near.setCamera(view);
+    submissions.prepareFrame();
+    await factory.whenIdle(renderer);
+    far.setDrawnTiles(["far"]);
+    near.setDrawnTiles(["near"]);
+    await factory.whenIdle(renderer);
+    if (errors.length) throw new Error(errors.join("\n"));
+    renderWindow.render();
+    const gl = renderWindow.getViews()[0].getContext();
+    const pixel = (x) => {
+      const value = new Uint8Array(4);
+      gl.readPixels(x, 64, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, value);
+      return [...value];
+    };
+    const ready = factory.stats(renderer);
+    const pixels = { sorted: pixel(35), occluded: pixel(93) };
+    camera.setPosition(0, 0, -2);
+    const reversedMatrix = camera.getCompositeProjectionMatrix(1, -1, 1);
+    const reversedView = {
+      ...view,
+      position: [0, 0, -2],
+      viewProj: Array.from(
+        { length: 16 },
+        (_, i) => reversedMatrix[(i % 4) * 4 + Math.floor(i / 4)],
+      ),
+    };
+    far.setCamera(reversedView);
+    near.setCamera(reversedView);
+    await factory.whenIdle(renderer);
+    renderWindow.render();
+    const reversed = { stats: factory.stats(renderer), pixel: pixel(93) };
+    far.dispose();
+    near.dispose();
+    submissions.dispose();
+    renderWindow.render();
+    const disposed = {
+      actors: renderer.getActors().length,
+      stats: factory.stats(renderer),
+      queuedJobs: submissions.stats().queuedJobs,
+      pixel: pixel(35),
+    };
+    window.delete();
+    return { ready, pixels, reversed, disposed };
   },
 };
 document.documentElement.dataset.ready = "true";

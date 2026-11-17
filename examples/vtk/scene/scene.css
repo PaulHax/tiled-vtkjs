@@ -8,7 +8,8 @@
   line-height: 1.5;
 }
 
-.description a {
+.description a,
+.dataset-body .field-note a {
   color: #8dcdf4;
 }
 

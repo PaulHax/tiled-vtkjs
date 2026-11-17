@@ -45,7 +45,7 @@ for (const module of modules) {
         assert(module !== "core", `${location} imports ${specifier}`);
         if (specifier.startsWith("@kitware/vtk.js")) {
           assert(
-            /\/(rendererAdapter|meshAdapter)\.ts$/.test(path),
+            /\/(rendererAdapter|meshAdapter|gaussianAdapter)\.ts$/.test(path),
             `${location} imports VTK outside its adapter`,
           );
         }

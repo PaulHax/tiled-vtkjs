@@ -50,6 +50,7 @@ const primitive = (
   xRange = [-2, 2],
   normalZ = 1,
 ) => ({
+  kind: "mesh",
   positions: new Float32Array([
     xRange[0],
     -1,

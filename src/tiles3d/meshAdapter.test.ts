@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import type { CameraView } from "../core/camera";
-import type { DecodedTexture, DecodedTileContent } from "./decode";
+import type { DecodedTexture, DecodedMeshTileContent } from "./decode";
 import { createMeshAdapter } from "./meshAdapter";
 import { pickSubmittedTriangles } from "./meshPicking";
 import {
@@ -25,9 +25,12 @@ const compressed = {
   capabilityKey: "astc",
 } satisfies DecodedTexture;
 
-const content = (texture: DecodedTexture = compressed): DecodedTileContent => ({
+const content = (
+  texture: DecodedTexture = compressed,
+): DecodedMeshTileContent => ({
   origin: [10, 20, 30],
   primitives: [0, 1].map(() => ({
+    kind: "mesh",
     positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
     normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
     uvs: new Float32Array([0, 0, 1, 0, 0, 1]),
@@ -86,7 +89,7 @@ const alphaContent = (
   alphaMode: "OPAQUE" | "MASK" | "BLEND",
   alphaCutoff: number,
   factorAlpha: number,
-): DecodedTileContent => {
+): DecodedMeshTileContent => {
   const result = content();
   result.primitives.splice(1);
   result.primitives[0]!.material.raw.alphaMode = alphaMode;
@@ -109,7 +112,7 @@ const coloredMask = (
   factorAlpha: number,
   cutoff: number,
   texture?: DecodedTexture,
-): DecodedTileContent => {
+): DecodedMeshTileContent => {
   const payload = alphaContent("MASK", cutoff, factorAlpha);
   payload.origin = [0, 0, 0];
   const primitive = payload.primitives[0]!;

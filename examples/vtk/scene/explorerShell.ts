@@ -5,7 +5,7 @@ const copy = (
 ): { title: string; description: string } =>
   preset === "points"
     ? {
-        title: "tiled-vtkjs · point cloud",
+        title: "tiled-vtkjs · explorer",
         description:
           "Stream point clouds and 3D Tiles into one governed vtk.js view. Each dataset keeps its own rendering controls.",
       }
