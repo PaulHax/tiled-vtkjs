@@ -1,3 +1,5 @@
+export type GaussianBounds = [number, number, number, number, number, number];
+
 /** Stable tuple ranges; retirement is committed only after a draw-order swap. */
 export const createGaussianStorage = () => {
   let bufferRevision = 0;
@@ -15,6 +17,21 @@ export const createGaussianStorage = () => {
   let free: { offset: number; count: number }[] = [];
   let pending: [number, number][] = [];
   let grew = false;
+  const packed = new Map<number, GaussianBounds>();
+
+  const grow = (target: number): void => {
+    if (target <= capacity) return;
+    positions = new Float32Array(target * 3);
+    scales = new Float32Array(target * 3);
+    rotations = new Float32Array(target * 4);
+    colors = new Float32Array(target * 4);
+    bufferRevision++;
+    free.push({ offset: capacity, count: target - capacity });
+    capacity = target;
+    coalesce();
+    packed.clear();
+    grew = true;
+  };
 
   const coalesce = (): void => {
     free.sort((left, right) => left.offset - right.offset);
@@ -96,23 +113,10 @@ export const createGaussianStorage = () => {
       if (existing) return { ...existing, fresh: false };
       let range = free.find((entry) => entry.count >= count);
       if (!range) {
-        const oldCapacity = capacity;
-        const needed = oldCapacity + count;
-        capacity = Math.max(1, oldCapacity);
-        while (capacity < needed) capacity *= 2;
-        const grow = (old: Float32Array, components: number): Float32Array => {
-          const next = new Float32Array(capacity * components);
-          next.set(old);
-          return next;
-        };
-        positions = grow(positions, 3);
-        scales = grow(scales, 3);
-        rotations = grow(rotations, 4);
-        colors = grow(colors, 4);
-        bufferRevision++;
-        free.push({ offset: oldCapacity, count: capacity - oldCapacity });
-        coalesce();
-        grew = true;
+        const needed = capacity + count;
+        let target = Math.max(1, capacity);
+        while (target < needed) target *= 2;
+        grow(target);
         range = free.find((entry) => entry.count >= count)!;
       }
       const allocation = {
@@ -127,6 +131,12 @@ export const createGaussianStorage = () => {
       pending.push([allocation.offset, count]);
       return { ...allocation, fresh: true };
     },
+    grow,
+    isPacked: (revision: number): boolean => packed.has(revision),
+    packedBounds: (revision: number) => packed.get(revision),
+    markPacked(revision: number, bounds: GaussianBounds): void {
+      packed.set(revision, bounds);
+    },
     owns(key: string, revision: number): boolean {
       return allocations.get(key)?.revision === revision;
     },
@@ -135,6 +145,7 @@ export const createGaussianStorage = () => {
       for (const [key, allocation] of allocations)
         if (!live.has(key)) {
           allocations.delete(key);
+          packed.delete(allocation.revision);
           free.push(allocation);
         }
       coalesce();
@@ -157,6 +168,7 @@ export const createGaussianStorage = () => {
       colors = new Float32Array();
       origin = null;
       allocations.clear();
+      packed.clear();
       free = [];
       pending = [];
       grew = true;

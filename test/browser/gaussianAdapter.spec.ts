@@ -43,6 +43,7 @@ afterAll(async () => {
 type Stats = {
   displayedSplats: number;
   pendingSort: boolean;
+  pendingPreparation: boolean;
   attributeUploadBytes: number;
   sortCount: number;
   residentBytes: number;
@@ -70,6 +71,15 @@ type MeshCacheState = {
   refusals: string[];
 };
 type Fixture = {
+  stageMixedProbe(
+    id: string,
+    count: number,
+    triangles: number,
+    replacement?: string[],
+  ): string;
+  stepMixedProbe(): ProbeFrame;
+  cancelMixedProbe(id: string): void;
+  restoreMixedProbeContext(): Promise<{ before: number; after: number }>;
   showCachedMeshParent(): Promise<string>;
   refineCachedMeshesCold(): Promise<string>;
   hideCachedMeshes(): Promise<void>;
@@ -157,6 +167,20 @@ type Fixture = {
   setCamera(position: number[]): void;
   settle(): Promise<Stats>;
   moveRepeatedly(count: number): Promise<Stats>;
+};
+
+type ProbeFrame = {
+  pixel: number[];
+  uploads: Array<{
+    phase: "prepare" | "draw";
+    kind: "mesh" | "order" | "attributes";
+    bytes: number;
+    count?: number;
+    x?: number;
+  }>;
+  stats: Stats & { orderUploadBytes: number; presentationRevision: number };
+  picks: string[];
+  queued: boolean;
 };
 
 const open = async (mode: string): Promise<Page> => {
@@ -414,8 +438,9 @@ describe("shared Gaussian realization", () => {
           globalThis as unknown as { gaussianFixture: Fixture }
         ).gaussianFixture.moveRepeatedly(200),
       );
-      expect(repeated.residentBytes).toBe(first.residentBytes);
-      expect(repeated.residentBytes).toBeLessThanOrEqual(131072);
+      const placementOverlap = initial.residentBytes * 3;
+      expect(first.residentBytes).toBeLessThanOrEqual(placementOverlap);
+      expect(repeated.residentBytes).toBeLessThanOrEqual(placementOverlap);
       const settled = await page.evaluate(async () => {
         const api = (globalThis as unknown as { gaussianFixture: Fixture })
           .gaussianFixture;
@@ -451,6 +476,171 @@ describe("coherent mixed presentations and ownership", () => {
       },
       { method, args },
     ) as Promise<Awaited<ReturnType<Fixture[K]>>>;
+
+  const stepUntil = async (
+    page: Page,
+    condition: (frame: ProbeFrame) => boolean,
+    frames: ProbeFrame[] = [],
+  ) => {
+    for (let i = 0; i < 200; i++) {
+      const frame = await api(page, "stepMixedProbe");
+      frames.push(frame);
+      if (condition(frame)) return frame;
+    }
+    throw new Error(
+      "The streamed presentation did not reach the requested state",
+    );
+  };
+
+  it("budgets mixed upload ranges before paint and preserves the accepted draw on cancellation", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      const frames: ProbeFrame[] = [];
+      expect(await api(page, "stageMixedProbe", "parent", 1, 1)).toBe("queued");
+      const parent = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 1,
+        frames,
+      );
+      expect(parent.picks).toEqual(["parent"]);
+      expect(parent.pixel[0]).toBeGreaterThan(30);
+
+      expect(await api(page, "stageMixedProbe", "cancelled", 80, 30)).toBe(
+        "queued",
+      );
+      const partial = await stepUntil(
+        page,
+        (frame) =>
+          frame.uploads.some(
+            (upload) => upload.kind === "attributes" && upload.count !== 1,
+          ),
+        frames,
+      );
+      expect(partial.picks).toEqual(["parent"]);
+      expect(partial.pixel).toEqual(parent.pixel);
+      expect(partial.stats.displayedSplats).toBe(1);
+      await api(page, "cancelMixedProbe", "cancelled");
+      const settled = await stepUntil(
+        page,
+        (frame) =>
+          !frame.stats.pendingSort &&
+          !frame.stats.pendingPreparation &&
+          !frame.queued,
+        frames,
+      );
+      expect(settled.picks).toEqual(["parent"]);
+      expect(settled.pixel).toEqual(parent.pixel);
+
+      expect(
+        await api(page, "stageMixedProbe", "child", 80, 30, ["parent"]),
+      ).toBe("queued");
+      const start = frames.length;
+      const child = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 80,
+        frames,
+      );
+      const transition = frames.slice(start, -1);
+      expect(
+        transition.filter((frame) =>
+          frame.uploads.some((upload) => upload.kind === "mesh"),
+        ).length,
+      ).toBeGreaterThan(1);
+      expect(
+        transition.filter((frame) =>
+          frame.uploads.some((upload) => upload.kind === "attributes"),
+        ).length,
+      ).toBeGreaterThan(1);
+      for (const frame of transition) {
+        expect(frame.picks).toEqual(["parent"]);
+        expect(frame.pixel).toEqual(parent.pixel);
+      }
+      expect(child.picks).toEqual(["child"]);
+      expect(child.pixel[2]).toBeGreaterThan(parent.pixel[2]!);
+      await stepUntil(
+        page,
+        (frame) =>
+          !frame.stats.pendingSort &&
+          !frame.stats.pendingPreparation &&
+          !frame.queued,
+        frames,
+      );
+
+      let attributes = 0;
+      let order = 0;
+      let lastRevision = 0;
+      for (const frame of frames) {
+        expect(
+          frame.uploads.every((upload) => upload.phase === "prepare"),
+        ).toBe(true);
+        expect(
+          frame.uploads.reduce((sum, upload) => sum + upload.bytes, 0),
+        ).toBeLessThanOrEqual(1024);
+        for (const upload of frame.uploads) {
+          if (upload.kind === "attributes") attributes += upload.bytes;
+          if (upload.kind === "order") order += upload.bytes;
+        }
+        expect(frame.stats.attributeUploadBytes).toBe(attributes);
+        expect(frame.stats.orderUploadBytes).toBe(order);
+        expect(frame.stats.presentationRevision).toBeGreaterThanOrEqual(
+          lastRevision,
+        );
+        lastRevision = frame.stats.presentationRevision;
+      }
+      expect(
+        frames.some((frame) =>
+          frame.uploads.some((upload) => (upload.x ?? 0) > 0),
+        ),
+      ).toBe(true);
+      expect(await api(page, "errors")).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("reuploads a partially staged snapshot on the restored WebGL context", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      expect(await api(page, "stageMixedProbe", "parent", 1, 1)).toBe("queued");
+      await stepUntil(page, (frame) => frame.stats.displayedSplats === 1);
+      expect(
+        await api(page, "stageMixedProbe", "child", 80, 30, ["parent"]),
+      ).toBe("queued");
+      const partial = await stepUntil(page, (frame) =>
+        frame.uploads.some(
+          (upload) => upload.kind === "attributes" && upload.count !== 1,
+        ),
+      );
+      expect(partial.picks).toEqual(["parent"]);
+      const generation = await api(page, "restoreMixedProbeContext");
+      expect(generation.after).toBeGreaterThan(generation.before);
+      const frames: ProbeFrame[] = [];
+      const child = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 80,
+        frames,
+      );
+      const textures = frames.flatMap((frame) =>
+        frame.uploads.filter(({ kind }) => kind !== "mesh"),
+      );
+      expect(textures.every((upload) => upload.phase === "prepare")).toBe(true);
+      expect(
+        textures
+          .filter(({ kind }) => kind === "attributes")
+          .reduce((sum, upload) => sum + upload.bytes, 0),
+      ).toBe(80 * 56);
+      expect(
+        textures
+          .filter(({ kind }) => kind === "order")
+          .reduce((sum, upload) => sum + upload.bytes, 0),
+      ).toBe(80 * 4);
+      expect(child.picks).toEqual(["child"]);
+      expect(child.pixel[2]).toBeGreaterThan(150);
+      expect(await api(page, "errors")).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
 
   it("restores the textured fine frontier after warm-cache hide and show", async () => {
     const page = await open("mesh-cache-restoration");
@@ -767,6 +957,12 @@ describe("coherent mixed presentations and ownership", () => {
           expect((await pixels(page)).data).toEqual(before.data);
           expect(await api(page, "refusals")).toEqual([]);
         }
+        await page.waitForFunction(
+          () =>
+            !(
+              globalThis as unknown as { gaussianFixture: Fixture }
+            ).gaussianFixture.stats().pendingPreparation,
+        );
         await api(page, "releaseWork");
         await expect.poll(() => api(page, "pending")).toBe(1);
         await api(page, "releaseNext");

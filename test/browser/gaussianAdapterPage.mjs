@@ -17,6 +17,31 @@ import { createGaussianDistanceSorter } from "../../src/tiles3d/gaussianSort";
 import { createTiles3dMember } from "../../src/tiles3d/member";
 
 const mode = new URLSearchParams(location.search).get("mode") ?? "shared";
+const measureUploads = mode === "budgeted-uploads";
+let uploads = [];
+let phase = "prepare";
+if (measureUploads) {
+  const prototype = WebGL2RenderingContext.prototype;
+  const texSubImage = prototype.texSubImage2D;
+  prototype.texSubImage2D = function (...args) {
+    if (ArrayBuffer.isView(args[8]))
+      uploads.push({
+        phase,
+        kind: args[6] === this.RED_INTEGER ? "order" : "attributes",
+        x: args[2],
+        y: args[3],
+        count: args[4] * args[5],
+        bytes: args[8].byteLength,
+      });
+    return texSubImage.apply(this, args);
+  };
+  const bufferData = prototype.bufferData;
+  prototype.bufferData = function (...args) {
+    if (ArrayBuffer.isView(args[1]))
+      uploads.push({ phase, kind: "mesh", bytes: args[1].byteLength });
+    return bufferData.apply(this, args);
+  };
+}
 const generic = vtkGenericRenderWindow.newInstance({ background: [0, 0, 0] });
 generic.setContainer(document.querySelector("#view"));
 generic.resize();
@@ -36,9 +61,21 @@ camera.setViewUp(0, 1, 0);
 camera.setParallelProjection(true);
 camera.setParallelScale(1.2);
 camera.setClippingRange(0.1, 100);
+let frameQueued = false;
+let suspendSubmissions = mode === "member-recovery";
+const scheduleFrame = () => {
+  if (frameQueued || measureUploads || suspendSubmissions) return;
+  frameQueued = true;
+  requestAnimationFrame(() => {
+    frameQueued = false;
+    if (suspendSubmissions) return;
+    scheduler.prepareFrame();
+    renderWindow.render();
+  });
+};
 const scheduler = createSubmissionScheduler({
-  scheduleRender() {},
-  maxBytesPerFrame: 1_000_000,
+  scheduleRender: scheduleFrame,
+  maxBytesPerFrame: measureUploads ? 1024 : 1_000_000,
   now: () => 0,
 });
 const errors = [];
@@ -60,6 +97,7 @@ const blockingOwner = memoryPool.createOwner();
 const factory = createGaussianContentAdapterFactory({
   resourceBudgetBytes: mode === "budget" ? 1600 : 131072,
   maximumVisibleSplats: 100,
+  ...(measureUploads ? { getOpenGLRenderWindow: () => openGL } : {}),
   createSortBackend: () => ({
     sort(job) {
       if (hold)
@@ -260,6 +298,8 @@ if (
     ],
     [],
   );
+} else if (mode === "budgeted-uploads") {
+  // The test supplies both frontiers and controls each paint.
 } else if (mode === "mesh-blend" || mode === "blend-before-gaussian") {
   adapters[1].submitTile("field", translucentMesh);
   if (mode === "blend-before-gaussian")
@@ -295,6 +335,7 @@ const setCamera = (position) => {
   for (const adapter of adapters) adapter.setCamera(view());
 };
 const settle = async () => {
+  suspendSubmissions = mode === "member-recovery";
   while (scheduler.hasPending()) scheduler.prepareFrame();
   await factory.whenIdle(renderer);
   renderWindow.render();
@@ -307,6 +348,69 @@ let recoveryMember;
 let recoveryConfig;
 const recoveryFetches = [];
 globalThis.gaussianFixture = {
+  stageMixedProbe(id, count, triangleCount, replacement = []) {
+    const content = field(
+      Array.from({ length: count }, () => (id === "parent" ? red : blue)),
+      id === "parent" ? 0 : 1,
+    );
+    const patch = triangle(-1, [0, 1, 0, 1], "OPAQUE");
+    patch.positions = Float32Array.from(
+      Array.from({ length: triangleCount }, () => [...patch.positions]).flat(),
+    );
+    content.primitives.push(patch);
+    return adapters[0].submitTile(
+      id,
+      content,
+      () => {
+        adapters[0].setDrawnTiles([id]);
+        for (const old of replacement) adapters[0].retireTile(old);
+      },
+      replacement,
+    );
+  },
+  stepMixedProbe() {
+    uploads = [];
+    phase = "prepare";
+    factory.noteContext(renderer);
+    scheduler.prepareFrame();
+    phase = "draw";
+    renderWindow.render();
+    const gl = openGL.getContext();
+    const pixel = new Uint8Array(4);
+    gl.readPixels(128, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+    return {
+      pixel: [...pixel],
+      uploads,
+      stats: factory.stats(renderer),
+      picks: adapters[0].pickableMeshTiles().map(({ id }) => id),
+      queued: scheduler.hasPending(),
+    };
+  },
+  async restoreMixedProbeContext() {
+    const canvas = openGL.getCanvas();
+    const extension = openGL.getContext().getExtension("WEBGL_lose_context");
+    if (!extension)
+      throw new Error("WebGL context loss simulation is unavailable");
+    const before = openGL.getGraphicsResourceGeneration();
+    const lost = new Promise((resolve) =>
+      canvas.addEventListener("webglcontextlost", resolve, { once: true }),
+    );
+    extension.loseContext();
+    await lost;
+    factory.noteContext(renderer);
+    // Dispatch must complete before the loss extension allows restoration.
+    await new Promise(requestAnimationFrame);
+    const restored = new Promise((resolve) =>
+      canvas.addEventListener("webglcontextrestored", resolve, { once: true }),
+    );
+    extension.restoreContext();
+    await restored;
+    return { before, after: openGL.getGraphicsResourceGeneration() };
+  },
+  cancelMixedProbe(id) {
+    adapters[0].retireTile(id);
+    adapters[0].setDrawnTiles(["parent"]);
+  },
   async showCachedMeshParent() {
     adapters[0].setVisible(true);
     const outcome = adapters[0].submitTile(
@@ -597,6 +701,7 @@ globalThis.gaussianFixture = {
     await settle();
   },
   queueDemand(gaussian) {
+    suspendSubmissions = true;
     let ready = 0;
     const entries = ["left", "right"].map((id) => {
       const content = gaussian
@@ -723,6 +828,7 @@ globalThis.gaussianFixture = {
     while (scheduler.hasPending()) scheduler.prepareFrame();
   },
   stageGrowth(id, count, restoreWork = false) {
+    suspendSubmissions = true;
     if (restoreWork) {
       memoryPool.configure({ workBytes: 1048576 });
       for (const adapter of adapters) adapter.clearRequiredBytes();

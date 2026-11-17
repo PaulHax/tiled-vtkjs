@@ -422,6 +422,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   );
   const gaussian = createGaussianContentAdapterFactory({
     resourceBudgetBytes,
+    getOpenGLRenderWindow: () => host.openGLRenderWindow,
     createSortBackend: () =>
       createGaussianSortWorkerBackend(
         new Worker(
@@ -872,13 +873,16 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
   };
   window.addEventListener("pagehide", onPageHide);
 
-  host.onBeforeFrame((view, devicePixelRatio) => {
+  host.onBeforePaint(() => {
     const showingGaussians =
       (gaussian.stats(host.renderer)?.displayedSplats ?? 0) > 0;
     if (showingGaussians !== gaussianPassActive) {
       gaussianPassActive = showingGaussians;
       host.setTranslucentPass(showingGaussians ? gaussianPass : null);
     }
+  });
+  host.onBeforeFrame((view, devicePixelRatio) => {
+    gaussian.noteContext(host.renderer);
     for (const dataset of datasets) {
       dataset.registration.setCamera(view);
       dataset.registration.setDevicePixelRatio(devicePixelRatio);

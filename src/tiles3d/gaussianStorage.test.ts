@@ -6,14 +6,14 @@ describe("Gaussian resident tuple ranges", () => {
     const arena = createGaussianStorage();
     const parent = arena.allocate("parent:1", 3);
     arena.positions.set([1, 2, 3, 4, 5, 6, 7, 8, 9], parent.offset * 3);
+    const accepted = arena.positions;
     arena.updates();
     const child = arena.allocate("child:1", 3);
     expect(child.offset).toBeGreaterThanOrEqual(parent.offset + parent.count);
     expect(
-      Array.from(
-        arena.positions.slice(parent.offset * 3, (parent.offset + 3) * 3),
-      ),
+      Array.from(accepted.slice(parent.offset * 3, (parent.offset + 3) * 3)),
     ).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(arena.positions).not.toBe(accepted);
     expect(arena.allocate("parent:1", 3)).toMatchObject({
       offset: parent.offset,
       fresh: false,

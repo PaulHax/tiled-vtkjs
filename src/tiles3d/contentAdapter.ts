@@ -14,8 +14,6 @@ import type {
 import type { SubmittedMeshTile } from "./meshPicking";
 
 export type TileContentAdapterOptions = MeshAdapterOptions & {
-  /** Physical renderer shared by realizations behind per-layer mesh wrappers. */
-  readonly realizationRenderer?: MeshAdapterOptions["renderer"];
   readonly memoryPool?: MemoryPool;
   readonly onPresentationChange?: () => void;
   readonly onAdmissionRefusal?: (

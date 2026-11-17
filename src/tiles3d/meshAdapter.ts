@@ -10,6 +10,8 @@ import vtkActor, {
 import vtkMapper, {
   type vtkMapper as VtkMapper,
 } from "@kitware/vtk.js/Rendering/Core/Mapper";
+import type vtkRenderer from "@kitware/vtk.js/Rendering/Core/Renderer";
+import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
 import vtkTexture, {
   type vtkTexture as VtkTexture,
   type TextureSampler,
@@ -46,6 +48,15 @@ export type MeshAdapterOptions = {
     removeActor(actor: unknown): void;
   };
   readonly scheduleRender: () => void;
+  /** Optional owning view for pre-uploading new triangle vertex/index chunks.
+   * Material textures and recovery of resident mesh buffers use VTK's render path.
+   */
+  readonly getOpenGLRenderWindow?: () =>
+    | vtkOpenGLRenderWindow
+    | null
+    | undefined;
+  /** Physical renderer behind any per-layer wrappers. */
+  readonly realizationRenderer?: MeshAdapterOptions["renderer"];
   readonly submissions: SubmissionScheduler;
   readonly visible?: boolean;
   readonly onError?: (error: unknown) => void;
@@ -71,6 +82,8 @@ export type MeshAdapterStats = {
    * setters since this adapter was created. Actor reuse does not increment it.
    */
   readonly logicalGeometryUploadBytes: number;
+  /** Buffer bytes realized on the owning view during submission. */
+  readonly gpuGeometryUploadBytes: number;
   /**
    * Cumulative compressed mip/RGBA bytes successfully accepted by vtkTexture
    * payload setters. This is the logical upload payload, not driver telemetry.
@@ -160,6 +173,8 @@ export type MeshAdapter = {
 };
 
 type PrimitiveResources = {
+  attached: boolean;
+  releaseViewResources?: () => void;
   readonly actor: VtkActor;
   readonly mapper: VtkMapper;
   readonly polyData: VtkPolyData;
@@ -178,7 +193,6 @@ type TileResources = {
   readonly geometryBytes: number;
   readonly textureBytes: number;
   readonly formats: Set<string>;
-  attached: boolean;
   readonly memory?: MemoryLease;
   readonly cpuBuffers: Set<ArrayBuffer>;
   cpuReservedBytes: number;
@@ -515,6 +529,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   const replacementClaims = new Map<string, string>();
   let drawn = new Set<string>();
   let logicalGeometryUploadBytes = 0;
+  let gpuGeometryUploadBytes = 0;
   let logicalTextureUploadBytes = 0;
 
   const pendingJobs = (): number => {
@@ -537,7 +552,8 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
 
   const release = (tile: TileResources): void => {
     for (const entry of tile.primitives) {
-      if (tile.attached) options.renderer.removeActor(entry.actor);
+      entry.releaseViewResources?.();
+      if (entry.attached) options.renderer.removeActor(entry.actor);
       entry.actor.delete?.();
       entry.mapper.delete?.();
       entry.polyData.delete?.();
@@ -545,7 +561,6 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     for (const texture of tile.textures) texture.delete?.();
     tile.primitives.length = 0;
     tile.textures.clear();
-    tile.attached = false;
     tile.memory?.release();
     tile.cpuBuffers.clear();
   };
@@ -692,7 +707,8 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         ...(primitive.uvs ? { uvs: primitive.uvs } : {}),
         ...(alphaMask ? { alphaMask } : {}),
       };
-      const resources = {
+      const resources: PrimitiveResources = {
+        attached: false,
         actor,
         mapper,
         polyData,
@@ -710,9 +726,24 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           tile.cpuBuffers.add(array.buffer);
       }
       includeBounds(tile, primitive.positions);
-      tile.primitives.push(resources);
       setActorState(tile, resources);
+      const window = options.getOpenGLRenderWindow?.();
+      const gl = window?.getContext();
+      if (window && gl && !gl.isContextLost()) {
+        actor.setVisibility(false);
+        options.renderer.addActor(actor);
+        resources.attached = true;
+        const prepared = window.preparePolygonalGeometry(
+          (options.realizationRenderer ?? options.renderer) as vtkRenderer,
+          actor,
+        );
+        resources.releaseViewResources = prepared.release;
+        gpuGeometryUploadBytes += prepared.bytes;
+      }
+      tile.primitives.push(resources);
     } catch (error) {
+      if (actor && options.getOpenGLRenderWindow)
+        options.renderer.removeActor(actor);
       actor?.delete?.();
       mapper?.delete?.();
       polyData?.delete?.();
@@ -784,18 +815,21 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
   };
 
   const attach = (tile: TileResources): void => {
-    const added: VtkActor[] = [];
+    const added: PrimitiveResources[] = [];
     try {
       for (const primitive of tile.primitives) {
         setActorState(tile, primitive);
-        added.push(primitive.actor);
-        options.renderer.addActor(primitive.actor);
+        if (!primitive.attached) {
+          added.push(primitive);
+          options.renderer.addActor(primitive.actor);
+          primitive.attached = true;
+        }
       }
-      tile.attached = true;
     } catch (error) {
-      for (const actor of added.reverse()) {
+      for (const primitive of added.reverse()) {
         try {
-          options.renderer.removeActor(actor);
+          options.renderer.removeActor(primitive.actor);
+          primitive.attached = false;
         } catch {
           // Keep rolling back the remaining actors even if the renderer is hostile.
         }
@@ -807,7 +841,6 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           // Resource deletion below is the final cleanup boundary.
         }
       }
-      tile.attached = false;
       throw error;
     }
   };
@@ -954,7 +987,6 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       geometryBytes,
       textureBytes,
       formats,
-      attached: false,
       memory: resourceMemory,
       cpuBuffers: new Set(),
       cpuReservedBytes: geometryBytes,
@@ -1438,6 +1470,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         ),
         pooledTiles: pooled.size,
         logicalGeometryUploadBytes,
+        gpuGeometryUploadBytes,
         logicalTextureUploadBytes,
         logicalUploadBytes:
           logicalGeometryUploadBytes + logicalTextureUploadBytes,

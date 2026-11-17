@@ -8,7 +8,7 @@ export const DEFAULT_SUBMISSION_BYTES_PER_FRAME = 16 * MiB;
 export const DEFAULT_SUBMISSION_TIME_MS_PER_FRAME = 4;
 
 export type SubmissionJob = {
-  /** Estimated retained geometry/texture bytes admitted by this job. */
+  /** Managed preparation or transfer bytes processed by this job. */
   readonly bytes: number;
   /** Indivisible resource already checked against its owner's memory budget.
    * If larger than the byte slice, admit it alone; all other work waits. */
@@ -53,7 +53,11 @@ export type SubmissionScheduler = {
 };
 
 /** `settled` means admitted or dropped, so it can no longer be cancelled. */
-type QueuedJob = SubmissionJob & { cancelled: boolean; settled: boolean };
+type QueuedJob = {
+  bytes: number;
+  job: SubmissionJob | null;
+  settled: boolean;
+};
 
 export const createSubmissionScheduler = (
   options: SubmissionSchedulerOptions,
@@ -79,7 +83,7 @@ export const createSubmissionScheduler = (
   let disposed = false;
 
   const discardCancelledHead = (): void => {
-    while (queue[0]?.cancelled) queue.shift();
+    while (queue.length && !queue[0]!.job) queue.shift();
   };
 
   return {
@@ -91,9 +95,8 @@ export const createSubmissionScheduler = (
         );
       }
       const queued: QueuedJob = {
-        ...job,
+        job,
         bytes,
-        cancelled: false,
         settled: false,
       };
       if (!disposed) {
@@ -103,14 +106,15 @@ export const createSubmissionScheduler = (
         peakQueuedJobs = Math.max(peakQueuedJobs, queue.length);
         if (wasEmpty) options.scheduleRender();
       } else {
-        queued.cancelled = true;
+        queued.job = null;
         queued.settled = true;
       }
       return {
         cancel() {
-          if (queued.cancelled || queued.settled) return false;
-          queued.cancelled = true;
+          if (!queued.job || queued.settled) return false;
+          queued.job = null;
           queuedBytes -= queued.bytes;
+          discardCancelledHead();
           return true;
         },
       };
@@ -138,14 +142,12 @@ export const createSubmissionScheduler = (
         queue.shift();
         next.settled = true;
         queuedBytes -= next.bytes;
-        if (next.cancelled) {
-          discardCancelledHead();
-          continue;
-        }
+        const job = next.job!;
+        next.job = null;
         try {
-          next.run();
+          job.run();
         } catch (error) {
-          safeCall(() => next.onError?.(error));
+          safeCall(() => job.onError?.(error));
         }
         frameJobs += 1;
         frameBytes += next.bytes;
@@ -158,13 +160,13 @@ export const createSubmissionScheduler = (
       if (queue.length > 0) options.scheduleRender();
     },
 
-    hasPending: () => !disposed && queue.some((job) => !job.cancelled),
+    hasPending: () => !disposed && queue.some((entry) => entry.job),
 
     stats: () => ({
       maxBytesPerFrame: maxBytes,
       maxTimeMsPerFrame: maxTimeMs,
       queuedJobs: queue.reduce(
-        (count, job) => count + (job.cancelled ? 0 : 1),
+        (count, entry) => count + (entry.job ? 1 : 0),
         0,
       ),
       queuedBytes,
@@ -178,9 +180,51 @@ export const createSubmissionScheduler = (
     dispose() {
       if (disposed) return;
       disposed = true;
-      for (const job of queue) job.settled = true;
+      for (const entry of queue) {
+        entry.job = null;
+        entry.settled = true;
+      }
       queue.length = 0;
       queuedBytes = 0;
+    },
+  };
+};
+
+/** Keep one continuation in the shared admission queue per preparation. */
+export const enqueueSubmissionSteps = (
+  scheduler: SubmissionScheduler,
+  steps: Iterable<Pick<SubmissionJob, "bytes" | "run">>,
+  onError: (error: unknown) => void,
+  onProgress: () => void,
+): Submission => {
+  const iterator = steps[Symbol.iterator]();
+  const frameCap = scheduler.stats().maxBytesPerFrame;
+  let pending: Submission | undefined;
+  let cancelled = false;
+  const advance = (): void => {
+    if (cancelled) return;
+    const step = iterator.next();
+    if (!step.done) {
+      pending = scheduler.enqueue({
+        bytes: step.value.bytes,
+        atomic: step.value.bytes > frameCap,
+        run() {
+          step.value.run();
+          onProgress();
+          advance();
+        },
+        onError,
+      });
+    } else pending = undefined;
+  };
+  advance();
+  return {
+    cancel() {
+      if (!pending || cancelled) return false;
+      cancelled = true;
+      pending.cancel();
+      iterator.return?.();
+      return true;
     },
   };
 };

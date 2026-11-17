@@ -152,7 +152,6 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
   const errors: unknown[] = [],
     refusals: unknown[] = [];
   let held = false;
-  let onStarted: (() => void) | undefined;
   const pending: (() => void)[] = [];
   const factory = createGaussianContentAdapterFactory({
     createSortBackend:
@@ -163,8 +162,6 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
           return held
             ? new Promise<Uint32Array>((resolve) => {
                 pending.push(() => resolve(order));
-                onStarted?.();
-                onStarted = undefined;
               })
             : Promise.resolve(order);
         },
@@ -192,9 +189,22 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
       viewportHeightCssPx: 100,
     });
   move(0);
+  const drainUntil = async (condition: () => boolean) => {
+    while (!condition()) {
+      submissions.prepareFrame();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+  const withFrames = async <T>(pending: Promise<T>): Promise<T> => {
+    let done = false;
+    void pending.finally(() => (done = true));
+    await drainUntil(() => done);
+    return pending;
+  };
   const settle = async () => {
-    while (submissions.hasPending()) submissions.prepareFrame();
-    await factory.whenIdle(renderer);
+    let idle = false;
+    void factory.whenIdle(renderer).then(() => (idle = true));
+    await drainUntil(() => idle && !submissions.hasPending());
   };
   return {
     adapter,
@@ -205,6 +215,8 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
     refusals,
     submissions,
     settle,
+    drainUntil,
+    withFrames,
     move,
     drawnX() {
       for (const actor of actors) {
@@ -246,10 +258,8 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
       for (const release of pending.splice(0)) release();
     },
     async started() {
-      if (!pending.length)
-        await new Promise<void>((resolve) => {
-          onStarted = resolve;
-        });
+      await drainUntil(() => pending.length > 0);
+      submissions.prepareFrame();
       expect(pending).toHaveLength(1);
     },
     async show(id: string, count: number, mixed = false) {
@@ -461,7 +471,9 @@ describe("Gaussian sort publication", () => {
       await f.started();
       f.adapter.setDrawnTiles(["field", "current"]);
       f.move(0);
-      await Promise.resolve();
+      await f.drainUntil(() =>
+        f.adapter.pickableMeshTiles().some(({ id }) => id === "current"),
+      );
       expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
         "current",
       ]);
@@ -527,7 +539,7 @@ describe("Gaussian sort publication", () => {
       f.adapter.setDrawnTiles(["child"]);
       f.move(7);
       crashed.crash();
-      const retry = await workers.next();
+      const retry = await f.withFrames(workers.next());
       expect(crashed.worker.terminate).toHaveBeenCalledOnce();
       expect(retry.worker).not.toBe(crashed.worker);
       expect(retry.camera).toEqual([7, 0, 10]);
@@ -586,7 +598,7 @@ describe("Gaussian sort publication", () => {
       );
       f.submissions.prepareFrame();
       crashed.crash();
-      const retry = await workers.next();
+      const retry = await f.withFrames(workers.next());
       retry.crash();
       await f.settle();
       expect(other.tileState("unrelated")).toBe("submitted");
@@ -963,12 +975,7 @@ describe("Gaussian admission ownership", () => {
       const matrix = [...IDENTITY];
       matrix[12] = 0.6;
       f.adapter.setBaseMatrix(matrix);
-      for (
-        let index = 0;
-        index < 100 && f.pool.stats().queuedOperations === 0;
-        index++
-      )
-        await Promise.resolve();
+      await f.drainUntil(() => f.pool.stats().queuedOperations > 0);
       expect(f.pool.stats().queuedOperations).toBe(1);
       matrix[12] = -0.6;
       f.adapter.setBaseMatrix(matrix);

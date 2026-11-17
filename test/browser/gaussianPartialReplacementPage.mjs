@@ -49,8 +49,18 @@ const pool = createMemoryPool({
   workBytes: 8192,
 });
 const memory = pool.createOwner();
+let frameQueued = false;
+const scheduleFrame = () => {
+  if (frameQueued) return;
+  frameQueued = true;
+  requestAnimationFrame(() => {
+    frameQueued = false;
+    scheduler.prepareFrame();
+    renderWindow.render();
+  });
+};
 const scheduler = createSubmissionScheduler({
-  scheduleRender() {},
+  scheduleRender: scheduleFrame,
   now: () => 0,
 });
 const sorter = createGaussianDistanceSorter();
