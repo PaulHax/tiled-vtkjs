@@ -63,7 +63,7 @@ export type MemoryPoolOptions = {
   workBytes?: number;
   /** Extra renderer capacity usable only for a complete replacement transition. */
   transitionBytes?: number;
-  /** Page limit for each of network and decode. Sort has a separate slot. Default 2. */
+  /** Aggregate page limit for physical network, decode, and sort work. Default 2. */
   maxConcurrentOperations?: number;
   admission?: RequestAdmission;
 };
@@ -118,7 +118,7 @@ export const createMemoryPool = (
       ),
       maxConcurrentOperations: integerAtLeast(
         "maxConcurrentOperations",
-        value.maxConcurrentOperations ?? 2,
+        value.maxConcurrentOperations ?? options.admission?.capacity() ?? 2,
         1,
       ),
     };

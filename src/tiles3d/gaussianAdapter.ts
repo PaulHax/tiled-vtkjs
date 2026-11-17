@@ -699,6 +699,11 @@ const createManager = (
   let newerPublication = false;
   const idleWaiters = new Set<() => void>();
   let sortAvailability = 0;
+  let releaseSortCapacity: (() => void) | undefined;
+  const freeSortCapacity = (): void => {
+    releaseSortCapacity?.();
+    releaseSortCapacity = undefined;
+  };
   let idleCheckQueued = false;
   const waitingForPreparation = () => dirty || !!allocationJob || !!packing;
   const hasWork = () => waitingForPreparation() || pendingSort || !!publication;
@@ -1675,6 +1680,7 @@ const createManager = (
       },
       dispose() {
         sortCancellation.abort();
+        freeSortCapacity();
         retireBackend();
       },
     },
@@ -1716,6 +1722,7 @@ const createManager = (
         return "retry";
       }
       sortUnavailable = true;
+      freeSortCapacity();
       sortFailure(error);
       return "stop";
     },
@@ -1731,6 +1738,9 @@ const createManager = (
     if (sameSortRanges(sortRanges, ranges)) return;
     forgetOrder();
     sortRanges = ranges;
+    if (ranges.length > 0 && !sortUnavailable)
+      releaseSortCapacity ??= memoryPool.admission.reserveSortCapacity();
+    else freeSortCapacity();
     sortAvailability += 1;
     memoryPool.admission.wake();
     sorter.setScene(ranges, { defer: true });

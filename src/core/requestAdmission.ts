@@ -136,12 +136,6 @@ const systemClock: RequestClock = {
 const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === "AbortError";
 
-const limitsFor = (parallel: number): Record<RequestLane, number> => ({
-  network: parallel,
-  compute: parallel,
-  sort: 1,
-});
-
 type WorkerKind = "copc" | "decode" | "sort";
 type IdleWorker = { readonly idle: () => boolean; readonly retire: () => void };
 
@@ -156,6 +150,10 @@ export type RequestAdmission = {
   run<T>(options: OneShotOptions<T>): Promise<T>;
   wake(): void;
   configure(parallel: number): void;
+  capacity(): number;
+  activeOperations(): number;
+  /** Keep room for one interactive sort while a view has sortable content. */
+  reserveSortCapacity(): () => void;
   queuedOperations(): number;
   canAcquireWorker(kind: WorkerKind, reclaim?: boolean): boolean;
   workerCapacityPinned(kind: WorkerKind): boolean;
@@ -168,30 +166,53 @@ export type RequestAdmission = {
 
 /** One start authority for all owners on the page. Executors report readiness and settlement. */
 export const createRequestAdmission = (parallel = 2): RequestAdmission => {
-  let limits = limitsFor(integerAtLeast("parallel", parallel, 1));
-  const active: Record<RequestLane, number> = {
-    network: 0,
-    compute: 0,
-    sort: 0,
-  };
+  let limit = integerAtLeast("parallel", parallel, 1);
+  let active = 0;
+  let sorting = 0;
+  let sortReservations = 0;
+  let preferSort = true;
   const owners = new Set<PendingOwner>();
   const workers = {
     copc: new Set<{ reclaimable?: IdleWorker }>(),
     decode: new Set<{ reclaimable?: IdleWorker }>(),
     sort: new Set<{ reclaimable?: IdleWorker }>(),
   };
-  const lastGrant = {
-    network: new WeakMap<object, number>(),
-    compute: new WeakMap<object, number>(),
-    sort: new WeakMap<object, number>(),
-  };
+  const backgroundLanes = ["compute", "network"] as const;
+  const sortLane = ["sort"] as const;
+  const lastBackgroundGrant = new WeakMap<object, number>();
+  const lastSortGrant = new WeakMap<object, number>();
   let serial = 0;
   let pumping = false;
   let wakeQueued = false;
 
-  const available = (lane: RequestLane): boolean => active[lane] < limits[lane];
   const charge = (lane: RequestLane, delta: number): void => {
-    active[lane] += delta;
+    active += delta;
+    if (lane === "sort") sorting += delta;
+  };
+
+  const offer = (
+    lanes: readonly RequestLane[],
+    served: WeakMap<object, number>,
+  ): Grant | undefined => {
+    let next: Grant | undefined;
+    let nextAge = Infinity;
+    // A ready decode can free buffered inputs. For equally ranked work in
+    // the same group, finish it before starting another fetch.
+    for (const lane of lanes)
+      for (const owner of owners) {
+        const candidate = owner.offer(lane);
+        if (!candidate) continue;
+        const age = served.get(candidate.group) ?? 0;
+        if (
+          !next ||
+          age < nextAge ||
+          (age === nextAge && candidate.priority < next.priority)
+        ) {
+          next = candidate;
+          nextAge = age;
+        }
+      }
+    return next;
   };
 
   const pump = (): void => {
@@ -201,28 +222,22 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     }
     pumping = true;
     try {
-      for (const lane of ["sort", "compute", "network"] as const) {
-        const served = lastGrant[lane];
-        while (available(lane)) {
-          let next: Grant | undefined;
-          let nextAge = Infinity;
-          for (const owner of owners) {
-            const candidate = owner.offer(lane);
-            if (!candidate) continue;
-            const age = served.get(candidate.group) ?? 0;
-            if (
-              !next ||
-              age < nextAge ||
-              (age === nextAge && candidate.priority < next.priority)
-            ) {
-              next = candidate;
-              nextAge = age;
-            }
-          }
-          if (!next) break;
-          served.set(next.group, ++serial);
-          next.start();
-        }
+      while (active < limit) {
+        const sort = sorting === 0 ? offer(sortLane, lastSortGrant) : undefined;
+        const reserved = sortReservations > 0 && limit > 1 ? 1 : 0;
+        const sortFirst = sort && (limit > 1 || preferSort);
+        const background =
+          !sortFirst && active - sorting < limit - reserved
+            ? offer(backgroundLanes, lastBackgroundGrant)
+            : undefined;
+        const next = background ?? sort;
+        if (!next) break;
+        // With one grant, alternate ready classes. A waiting sort takes the
+        // next turn after background work, and continuous sorts yield in turn.
+        preferSort = next === background;
+        const served = preferSort ? lastBackgroundGrant : lastSortGrant;
+        served.set(next.group, ++serial);
+        next.start();
       }
     } finally {
       pumping = false;
@@ -253,11 +268,6 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     let disposed = false;
     let records = new Map<string, Operation<T>>();
     const running = new Map<string, Operation<T>>();
-    const ownerActive: Record<RequestLane, number> = {
-      network: 0,
-      compute: 0,
-      sort: 0,
-    };
     const failures = new Map<string, FailureRecord>();
     const onChange = (): void => safeCall(() => options.onChange?.());
     const resting = (key: string): boolean =>
@@ -372,7 +382,6 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     ): void => {
       const lane = op.stage.lane;
       running.delete(op.key);
-      ownerActive[lane] -= 1;
       charge(lane, -1);
       op.clearGrace?.();
       op.clearGrace = undefined;
@@ -410,7 +419,6 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       if (op.firstStage) op.attempt += 1;
       op.status = "active";
       running.set(op.key, op);
-      ownerActive[lane] += 1;
       charge(lane, 1);
       onChange();
       try {
@@ -426,7 +434,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
 
     const owner: PendingOwner = {
       offer(lane) {
-        if (ownerActive[lane] >= concurrency) return undefined;
+        if (running.size >= concurrency) return undefined;
         for (const op of records.values()) {
           if (
             op.stage.lane !== lane ||
@@ -626,8 +634,20 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     },
     wake,
     configure(parallel) {
-      limits = limitsFor(integerAtLeast("parallel", parallel, 1));
+      limit = integerAtLeast("parallel", parallel, 1);
       wake();
+    },
+    capacity: () => limit,
+    activeOperations: () => active,
+    reserveSortCapacity() {
+      sortReservations += 1;
+      let held = true;
+      return () => {
+        if (!held) return;
+        held = false;
+        sortReservations -= 1;
+        wake();
+      };
     },
     queuedOperations: () =>
       [...owners].reduce((sum, owner) => sum + owner.queued(), 0),

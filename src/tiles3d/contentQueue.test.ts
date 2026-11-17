@@ -123,12 +123,18 @@ describe("content queue", () => {
 
     expect(starts).toEqual(["/tiles/a.glb", "/tiles/b.glb"]);
     expect(decode).not.toHaveBeenCalled();
-    expect(pool.stats().workReservedBytes).toBe(14);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 14,
+      activeOperations: 1,
+    });
     queue.setSelection([request("b")]);
     expect(pool.stats().workReservedBytes).toBe(0);
     lateNetwork.resolve(ok(new Uint8Array(20)));
     await flush();
-    expect(pool.stats().workReservedBytes).toBe(20);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 20,
+      activeOperations: 0,
+    });
     decoderReady = true;
     pool.admission.wake();
     await flush();
@@ -140,6 +146,48 @@ describe("content queue", () => {
     });
     queue.dispose();
     memory.close();
+  });
+
+  it("shares remaining capacity with another owner when a decode fills its own limit", async () => {
+    const pool = createMemoryPool({
+      totalBytes: 100,
+      maxConcurrentOperations: 2,
+    });
+    const first = pool.createOwner();
+    const second = pool.createOwner();
+    const decode = deferred<Decoded>();
+    const fetchFirst = vi.fn(async () => ok());
+    const fetchSecond = vi.fn(async () => ok());
+    const firstQueue = makeQueue({
+      memory: first,
+      maxConcurrency: 1,
+      fetch: fetchFirst,
+      decode: (_bytes, item) =>
+        item.id === "a" ? decode.promise : { id: item.id, bytes: 10 },
+    }).queue;
+    const secondQueue = makeQueue({ memory: second, fetch: fetchSecond }).queue;
+    firstQueue.setSelection([request("a"), request("b")]);
+    await flush();
+    expect(fetchFirst).toHaveBeenCalledOnce();
+    expect(pool.stats().activeOperations).toBe(1);
+    secondQueue.setSelection([request("c")]);
+    await flush();
+    expect(fetchSecond).toHaveBeenCalledOnce();
+    expect(secondQueue.snapshot().ready).toBe(1);
+    expect(fetchFirst).toHaveBeenCalledOnce();
+
+    decode.resolve({ id: "a", bytes: 10 });
+    await flush();
+    expect(fetchFirst).toHaveBeenCalledTimes(2);
+    expect(firstQueue.snapshot().ready).toBe(2);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 0,
+      activeOperations: 0,
+    });
+    firstQueue.dispose();
+    secondQueue.dispose();
+    first.close();
+    second.close();
   });
 
   it("aborts active deselected work and never reports it to the consumer", async () => {

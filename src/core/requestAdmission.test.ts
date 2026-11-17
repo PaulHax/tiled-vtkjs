@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createRequestAdmission } from "./requestAdmission";
+import { createRequestAdmission, type RequestLane } from "./requestAdmission";
 import type { RetryPolicy } from "./retryPolicy";
 
 const POLICY: RetryPolicy = {
@@ -316,33 +316,106 @@ describe("page request admission", () => {
     expect(admission.queuedOperations()).toBe(0);
   });
 
-  it("admits sort while network and compute slots are occupied", async () => {
-    const admission = createRequestAdmission(1);
-    const controller = new AbortController();
-    const releases: (() => void)[] = [];
-    const hold = (lane: "compute" | "network") =>
+  const controlledStages = (parallel: number) => {
+    const admission = createRequestAdmission(parallel);
+    const starts: string[] = [];
+    const finish = new Map<string, () => void>();
+    const run = (
+      lane: RequestLane,
+      key: string,
+      controller = new AbortController(),
+    ) =>
       admission.run({
         signal: controller.signal,
         stage: {
           lane,
           start: () =>
-            new Promise<{ value: void }>((resolve) => {
-              releases.push(() => resolve({ value: undefined }));
+            new Promise<{ value: string }>((resolve) => {
+              starts.push(key);
+              finish.set(key, () => resolve({ value: key }));
             }),
         },
       });
+    return {
+      admission,
+      starts,
+      run,
+      finish: (key: string) => finish.get(key)!(),
+    };
+  };
 
-    const network = hold("network");
-    const compute = hold("compute");
-    expect(releases).toHaveLength(2);
-    await expect(
-      admission.run({
-        signal: controller.signal,
-        stage: { lane: "sort", start: () => ({ value: "sorted" }) },
-      }),
-    ).resolves.toBe("sorted");
-    for (const release of releases) release();
-    await Promise.all([network, compute]);
+  it("caps overlapping work of different lanes and owners, including canceled work", async () => {
+    const { admission, starts, run, finish } = controlledStages(2);
+    const controller = new AbortController();
+    const network = run("network", "fetch", controller);
+    const cancelled = expect(network).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    const compute = run("compute", "decode");
+    const sort = run("sort", "sort");
+    const next = run("network", "next");
+    controller.abort();
+    await cancelled;
+
+    expect(starts).toEqual(["fetch", "decode"]);
+    expect(admission.activeOperations()).toBe(2);
+    finish("fetch");
+    await settle();
+    expect(starts).toEqual(["fetch", "decode", "sort"]);
+    expect(admission.activeOperations()).toBe(2);
+
+    finish("decode");
+    await compute;
+    expect(starts.at(-1)).toBe("next");
+    finish("sort");
+    finish("next");
+    await Promise.all([sort, next]);
+    expect(admission.activeOperations()).toBe(0);
+  });
+
+  it("keeps one grant for an interactive sort while background work progresses", async () => {
+    const { admission, starts, run, finish } = controlledStages(3);
+    const releaseCapacity = admission.reserveSortCapacity();
+    const network = run("network", "fetch");
+    const compute = run("compute", "decode");
+    const next = run("network", "next");
+    expect(starts).toEqual(["fetch", "decode"]);
+    const sort = run("sort", "sort");
+    expect(starts).toEqual(["fetch", "decode", "sort"]);
+    expect(admission.activeOperations()).toBe(3);
+    finish("sort");
+    await sort;
+    expect(starts.at(-1)).toBe("sort");
+
+    releaseCapacity();
+    await settle();
+    expect(starts.at(-1)).toBe("next");
+    for (const key of ["fetch", "decode", "next"]) finish(key);
+    await Promise.all([network, compute, next]);
+  });
+
+  it("alternates ready sort and background stages with one grant", async () => {
+    const { admission, starts, run, finish } = controlledStages(1);
+    const releaseCapacity = admission.reserveSortCapacity();
+    const network = run("network", "fetch");
+    const decode = run("compute", "decode");
+    const firstSort = run("sort", "sort 1");
+    const secondSort = run("sort", "sort 2");
+    expect(starts).toEqual(["fetch"]);
+    for (const [current, expected] of [
+      ["fetch", "sort 1"],
+      ["sort 1", "decode"],
+      ["decode", "sort 2"],
+    ] as const) {
+      finish(current);
+      await settle();
+      expect(starts.at(-1)).toBe(expected);
+      expect(admission.activeOperations()).toBe(1);
+    }
+    finish("sort 2");
+    await Promise.all([network, decode, firstSort, secondSort]);
+    releaseCapacity();
+    expect(admission.activeOperations()).toBe(0);
   });
 
   it("reclaims idle persistent workers while keeping separate sort headroom", () => {

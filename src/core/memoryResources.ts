@@ -72,7 +72,7 @@ export type MemoryWork = {
   /** Grow or shrink the estimate for all overlapping allocations in this operation. */
   resize(bytes: number): void;
   bytes(): number;
-  /** Transfer finished output into retained ownership and relinquish the work slot. */
+  /** Transfer finished output into retained ownership and relinquish reserved work bytes. */
   commit(buffers: Iterable<ArrayBuffer>, estimatedBytes?: number): MemoryLease;
   /** Call only once the physical operation has settled, including after cancellation. */
   release(): void;
@@ -122,7 +122,7 @@ export type MemoryResourceStats = MemoryResourceOptions & {
   readonly cpuReservedBytes: number;
   readonly rendererBytes: number;
   readonly workReservedBytes: number;
-  /** Physical work reservations, including fetched bytes waiting to decode. */
+  /** Physical stages running under the shared page admission limit. */
   readonly activeOperations: number;
   readonly queuedOperations: number;
   readonly owners: number;
@@ -133,7 +133,7 @@ export type MemoryResourceStats = MemoryResourceOptions & {
 type OwnerEntry = {
   closed: boolean;
   readonly leases: Set<LeaseEntry>;
-  readonly operations: Set<WorkEntry>;
+  readonly reservations: Set<WorkEntry>;
   readonly reclaim?: (domain: MemoryDomain) => void;
 };
 
@@ -170,7 +170,6 @@ export const createMemoryResources = (
   let cpuReserved = 0;
   let renderer = 0;
   let workReserved = 0;
-  let operations = 0;
   let reclaiming = false;
   const owners = new Set<OwnerEntry>();
   const buffers = new Map<ArrayBuffer, { references: number; bytes: number }>();
@@ -178,7 +177,11 @@ export const createMemoryResources = (
   const claimedReplacements = new Map<LeaseEntry, number>();
 
   const retireOwner = (owner: OwnerEntry): void => {
-    if (owner.closed && owner.leases.size === 0 && owner.operations.size === 0)
+    if (
+      owner.closed &&
+      owner.leases.size === 0 &&
+      owner.reservations.size === 0
+    )
       owners.delete(owner);
   };
   const reclaim = (domain: MemoryDomain): void => {
@@ -334,16 +337,14 @@ export const createMemoryResources = (
 
   const startWork = (owner: OwnerEntry, bytes: number): MemoryWork => {
     const entry: WorkEntry = { owner, bytes, released: false };
-    owner.operations.add(entry);
-    operations += 1;
+    owner.reservations.add(entry);
     workReserved += bytes;
     changed();
     const release = (): void => {
       if (entry.released) return;
       entry.released = true;
-      operations -= 1;
       workReserved -= entry.bytes;
-      owner.operations.delete(entry);
+      owner.reservations.delete(entry);
       if (entry.bytes > 0) availabilityRevision += 1;
       retireOwner(owner);
       changed();
@@ -468,7 +469,7 @@ export const createMemoryResources = (
       const owner: OwnerEntry = {
         closed: false,
         leases: new Set(),
-        operations: new Set(),
+        reservations: new Set(),
         reclaim: options.reclaim,
       };
       owners.add(owner);
@@ -552,11 +553,12 @@ export const createMemoryResources = (
     stats(): MemoryResourceStats {
       return {
         ...limits,
+        maxConcurrentOperations: admission.capacity(),
         cpuRetainedBytes: cpuRetained,
         cpuReservedBytes: cpuReserved,
         rendererBytes: renderer,
         workReservedBytes: workReserved,
-        activeOperations: operations,
+        activeOperations: admission.activeOperations(),
         queuedOperations: admission.queuedOperations(),
         owners: owners.size,
         revision,

@@ -180,7 +180,7 @@ describe("createMemoryPool", () => {
     expect(pool.stats()).toMatchObject({ rendererBytes: 0, owners: 0 });
   });
 
-  it("refuses work immediately and retains canceled allocations until physical settlement", () => {
+  it("retains reserved work bytes independently of admission and owner closure", () => {
     const pool = createMemoryPool({ totalBytes: 100, workBytes: 100 });
     const a = pool.createOwner();
     const b = pool.createOwner();
@@ -190,7 +190,7 @@ describe("createMemoryPool", () => {
     signal.abort();
     a.close();
     expect(pool.stats()).toMatchObject({
-      activeOperations: 1,
+      activeOperations: 0,
       queuedOperations: 0,
       workReservedBytes: 80,
       owners: 2,
@@ -201,7 +201,7 @@ describe("createMemoryPool", () => {
     expect(pool.availability()).toBeGreaterThan(before);
     const resumed = b.work(undefined, 40);
     expect(pool.stats()).toMatchObject({
-      activeOperations: 1,
+      activeOperations: 0,
       workReservedBytes: 40,
       owners: 1,
     });

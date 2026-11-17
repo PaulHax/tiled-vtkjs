@@ -10,7 +10,6 @@ it("holds the work reservation until an early body refusal acknowledges cancella
     maxConcurrentOperations: 1,
   });
   const owner = pool.createOwner();
-  const work = await owner.work(undefined, 2);
   let acknowledge!: () => void;
   let cancelling!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -24,16 +23,31 @@ it("holds the work reservation until an early body refusal acknowledges cancella
       });
     },
   });
-  const read = readMemoryResponse(
-    {
-      headers: { get: () => "16" },
-      body,
-      arrayBuffer: async () => {
-        throw new Error("refused body must not be buffered");
+  const read = pool.admission.run({
+    signal: new AbortController().signal,
+    stage: {
+      lane: "network",
+      async start(signal) {
+        const work = owner.work(signal, 2);
+        try {
+          const value = await readMemoryResponse(
+            {
+              headers: { get: () => "16" },
+              body,
+              arrayBuffer: async () => {
+                throw new Error("refused body must not be buffered");
+              },
+            },
+            work,
+            signal,
+          );
+          return { value };
+        } finally {
+          work.release();
+        }
       },
     },
-    work,
-  ).finally(() => work.release());
+  });
   const rejected = expect(read).rejects.toBeInstanceOf(ResourcePolicyError);
   await started;
   owner.close();
