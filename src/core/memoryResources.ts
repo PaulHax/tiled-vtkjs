@@ -4,6 +4,13 @@ import type { RequestAdmission } from "./requestAdmission";
 
 export type MemoryDomain = "cpu" | "renderer" | "work";
 
+export type MemoryRefusalEstimate = {
+  readonly reason: "configured-limit" | "contention" | "transition-unavailable";
+  readonly finalBytes: number;
+  readonly peakBytes: number;
+  readonly wake: "policy" | "availability" | "presentation";
+};
+
 /** A configured accounting refusal, independent of allocation or decode failure. */
 export class ResourcePolicyError extends Error {
   readonly domain: MemoryDomain;
@@ -11,6 +18,7 @@ export class ResourcePolicyError extends Error {
   readonly limitBytes: number;
   readonly retryable: boolean;
   readonly operationBytes?: number;
+  readonly estimate: MemoryRefusalEstimate;
 
   constructor(
     domain: MemoryDomain,
@@ -18,6 +26,7 @@ export class ResourcePolicyError extends Error {
     limitBytes: number,
     retryable = false,
     operationBytes?: number,
+    estimate?: MemoryRefusalEstimate,
   ) {
     super(
       `${domain} memory requires ${requestedBytes} bytes; configured limit is ${limitBytes} bytes`,
@@ -28,6 +37,12 @@ export class ResourcePolicyError extends Error {
     this.limitBytes = limitBytes;
     this.retryable = retryable;
     this.operationBytes = operationBytes;
+    this.estimate = estimate ?? {
+      reason: retryable ? "contention" : "configured-limit",
+      finalBytes: requestedBytes,
+      peakBytes: requestedBytes,
+      wake: retryable ? "availability" : "policy",
+    };
   }
 }
 
@@ -243,6 +258,7 @@ export const createMemoryResources = (
           const next = bytesValue("renderer bytes", bytes);
           if (next > entry.renderer)
             throw new RangeError("renderer reservations may only shrink");
+          if (entry.renderer === next) return;
           renderer -= entry.renderer - next;
           entry.renderer = next;
           availabilityRevision += 1;
@@ -254,17 +270,25 @@ export const createMemoryResources = (
           entry.references -= 1;
           if (entry.references > 0) return;
           entry.released = true;
+          const previousBytes = cpuRetained + cpuReserved + renderer;
+          let releasedCredit = false;
           replaceBuffers(entry, new Set());
           cpuReserved -= entry.cpuReserved;
           renderer -= entry.renderer;
           for (const old of entry.replaces) {
             const remaining = claimedReplacements.get(old)! - 1;
-            if (remaining === 0) claimedReplacements.delete(old);
-            else claimedReplacements.set(old, remaining);
+            if (remaining === 0) {
+              claimedReplacements.delete(old);
+              releasedCredit ||= !old.released;
+            } else claimedReplacements.set(old, remaining);
           }
           owner.leases.delete(entry);
           retireOwner(owner);
-          availabilityRevision += 1;
+          if (
+            releasedCredit ||
+            cpuRetained + cpuReserved + renderer < previousBytes
+          )
+            availabilityRevision += 1;
           changed();
         },
       };
@@ -404,14 +428,31 @@ export const createMemoryResources = (
         finalBytes,
         limits.totalBytes,
         amount <= limits.totalBytes,
+        undefined,
+        {
+          reason:
+            amount <= limits.totalBytes ? "contention" : "configured-limit",
+          finalBytes,
+          peakBytes: renderer + amount,
+          wake: amount <= limits.totalBytes ? "availability" : "policy",
+        },
       );
-    if (renderer + amount > ceiling)
+    if (renderer + amount > ceiling) {
+      const canFitWithCredit = credit() + amount <= ceiling;
       throw new ResourcePolicyError(
         "renderer",
         renderer + amount,
         ceiling,
-        amount <= limits.totalBytes,
+        canFitWithCredit,
+        undefined,
+        {
+          reason: "transition-unavailable",
+          finalBytes,
+          peakBytes: renderer + amount,
+          wake: canFitWithCredit ? "availability" : "policy",
+        },
       );
+    }
     checkCpu(cpu);
     const result = normalized.map((item) =>
       makeLease(owner, item.cpuBytes, item.rendererBytes, old),

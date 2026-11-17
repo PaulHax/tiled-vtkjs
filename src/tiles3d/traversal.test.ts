@@ -259,7 +259,9 @@ describe("traverseTileset", () => {
       },
     );
 
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/fixture/subtrees/0/0/0.subtree" },
+    ]);
     expect(result.desiredTileIds).toEqual([
       "root/0",
       "root/1",
@@ -342,7 +344,9 @@ describe("traverseTileset", () => {
       "root/2",
       "root/3",
     ]);
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/tiles/subtrees/0/0/0.subtree" },
+    ]);
     expect(result.tileById.get("root/3")).toMatchObject({
       geometricError: 8,
       contentUri: "content/1/1/1.glb",
@@ -429,7 +433,10 @@ describe("traverseTileset", () => {
       },
     );
 
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/tiles/subtrees/0/0/0.subtree" },
+      { id: "subtree/2/0/0", url: "/tiles/subtrees/2/0/0.subtree" },
+    ]);
     expect(result.desiredTileIds).toContain("root/0/0");
     expect(result.desiredTileIds).not.toContain("root/0");
     expect(result.requestedTileIds).toContain("root/0/0");

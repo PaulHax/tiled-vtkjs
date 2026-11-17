@@ -9,7 +9,6 @@ import {
   type RequestStage,
 } from "../core/requestAdmission";
 import {
-  resourcePolicyError,
   type MemoryOwner,
   type MemoryLease,
   type MemoryWork,
@@ -19,8 +18,6 @@ import {
   readMemoryResponse,
   type BufferedResponse,
 } from "../core/memoryResponse";
-
-const MAX_EVICTION_HISTORY = 4_096;
 
 export type TileContentRequest = {
   readonly id: string;
@@ -78,7 +75,6 @@ export type ContentQueueSnapshot = {
   readonly cacheHits: number;
   readonly cacheMisses: number;
   readonly cacheEvictions: number;
-  readonly cacheRevisits: number;
   readonly workPending: boolean;
   readonly disposed: boolean;
   readonly entries: readonly ContentQueueEntrySnapshot[];
@@ -112,7 +108,6 @@ export type ContentQueueOptions<T> = {
     request: TileContentRequest,
     error: ResourcePolicyError,
   ) => void;
-  readonly onEvict?: (request: TileContentRequest, content: T) => void;
   readonly onStateChange?: (snapshot: ContentQueueSnapshot) => void;
 };
 
@@ -124,18 +119,16 @@ export type ContentQueueConfiguration = {
 };
 
 export type ContentQueue<T> = {
-  setSelection(
-    requests: readonly TileContentRequest[],
-    options?: { readonly requeueUncached?: ReadonlySet<string> },
-  ): void;
+  setSelection(requests: readonly TileContentRequest[]): void;
+  state(id: string): ContentQueueEntrySnapshot | undefined;
   configure(configuration: ContentQueueConfiguration): void;
   /** Look up decoded content and mark it most recently used. */
   get(id: string): T | undefined;
-  /** Every cached decode, in least-recently-used order. */
+  /** Live decodes held by current demand or by optional retention. */
   contents(): ReadonlyMap<string, T>;
   snapshot(): ContentQueueSnapshot;
   trimCache(bytes: number): void;
-  retryBlocked(availabilityOnly?: boolean): void;
+  retryBlocked(): void;
   dispose(): void;
 };
 
@@ -186,16 +179,15 @@ export class ContentQueueRetryError extends ContentQueueError {
   }
 }
 
-type SelectedEntry = {
-  readonly request: TileContentRequest;
-  readyAttempt?: number;
-};
-
-type CacheEntry<T> = {
-  readonly request: TileContentRequest;
+type Decoded<T> = {
   readonly content: T;
   readonly bytes: number;
   readonly memory?: MemoryLease;
+};
+
+type TileGeneration<T> = {
+  readonly request: TileContentRequest;
+  decoded?: Decoded<T> & { readonly attempt: number };
 };
 
 const normalizeRequest = (request: TileContentRequest): TileContentRequest => {
@@ -246,14 +238,28 @@ export const createContentQueue = <T>(
   }
 
   let disposed = false;
-  let selected = new Map<string, SelectedEntry>();
-  const cache = new Map<string, CacheEntry<T>>();
+  let selected = new Map<string, TileGeneration<T>>();
+  const cache = new Map<string, TileGeneration<T>>();
   let decodedBytes = 0;
   let cacheHits = 0;
   let cacheMisses = 0;
   let cacheEvictions = 0;
-  let cacheRevisits = 0;
-  const previouslyEvicted = new Set<string>();
+  const state = (id: string): ContentQueueEntrySnapshot | undefined => {
+    const tile = selected.get(id);
+    if (!tile) return undefined;
+    const operation = owner.state(id);
+    return {
+      ...tile.request,
+      status: tile.decoded
+        ? "ready"
+        : operation?.status === "active"
+          ? "fetching"
+          : operation?.status === "resting"
+            ? "retrying"
+            : (operation?.status ?? "queued"),
+      attempt: tile.decoded?.attempt ?? operation?.attempt ?? 0,
+    };
+  };
 
   const snapshot = (): ContentQueueSnapshot => {
     const entries: ContentQueueEntrySnapshot[] = [];
@@ -265,19 +271,10 @@ export const createContentQueue = <T>(
       failed: 0,
       blocked: 0,
     };
-    for (const { request, readyAttempt } of selected.values()) {
-      const state = owner.state(request.id);
-      const status =
-        readyAttempt !== undefined
-          ? "ready"
-          : state?.status === "active"
-            ? "fetching"
-            : state?.status === "resting"
-              ? "retrying"
-              : (state?.status ?? "queued");
-      const attempt = readyAttempt ?? state?.attempt ?? 0;
-      entries.push(Object.freeze({ ...request, status, attempt }));
-      counts[status] += 1;
+    for (const id of selected.keys()) {
+      const entry = state(id)!;
+      entries.push(Object.freeze(entry));
+      counts[entry.status] += 1;
     }
     const { queued, retrying, fetching, ready, failed, blocked } = counts;
     return Object.freeze({
@@ -297,7 +294,6 @@ export const createContentQueue = <T>(
       cacheHits,
       cacheMisses,
       cacheEvictions,
-      cacheRevisits,
       workPending: queued + retrying + fetching > 0,
       disposed,
       entries: Object.freeze(entries),
@@ -310,59 +306,34 @@ export const createContentQueue = <T>(
     if (onStateChange) safeCall(() => onStateChange(snapshot()));
   };
 
-  const evict = (id: string): boolean => {
-    const entry = cache.get(id);
-    if (!entry) return false;
+  const releaseDecoded = (tile: TileGeneration<T>): void => {
+    tile.decoded?.memory?.release();
+    tile.decoded = undefined;
+  };
+
+  const evict = (id: string): void => {
+    const tile = cache.get(id)!;
+    const decoded = tile.decoded!;
     cache.delete(id);
-    entry.memory?.release();
-    decodedBytes -= entry.bytes;
+    decodedBytes -= decoded.bytes;
     cacheEvictions += 1;
-    previouslyEvicted.add(id);
-    while (previouslyEvicted.size > MAX_EVICTION_HISTORY) {
-      const oldest = previouslyEvicted.values().next();
-      if (oldest.done) break;
-      previouslyEvicted.delete(oldest.value);
-    }
-    safeCall(() => options.onEvict?.(entry.request, entry.content));
-    return true;
+    if (selected.get(id) !== tile) releaseDecoded(tile);
   };
 
-  const enforceCacheBudget = (): void => {
-    while (decodedBytes > maxDecodedBytes) {
-      const oldest = cache.keys().next();
-      if (oldest.done === true) break;
-      evict(oldest.value);
+  const enforceCacheBudget = (budget = maxDecodedBytes): void => {
+    for (const id of cache.keys()) {
+      if (budget > 0 && decodedBytes <= budget) break;
+      evict(id);
     }
-  };
-
-  const putCache = (
-    request: TileContentRequest,
-    content: T,
-    bytes: number,
-    memory?: MemoryLease,
-  ): void => {
-    evict(request.id);
-    // Oversize content is still delivered to the submission consumer, but is
-    // never transiently charged to the CPU cache. Existing LRU entries remain
-    // intact and the uncached value never produces an eviction notification.
-    if (bytes > maxDecodedBytes) return;
-    cache.set(request.id, { request, content, bytes, memory });
-    decodedBytes += bytes;
-    enforceCacheBudget();
   };
 
   const clearCache = (): void => {
     for (const id of cache.keys()) evict(id);
   };
 
-  type Output = {
-    readonly content: T;
-    readonly bytes: number;
-    readonly memory?: MemoryLease;
-  };
   const admission =
     options.memory?.admission ?? createRequestAdmission(maxConcurrency);
-  const owner = admission.createOwner<Output>({
+  const owner = admission.createOwner<Decoded<T>>({
     group: options.memory,
     priority: options.priority,
     availability: options.memory?.availability,
@@ -390,7 +361,7 @@ export const createContentQueue = <T>(
         "retry policy or timer scheduling failed",
         { cause },
       ),
-    operation(id): RequestStage<Output> {
+    operation(id): RequestStage<Decoded<T>> {
       const { request } = selected.get(id)!;
       const operationRevision = revision;
       const operationGeneration = configGeneration;
@@ -481,31 +452,31 @@ export const createContentQueue = <T>(
       };
     },
     onLoaded(id, output, attempt) {
-      const entry = selected.get(id)!;
-      try {
-        putCache(entry.request, output.content, output.bytes, output.memory);
-        entry.readyAttempt = attempt;
-        safeCall(() => options.onContent?.(entry.request, output.content));
-      } finally {
-        if (cache.get(id)?.memory !== output.memory) output.memory?.release();
+      const tile = selected.get(id)!;
+      tile.decoded = { ...output, attempt };
+      if (maxDecodedBytes > 0 && output.bytes <= maxDecodedBytes) {
+        cache.set(id, tile);
+        decodedBytes += output.bytes;
+        enforceCacheBudget();
       }
+      safeCall(() => options.onContent?.(tile.request, output.content));
     },
     onDiscarded: (output) => output.memory?.release(),
+    onBlocked(id, refusal) {
+      options.onPolicyRefusal?.(selected.get(id)!.request, refusal);
+    },
     onFailed(id, error) {
       const item = selected.get(id)!.request;
-      const refusal = resourcePolicyError(error);
-      if (refusal) options.onPolicyRefusal?.(item, refusal);
-      else
-        options.onError?.(
-          item,
-          error instanceof Error
-            ? error
-            : new ContentQueueError(
-                "ContentQueueError",
-                item,
-                "operation failed with a non-Error value",
-              ),
-        );
+      options.onError?.(
+        item,
+        error instanceof Error
+          ? error
+          : new ContentQueueError(
+              "ContentQueueError",
+              item,
+              "operation failed with a non-Error value",
+            ),
+      );
     },
     onChange: emit,
   });
@@ -513,24 +484,22 @@ export const createContentQueue = <T>(
   const requestMissing = (): void =>
     owner.want(
       [...selected.values()]
-        .filter((entry) => entry.readyAttempt === undefined)
+        .filter((tile) => !tile.decoded)
         .map(({ request }) => request.id),
     );
 
   return {
     trimCache(bytes) {
-      for (const id of cache.keys()) {
-        if (decodedBytes <= bytes) break;
-        evict(id);
-      }
+      enforceCacheBudget(bytes);
       emit();
     },
-    retryBlocked(availabilityOnly = false) {
+    state,
+    retryBlocked() {
       if (disposed) return;
-      owner.retryBlocked(availabilityOnly);
+      owner.retryBlocked();
       emit();
     },
-    setSelection(requests, selectionOptions) {
+    setSelection(requests) {
       if (disposed) throw new Error("content queue is disposed");
       const normalized = new Map<string, TileContentRequest>();
       for (const raw of requests) {
@@ -550,21 +519,11 @@ export const createContentQueue = <T>(
           throw new Error(`conflicting content request URL for ${id}`);
         }
       }
-      const nextSelection = new Map<string, SelectedEntry>();
-      const hits: CacheEntry<T>[] = [];
+      const nextSelection = new Map<string, TileGeneration<T>>();
+      const hits: TileGeneration<T>[] = [];
       for (const item of normalized.values()) {
         const retained = selected.get(item.id);
-        // Delivery is distinct from cache residency. A consumer that needs
-        // an evicted payload again can explicitly reopen only that request,
-        // without cancelling unrelated work or retrying cached/active jobs.
-        if (
-          retained &&
-          !(
-            retained.readyAttempt !== undefined &&
-            !cache.has(item.id) &&
-            selectionOptions?.requeueUncached?.has(item.id)
-          )
-        ) {
+        if (retained) {
           nextSelection.set(item.id, retained);
           continue;
         }
@@ -573,11 +532,6 @@ export const createContentQueue = <T>(
           evict(item.id);
           cached = undefined;
         }
-        const entry: SelectedEntry = {
-          request: item,
-          readyAttempt: cached ? 0 : undefined,
-        };
-        nextSelection.set(item.id, entry);
         if (cached) {
           cacheHits += 1;
           cache.delete(item.id);
@@ -585,14 +539,21 @@ export const createContentQueue = <T>(
           hits.push(cached);
         } else {
           cacheMisses += 1;
-          if (previouslyEvicted.delete(item.id)) cacheRevisits += 1;
         }
+        nextSelection.set(item.id, cached ?? { request: item });
       }
+      const previous = selected;
       selected = nextSelection;
+      for (const [id, tile] of previous) {
+        if (!selected.has(id) && !cache.has(id)) releaseDecoded(tile);
+      }
       requestMissing();
-      for (const hit of hits)
-        if (selected.has(hit.request.id) && cache.get(hit.request.id) === hit)
-          safeCall(() => options.onContent?.(hit.request, hit.content));
+      for (const hit of hits) {
+        if (selected.get(hit.request.id) === hit && hit.decoded)
+          safeCall(() =>
+            options.onContent?.(hit.request, hit.decoded!.content),
+          );
+      }
       emit();
     },
 
@@ -630,10 +591,9 @@ export const createContentQueue = <T>(
       if (changedGeneration) {
         owner.reset();
         clearCache();
-        previouslyEvicted.clear();
+        for (const tile of selected.values()) releaseDecoded(tile);
         revision = nextRevision;
         configGeneration = nextGeneration;
-        for (const entry of selected.values()) entry.readyAttempt = undefined;
       } else {
         enforceCacheBudget();
       }
@@ -644,15 +604,22 @@ export const createContentQueue = <T>(
     },
 
     get(id) {
-      const entry = cache.get(id);
-      if (!entry) return undefined;
-      cache.delete(id);
-      cache.set(id, entry);
-      return entry.content;
+      const cached = cache.get(id);
+      if (cached) {
+        cache.delete(id);
+        cache.set(id, cached);
+      }
+      return (selected.get(id) ?? cached)?.decoded?.content;
     },
 
-    contents: () =>
-      new Map([...cache].map(([id, entry]) => [id, entry.content] as const)),
+    contents() {
+      const live = new Map<string, T>();
+      for (const [id, tile] of cache) live.set(id, tile.decoded!.content);
+      for (const [id, tile] of selected) {
+        if (tile.decoded) live.set(id, tile.decoded.content);
+      }
+      return live;
+    },
 
     snapshot,
 
@@ -660,9 +627,9 @@ export const createContentQueue = <T>(
       if (disposed) return;
       disposed = true;
       owner.dispose();
-      selected.clear();
       clearCache();
-      previouslyEvicted.clear();
+      for (const tile of selected.values()) releaseDecoded(tile);
+      selected.clear();
       emit();
     },
   };

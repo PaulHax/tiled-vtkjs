@@ -127,7 +127,10 @@ const field = (count: number, mixed = false): DecodedTileContent => ({
   ],
 });
 
-const fixture = (createSortBackend?: () => GaussianSortBackend) => {
+const fixture = (
+  createSortBackend?: () => GaussianSortBackend,
+  maximumVisibleSplats?: number,
+) => {
   const actors = new Set<any>();
   const renderer = {
     addActor(actor: any) {
@@ -154,6 +157,7 @@ const fixture = (createSortBackend?: () => GaussianSortBackend) => {
   let held = false;
   const pending: (() => void)[] = [];
   const factory = createGaussianContentAdapterFactory({
+    maximumVisibleSplats,
     createSortBackend:
       createSortBackend ??
       (() => ({
@@ -742,14 +746,23 @@ describe("Gaussian admission ownership", () => {
       );
       await f.settle();
       f.pool.configure({ totalBytes: bytes * 2, transitionBytes: bytes });
-      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
-        "budget-blocked",
-      );
+      expect(
+        f.adapter.submitTile("b", meshOnly(), undefined, ["parent"]),
+      ).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "renderer",
+          estimate: {
+            reason: "contention",
+            wake: "availability",
+            finalBytes: bytes * 3,
+            peakBytes: bytes * 3,
+          },
+        },
+      });
       await f.settle();
       expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
       expect(f.pool.stats().rendererBytes).toBe(bytes * 2);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
       expect(f.errors).toEqual([]);
       f.adapter.retireTile("a");
       await f.settle();
@@ -1150,8 +1163,6 @@ describe("Gaussian admission ownership", () => {
       expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
       expect(f.pool.stats().rendererBytes).toBe(480);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
       f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
       f.adapter.clearRequiredBytes();
       await f.settle();
@@ -1212,8 +1223,6 @@ describe("Gaussian admission ownership", () => {
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
       expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
       expect(f.pool.stats().rendererBytes).toBe(960);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
       f.pool.configure({ totalBytes: 1440 });
       f.adapter.clearRequiredBytes();
       await f.settle();
@@ -1310,6 +1319,55 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("releases a failed mixed realization and keeps the accepted parent", async () => {
+    const f = fixture();
+    try {
+      await f.show("parent", 2);
+      const before = f.pool.stats().rendererBytes;
+      f.renderer.addActor = () => {
+        throw new Error("mesh attachment failed");
+      };
+      expect(
+        f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("child")).toBe("failed");
+      expect(f.adapter.stats()).toMatchObject({
+        drawnTileIds: ["parent"],
+        pendingTiles: 0,
+      });
+      expect(f.pool.stats().rendererBytes).toBe(before);
+      expect(f.errors).toEqual([new Error("mesh attachment failed")]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("refuses an over-count representation independently of renderer memory", async () => {
+    const f = fixture(undefined, 2);
+    try {
+      await f.show("parent", 2);
+      const before = f.pool.stats().rendererBytes;
+      expect(
+        f.adapter.submitTile("child", field(3), undefined, ["parent"]),
+      ).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "count",
+          finalCount: 3,
+          peakCount: 5,
+          limitCount: 2,
+          wake: "selection",
+        },
+      });
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.pool.stats().rendererBytes).toBe(before);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("preserves coverage on transition refusal and recovers when overlap capacity increases", async () => {
     const f = fixture();
     try {
@@ -1327,7 +1385,18 @@ describe("Gaussian admission ownership", () => {
           },
           ["detail"],
         );
-      expect(submit()).toBe("budget-blocked");
+      expect(submit()).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "renderer",
+          estimate: {
+            reason: "transition-unavailable",
+            wake: "policy",
+            finalBytes: 60,
+            peakBytes: 540,
+          },
+        },
+      });
       await f.settle();
       expect(f.pool.stats().rendererBytes).toBe(480);
       expect(f.pool.stats().cpuRetainedBytes).toBe(baseline);

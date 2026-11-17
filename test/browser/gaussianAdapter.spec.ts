@@ -775,7 +775,7 @@ describe("coherent mixed presentations and ownership", () => {
         expect(restored.stats.queue.workPending).toBe(false);
         expect(
           restored.fetches.filter((url) => url.endsWith("/child-0.glb")),
-        ).toHaveLength(evict ? 2 : 1);
+        ).toHaveLength(1);
         expect(
           restored.fetches.filter((url) => url.endsWith("/child-1.glb")),
         ).toHaveLength(1);
@@ -1313,7 +1313,9 @@ describe("coherent mixed presentations and ownership", () => {
           queue: { queuedJobs: 0 },
         });
         expect((await pixels(page)).data).toEqual(before.data);
-        expect(await api(page, "queueDemand", gaussian)).toBe("budget-blocked");
+        expect(await api(page, "queueDemand", gaussian)).toMatchObject({
+          status: "blocked",
+        });
         const refused = await api(page, "demandState");
         expect(refused.required).toBeGreaterThan(
           refused.renderer.residentBytes,
@@ -1356,7 +1358,9 @@ describe("coherent mixed presentations and ownership", () => {
       await api(page, "raiseDemand", 200);
       const before = await pixels(page);
       expect(await api(page, "queueDemand", false)).toBe("queued");
-      expect(await api(page, "additionalGaussian")).toBe("budget-blocked");
+      expect(await api(page, "additionalGaussian")).toMatchObject({
+        status: "blocked",
+      });
       const pending = await api(page, "demandState");
       expect(pending.renderer.pendingTiles).toBe(2);
       expect(pending.queue.queuedJobs).toBeGreaterThan(0);
@@ -1404,7 +1408,9 @@ describe("coherent mixed presentations and ownership", () => {
       await api(page, "raiseDemand", 200);
       const before = await pixels(page);
       expect(await api(page, "queueDemand", false)).toBe("queued");
-      expect(await api(page, "replacementGaussian")).toBe("budget-blocked");
+      expect(await api(page, "replacementGaussian")).toMatchObject({
+        status: "blocked",
+      });
       await api(page, "settle");
       const refusals = await api(page, "admissionRefusals");
       expect(refusals).toHaveLength(1);

@@ -32,16 +32,18 @@ import type {
   DecodedMeshTileContent,
   DecodedTileContent,
 } from "./decode";
+import { TileRenderingProfileError } from "./contentAdapter";
 import type {
   TileContentAdapter,
   TileContentAdapterFactory,
   TileContentAdapterOptions,
+  TileSubmissionOutcome,
+  TileSubmissionRefusal,
 } from "./contentAdapter";
 import {
   createMeshAdapter,
   type MeshAdapter,
   type MeshAdapterStats,
-  type MeshSubmitOutcome,
 } from "./meshAdapter";
 import { collectContentBuffers } from "./decode/transfer";
 import {
@@ -185,14 +187,7 @@ export type GaussianAlphaPass = {
   delete(): void;
 };
 
-export class GaussianResourceLimitError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "GaussianResourceLimitError";
-  }
-}
-
-export class GaussianRenderingProfileError extends Error {
+export class GaussianRenderingProfileError extends TileRenderingProfileError {
   constructor(message: string) {
     super(message);
     this.name = "GaussianRenderingProfileError";
@@ -920,7 +915,10 @@ const createManager = (
     for (const owner of owners) safeCall(owner.options.onPresentationChange);
     notify();
   };
-  const refuse = (error: ResourcePolicyError, tiles: readonly Tile[]): void => {
+  const refuse = (
+    error: TileSubmissionRefusal,
+    tiles: readonly Tile[],
+  ): void => {
     const groups = new Map<Owner, string[]>();
     for (const tile of tiles) {
       const ids = groups.get(tile.owner) ?? [];
@@ -2110,31 +2108,17 @@ const createManager = (
               if (bytes > owner.ceiling)
                 throw new ResourcePolicyError("renderer", bytes, owner.ceiling);
             }
-            let lease: MemoryLease;
-            try {
-              lease = memory.reserveRenderer(capacity * gpuBytesPerTuple, {
-                cpuBytes: capacity * 60,
-                replacing:
-                  displayedMemory &&
-                  displayedMemory !== arenaMemory &&
-                  displayedMemory !== realizedMemory
-                    ? [displayedMemory]
-                    : [],
-              });
-            } catch (error) {
-              // A composite mesh group can still own the displayed atlas's
-              // replacement credit. Extra presentation storage must then fit
-              // without spending that same credit a second time.
-              if (
-                !(error instanceof Error) ||
-                error.message !==
-                  "replacement must own unclaimed live allocations"
-              )
-                throw error;
-              lease = memory.reserveRenderer(capacity * gpuBytesPerTuple, {
-                cpuBytes: capacity * 60,
-              });
-            }
+            const replacement =
+              displayedMemory &&
+              displayedMemory !== arenaMemory &&
+              displayedMemory !== realizedMemory &&
+              memory.replacementAvailable(displayedMemory)
+                ? [displayedMemory]
+                : [];
+            const lease = memory.reserveRenderer(capacity * gpuBytesPerTuple, {
+              cpuBytes: capacity * 60,
+              replacing: replacement,
+            });
             try {
               const prepared = makeStorage(selected, null, selectedArena);
               lease.setCpu(
@@ -2180,10 +2164,19 @@ const createManager = (
         (sum, primitive) => sum + primitive.count,
         0,
       );
-      if (visible > maximum)
-        throw new GaussianResourceLimitError(
-          `visible Gaussian representation contains ${visible} splats, exceeding the ${maximum}-splat limit; choose a coarser tileset representation`,
-        );
+      if (visible > maximum) {
+        const refusal = {
+          domain: "count",
+          finalCount: visible,
+          peakCount: visible,
+          limitCount: maximum,
+          reason: "count-limit",
+          wake: "selection",
+        } as const;
+        for (const owner of owners)
+          safeCall(() => owner.options.onPolicyRefusal?.(refusal));
+        return;
+      }
       const ranges: GaussianSortRange[] = primitives.map((packed) => ({
         id: packed.id,
         generation: packed.tile.generation,
@@ -2244,19 +2237,15 @@ const createManager = (
       sortTarget = null;
       setSortScene([]);
       const policy = resourcePolicyError(error);
-      if (policy)
-        refuse(
-          policy,
-          [...owners].flatMap((owner) =>
-            [...owner.tiles.values()].filter((tile) => !tile.submitted),
-          ),
-        );
-      for (const owner of owners)
-        for (const tile of owner.tiles.values())
-          if (!tile.submitted) {
-            if (!resourcePolicyError(error)) owner.failed.add(tile.id);
-            dropTile(owner, tile.id);
-          }
+      const incomplete = [...owners].flatMap((owner) =>
+        [...owner.tiles.values()].filter((tile) => !tile.submitted),
+      );
+      if (policy) refuse(policy, incomplete);
+      for (const tile of incomplete)
+        if (tile.owner.tiles.get(tile.id) === tile)
+          dropTile(tile.owner, tile.id);
+      if (!policy)
+        for (const tile of incomplete) tile.owner.failed.add(tile.id);
       report(error);
     } finally {
       wakeIdle();
@@ -2446,6 +2435,24 @@ const createManager = (
           ...options,
           memory,
           retainReplacements: true,
+          onError(error) {
+            queueMicrotask(() => {
+              if (owner.disposed) return;
+              // A failed mesh group also owns Gaussian ranges and source
+              // leases in the composite realization.
+              const failed = new Set<Tile>();
+              for (const tile of owner.tiles.values())
+                if (
+                  !tile.submitted &&
+                  owner.mesh.tileState(tile.id) === "failed"
+                )
+                  for (const member of tile.group) failed.add(member);
+              for (const tile of failed)
+                if (owner.tiles.get(tile.id) === tile) dropTile(owner, tile.id);
+              for (const tile of failed) owner.failed.add(tile.id);
+              safeCall(() => options.onError?.(error));
+            });
+          },
           ...(getOpenGLRenderWindow ? { getOpenGLRenderWindow } : {}),
         }),
         tiles: new Map(),
@@ -2518,7 +2525,7 @@ const createManager = (
           onSubmitted?: () => void;
         }[],
         replacementIds: readonly string[],
-      ): MeshSubmitOutcome => {
+      ): TileSubmissionOutcome => {
         if (disposed || owner.disposed || !entries.length) return "failed";
         const ids = new Set(entries.map((entry) => entry.id));
         if (
@@ -2685,31 +2692,63 @@ const createManager = (
             [...owner.tiles.values()]
               .filter((tile) => replacements.has(tile.id))
               .reduce((sum, tile) => sum + tile.meshBytes, 0);
-          if (
-            finalBytes > owner.ceiling ||
-            residentCount + additionalCount - replacedCount > maximum ||
-            residentCount + additionalCount > maximum * 2
-          ) {
+          const finalCount = residentCount + additionalCount - replacedCount;
+          const peakCount = residentCount + additionalCount;
+          if (finalCount > maximum || peakCount > maximum * 2) {
+            return {
+              status: "blocked",
+              refusal: {
+                domain: "count",
+                finalCount,
+                peakCount,
+                limitCount: finalCount > maximum ? maximum : maximum * 2,
+                reason: "count-limit",
+                wake: "selection",
+              },
+            };
+          }
+          const peakBytes =
+            ownerChargeFor(owner) +
+            (compactReplacement || projectedCapacity > arenaCapacity
+              ? fullGaussianBytes
+              : 0) +
+            group.reduce((sum, tile) => sum + tile.meshBytes, 0);
+          if (finalBytes > owner.ceiling) {
             owner.requiredBytes = Math.max(owner.requiredBytes, finalBytes);
-            safeCall(() =>
-              options.onPolicyRefusal?.(
-                new ResourcePolicyError("renderer", finalBytes, owner.ceiling),
+            return {
+              status: "blocked",
+              refusal: new ResourcePolicyError(
+                "renderer",
+                finalBytes,
+                owner.ceiling,
+                false,
+                undefined,
+                {
+                  reason: "configured-limit",
+                  finalBytes,
+                  peakBytes,
+                  wake: "policy",
+                },
               ),
-            );
-            return "budget-blocked";
+            };
           }
           if (arenaMemory && arenaMemory !== displayedMemory && pendingSort) {
-            safeCall(() =>
-              options.onPolicyRefusal?.(
-                new ResourcePolicyError(
-                  "renderer",
+            return {
+              status: "blocked",
+              refusal: new ResourcePolicyError(
+                "renderer",
+                peakBytes,
+                memoryPool.stats().totalBytes,
+                true,
+                undefined,
+                {
+                  reason: "transition-unavailable",
                   finalBytes,
-                  memoryPool.stats().totalBytes,
-                  true,
-                ),
+                  peakBytes,
+                  wake: "presentation",
+                },
               ),
-            );
-            return "budget-blocked";
+            };
           }
           const cancelled = cancelMeshUploads(
             Math.max(0, owner.ceiling - gaussianBytes),
@@ -2722,13 +2761,16 @@ const createManager = (
               required,
               owner.ceiling,
               true,
+              undefined,
+              {
+                reason: "contention",
+                finalBytes,
+                peakBytes,
+                wake: "availability",
+              },
             );
-            safeCall(() =>
-              options.onAdmissionRefusal
-                ? options.onAdmissionRefusal(cancelled, error)
-                : options.onPolicyRefusal?.(error),
-            );
-            return "budget-blocked";
+            safeCall(() => options.onAdmissionRefusal?.(cancelled, error));
+            return { status: "blocked", refusal: error };
           }
           for (const tile of group) {
             tile.sourceMemory = (options.memory ?? memory).retain([
@@ -2780,7 +2822,11 @@ const createManager = (
               reserved.slice(0, meshEntries.length),
             );
             if (outcome !== "queued") {
-              for (const admitted of group) dropTile(owner, admitted.id);
+              for (const admitted of group) {
+                if (owner.tiles.get(admitted.id) === admitted)
+                  dropTile(owner, admitted.id);
+                if (outcome === "failed") owner.failed.add(admitted.id);
+              }
               rollbackReservations();
               return outcome;
             }
@@ -2802,12 +2848,9 @@ const createManager = (
           if (!policy) for (const entry of entries) owner.failed.add(entry.id);
           for (const tile of group)
             if (owner.tiles.has(tile.id)) dropTile(owner, tile.id);
-          safeCall(() =>
-            policy
-              ? options.onPolicyRefusal?.(policy)
-              : options.onError?.(error),
-          );
-          return policy ? "budget-blocked" : "failed";
+          if (policy) return { status: "blocked", refusal: policy };
+          safeCall(() => options.onError?.(error));
+          return "failed";
         }
       };
       return {

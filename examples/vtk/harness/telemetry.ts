@@ -153,7 +153,6 @@ const memberSnapshot = (
             cacheHits: stats.queue.cacheHits,
             cacheMisses: stats.queue.cacheMisses,
             cacheEvictions: stats.queue.cacheEvictions,
-            cacheRevisits: stats.queue.cacheRevisits,
             workPending: stats.queue.workPending,
           },
     decode: stats.decode ?? null,

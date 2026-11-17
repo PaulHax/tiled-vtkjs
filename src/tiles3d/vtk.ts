@@ -3,7 +3,6 @@ export { createMeshContentAdapter } from "./meshContentAdapter";
 export {
   createGaussianAlphaPass,
   createGaussianContentAdapterFactory,
-  GaussianResourceLimitError,
   GaussianRenderingProfileError,
   type GaussianContentAdapterFactory,
   type GaussianContentAdapterFactoryOptions,
@@ -16,6 +15,8 @@ export {
   type TileContentAdapterFactory,
   type TileContentAdapterOptions,
   type TileContentAdapterStats,
+  type TileSubmissionOutcome,
+  type TileSubmissionRefusal,
 } from "./contentAdapter";
 export {
   createMeshAdapter,

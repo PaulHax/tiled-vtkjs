@@ -9,16 +9,31 @@ import type {
   MeshAdapter,
   MeshAdapterOptions,
   MeshAdapterStats,
-  MeshSubmitOutcome,
 } from "./meshAdapter";
 import type { SubmittedMeshTile } from "./meshPicking";
+
+export type TileCountLimit = {
+  readonly domain: "count";
+  readonly finalCount: number;
+  readonly peakCount: number;
+  readonly limitCount: number;
+  readonly reason: "count-limit";
+  readonly wake: "selection";
+};
+
+export type TileSubmissionRefusal = ResourcePolicyError | TileCountLimit;
+export type TileSubmissionOutcome =
+  | "queued"
+  | "failed"
+  | { readonly status: "blocked"; readonly refusal: TileSubmissionRefusal };
 
 export type TileContentAdapterOptions = MeshAdapterOptions & {
   readonly memoryPool?: MemoryPool;
   readonly onPresentationChange?: () => void;
+  readonly onPolicyRefusal?: (refusal: TileSubmissionRefusal) => void;
   readonly onAdmissionRefusal?: (
     ids: readonly string[],
-    error: ResourcePolicyError,
+    error: TileSubmissionRefusal,
   ) => void;
 };
 export type TileContentAdapterStats = MeshAdapterStats;
@@ -45,7 +60,7 @@ export type TileContentAdapter = Omit<
     content: DecodedTileContent,
     onSubmitted?: () => void,
     replacementIds?: readonly string[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
   submitTileGroup(
     entries: readonly {
       readonly id: string;
@@ -53,7 +68,7 @@ export type TileContentAdapter = Omit<
       readonly onSubmitted?: () => void;
     }[],
     replacementIds: readonly string[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
   pickableMeshTiles(): readonly SubmittedMeshTile[];
 };
 
@@ -62,7 +77,9 @@ export type TileContentAdapterFactory = (
 ) => TileContentAdapter;
 
 /** The selected renderer cannot realize this decoded content profile. */
-export class TileContentRealizationError extends Error {
+export class TileRenderingProfileError extends Error {}
+
+export class TileContentRealizationError extends TileRenderingProfileError {
   readonly tileId: string;
   readonly primitiveKind: string;
 

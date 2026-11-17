@@ -62,7 +62,7 @@ type RequestOwner = {
   reset(): void;
   dispose(): void;
   setConcurrency(limit: number): void;
-  retryBlocked(availabilityOnly?: boolean): void;
+  retryBlocked(): void;
   state(key: string): RequestState | undefined;
   physicalCount(): number;
   resting(key: string): boolean;
@@ -89,6 +89,7 @@ type OwnerOptions<T> = {
   readonly onLoaded: (key: string, value: T, attempt: number) => void;
   readonly onDiscarded?: (value: T) => void;
   readonly onFailed: (key: string, error: unknown) => void;
+  readonly onBlocked?: (key: string, refusal: ResourcePolicyError) => void;
   readonly onChange?: () => void;
 };
 
@@ -314,7 +315,9 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
         op.status = "blocked";
         op.refusal = refusal;
         op.availability = options.availability?.();
-        if (!refusal.retryable || op.availability === undefined)
+        if (options.onBlocked)
+          safeCall(() => options.onBlocked?.(key, refusal));
+        else if (!refusal.retryable || op.availability === undefined)
           safeCall(() => options.onFailed(key, refusal));
         return;
       }
@@ -540,17 +543,14 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
         concurrency = limit;
         pump();
       },
-      retryBlocked(availabilityOnly = false) {
+      retryBlocked() {
         for (const op of records.values())
-          if (
-            op.status === "blocked" &&
-            (!availabilityOnly || op.refusal?.retryable)
-          ) {
+          if (op.status === "blocked") {
             // Temporary contention wakes from the availability revision that refused it.
             if (
               op.refusal?.retryable &&
               op.availability !== undefined &&
-              (availabilityOnly || options.canRetry?.(op.refusal) === false)
+              options.canRetry?.(op.refusal) === false
             )
               continue;
             op.status = "queued";

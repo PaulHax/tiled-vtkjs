@@ -1,3 +1,4 @@
+import type { TileSubmissionOutcome } from "./contentAdapter";
 /** vtk.js-only realization of renderer-neutral decoded mesh tiles. */
 
 import vtkDataArray from "@kitware/vtk.js/Common/Core/DataArray";
@@ -67,7 +68,6 @@ export type MeshAdapterOptions = {
   readonly memory?: MemoryOwner;
   /** Composite content retires replacements after its complete presentation is accepted. */
   readonly retainReplacements?: boolean;
-  readonly onPolicyRefusal?: (error: ResourcePolicyError) => void;
 };
 
 export type MeshAdapterStats = {
@@ -117,8 +117,6 @@ export type MeshAdapterStats = {
 };
 
 export type MeshTileState = "absent" | "queued" | "submitted" | "failed";
-export type MeshSubmitOutcome = "queued" | "budget-blocked" | "failed";
-
 export type MeshAdapter = {
   resourcePlan(content: DecodedMeshTileContent): {
     rendererBytes: number;
@@ -134,7 +132,7 @@ export type MeshAdapter = {
     content: DecodedMeshTileContent,
     onSubmitted?: () => void,
     replacementIds?: readonly string[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
   submitTileGroup(
     entries: readonly {
       readonly id: string;
@@ -143,7 +141,7 @@ export type MeshAdapter = {
     }[],
     replacementIds: readonly string[],
     reservations?: readonly MemoryLease[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
   cancelTile(id: string): boolean;
   retireTile(id: string): boolean;
   setDrawnTiles(ids: readonly string[]): void;
@@ -849,24 +847,30 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     }
   };
 
-  const finish = (entry: PendingTile): void => {
-    if (entry.cancelled || disposed || pending.get(entry.id) !== entry) return;
-    attach(entry.resources);
+  const admitPending = (entry: PendingTile): void => {
     dropPending(entry);
     entry.sourceMemory?.release();
     admit(entry.id, entry.resources);
+    for (const id of entry.replacementIds) {
+      if (replacementClaims.get(id) === entry.id) replacementClaims.delete(id);
+    }
     workRevision += 1;
-    options.scheduleRender();
+  };
+
+  const notifySubmitted = (entry: PendingTile): void => {
     try {
       entry.onSubmitted?.();
     } catch (error) {
       safeCall(() => options.onError?.(error));
-    } finally {
-      for (const id of entry.replacementIds) {
-        if (replacementClaims.get(id) === entry.id)
-          replacementClaims.delete(id);
-      }
     }
+  };
+
+  const finish = (entry: PendingTile): void => {
+    if (entry.cancelled || disposed || pending.get(entry.id) !== entry) return;
+    attach(entry.resources);
+    admitPending(entry);
+    options.scheduleRender();
+    notifySubmitted(entry);
   };
 
   /** Drop every pending, submitted and pooled tile back to an empty adapter. */
@@ -894,7 +898,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
     replacementIds: readonly string[] = [],
     preapprovedPlan?: RealizationPlan,
     preapprovedMemory?: MemoryLease,
-  ): MeshSubmitOutcome => {
+  ): TileSubmissionOutcome => {
     if (disposed || failed.has(id)) return "failed";
     if (pending.has(id) || submitted.has(id)) return "queued";
     if (typeof id !== "string" || id.length === 0)
@@ -925,25 +929,21 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       },
       0,
     );
-    if (
-      !preapprovedPlan &&
-      reservedBytes() + geometryBytes + textureBytes - replacementBytes >
-        resourceCeilingBytes
-    ) {
-      requiredBytes = Math.max(
-        requiredBytes,
-        reservedBytes() + geometryBytes + textureBytes - replacementBytes,
-      );
-      safeCall(() =>
-        options.onPolicyRefusal?.(
-          new ResourcePolicyError(
-            "renderer",
-            requiredBytes,
-            resourceCeilingBytes,
-          ),
+    const peakBytes = reservedBytes() + geometryBytes + textureBytes;
+    const finalBytes = peakBytes - replacementBytes;
+    if (!preapprovedPlan && finalBytes > resourceCeilingBytes) {
+      requiredBytes = Math.max(requiredBytes, finalBytes);
+      return {
+        status: "blocked",
+        refusal: new ResourcePolicyError(
+          "renderer",
+          finalBytes,
+          resourceCeilingBytes,
+          false,
+          undefined,
+          { reason: "configured-limit", finalBytes, peakBytes, wake: "policy" },
         ),
-      );
-      return "budget-blocked";
+      };
     }
     const oversized = content.primitives.find(
       (primitive) =>
@@ -979,8 +979,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         requiredBytes,
         reservedBytes() + geometryBytes + textureBytes - replacementBytes,
       );
-      safeCall(() => options.onPolicyRefusal?.(error));
-      return "budget-blocked";
+      return { status: "blocked", refusal: error };
     }
     const resources: TileResources = {
       id,
@@ -1220,24 +1219,26 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
         0,
       );
       trimPool(groupBytes);
-      if (
-        reservedBytes() + groupBytes - replacementBytes >
-        resourceCeilingBytes
-      ) {
-        requiredBytes = Math.max(
-          requiredBytes,
-          reservedBytes() + groupBytes - replacementBytes,
-        );
-        safeCall(() =>
-          options.onPolicyRefusal?.(
-            new ResourcePolicyError(
-              "renderer",
-              requiredBytes,
-              resourceCeilingBytes,
-            ),
+      const peakBytes = reservedBytes() + groupBytes;
+      const finalBytes = peakBytes - replacementBytes;
+      if (finalBytes > resourceCeilingBytes) {
+        requiredBytes = Math.max(requiredBytes, finalBytes);
+        return {
+          status: "blocked",
+          refusal: new ResourcePolicyError(
+            "renderer",
+            finalBytes,
+            resourceCeilingBytes,
+            false,
+            undefined,
+            {
+              reason: "configured-limit",
+              finalBytes,
+              peakBytes,
+              wake: "policy",
+            },
           ),
-        );
-        return "budget-blocked";
+        };
       }
 
       let groupMemory: readonly MemoryLease[] = [];
@@ -1258,8 +1259,7 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           requiredBytes,
           reservedBytes() + groupBytes - replacementBytes,
         );
-        safeCall(() => options.onPolicyRefusal?.(error));
-        return "budget-blocked";
+        return { status: "blocked", refusal: error };
       }
 
       const admitted: string[] = [];
@@ -1293,10 +1293,10 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
       };
       const finishGroup = (): void => {
         if (groupFailed || groupEntries.some((entry) => !entry.ready)) return;
-        // The replacement remains attached until every child resource is
-        // ready. Then the displayed frontier swaps synchronously: no paint
-        // can observe the gap, and replacement residency is released before
-        // any child becomes submitted.
+        // Attachment may fail. Keep the previous coverage until every
+        // replacement is attached, then publish the whole group before
+        // notifying observers that may recompute demand.
+        for (const entry of groupEntries) attach(entry.resources);
         for (const id of options.retainReplacements
           ? []
           : normalizedReplacements) {
@@ -1305,7 +1305,9 @@ export const createMeshAdapter = (options: MeshAdapterOptions): MeshAdapter => {
           drawn.delete(id);
           release(tile);
         }
-        for (const entry of groupEntries) finish(entry);
+        for (const entry of groupEntries) admitPending(entry);
+        options.scheduleRender();
+        for (const entry of groupEntries) notifySubmitted(entry);
       };
       for (const entry of groupEntries) {
         entry.finishBarrier = finishGroup;

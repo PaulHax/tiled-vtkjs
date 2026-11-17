@@ -825,9 +825,48 @@ describe("createTiles3dMember", () => {
     expect(member.stats()).toMatchObject({
       errorCount: 1,
       lastError: expect.stringContaining("unsupported required glTF extension"),
+      resourceState: { status: "unsupported" },
       queue: { failed: 1, workPending: false },
     });
     member.dispose();
+  });
+
+  it("recovers a deferred realization when another owner releases headroom", async () => {
+    const h = harness();
+    const other = h.memory.createOwner();
+    const occupied = other.reserveRenderer(4096);
+    const member = createTiles3dMember(
+      h.context,
+      { ...h.config, cacheBytes: 0 },
+      h.services,
+    );
+    member.applyAllocation({
+      qualityFraction: 1,
+      memoryBudgetBytes: 4096,
+      regime: "stationary",
+    });
+    member.setCamera(view);
+    await settle();
+    expect(member.stats()).toMatchObject({
+      resourceState: {
+        status: "blocked",
+        domain: "renderer",
+        reason: "contention",
+        wake: "availability",
+      },
+      renderer: { drawnTileIds: [] },
+    });
+
+    occupied.release();
+    member.prepareFrame();
+    while (h.submissions.hasPending()) h.submissions.prepareFrame();
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "ready" },
+      renderer: { drawnTileIds: ["root"] },
+    });
+    expect(h.contentRequests).toEqual(["/tiles/root.glb"]);
+    member.dispose();
+    other.close();
   });
 
   it.each([1024, 0])(
@@ -863,6 +902,12 @@ describe("createTiles3dMember", () => {
       expect(member.stats()).toMatchObject({
         memoryConstrained: true,
         irreducibleBudget: true,
+        resourceState: {
+          status: "blocked",
+          domain: "renderer",
+          reason: "configured-limit",
+          wake: "policy",
+        },
         renderer: { residentBytes: 0 },
       });
       const refusedFetches = h.contentRequests.length;
@@ -1115,7 +1160,7 @@ describe("createTiles3dMember", () => {
       expect(member.governorInputs().work.operations).toBe(0);
       expect(
         h.contentRequests.filter((url) => url.endsWith("/child-0.glb")),
-      ).toHaveLength(evict ? 2 : 1);
+      ).toHaveLength(1);
       expect(
         h.contentRequests.filter((url) => url.endsWith("/child-1.glb")),
       ).toHaveLength(1);
@@ -1488,7 +1533,7 @@ describe("createTiles3dMember", () => {
     expect((member.stats() as Tiles3dMemberStats).renderer.pendingTiles).toBe(
       0,
     );
-    expect(h.decodedRequests.length).toBeGreaterThan(1);
+    expect(h.decodedRequests).toHaveLength(1);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1756,20 +1801,9 @@ describe("createTiles3dMember", () => {
       const stats = member.stats() as Tiles3dMemberStats;
       expect(stats.renderer.residentBytes).toBeLessThanOrEqual(budget);
       expect([...stats.renderer.drawnTileIds].sort()).toEqual(
-        budget === 208 && cacheBytes >= 84
-          ? ["root/0", "root/1", "root/2", "root/3"]
-          : ["root"],
+        budget === 208 ? ["root/0", "root/1", "root/2", "root/3"] : ["root"],
       );
-      if (budget === 208 && cacheBytes < 84) {
-        member.setConfig({ ...h.config, concurrency: 5, cacheBytes: 1024 });
-        await drain();
-        expect(member.governorInputs().work.operations).toBe(0);
-        expect(
-          [
-            ...(member.stats() as Tiles3dMemberStats).renderer.drawnTileIds,
-          ].sort(),
-        ).toEqual(["root/0", "root/1", "root/2", "root/3"]);
-      }
+      expect(new Set(h.contentRequests).size).toBe(h.contentRequests.length);
       member.dispose();
     },
   );

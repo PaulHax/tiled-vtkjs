@@ -463,10 +463,8 @@ describe("content queue", () => {
   });
 
   it("accounts decoded bytes and evicts least-recently-used content deterministically", async () => {
-    const evicted: string[] = [];
     const { queue } = makeQueue({
       maxDecodedBytes: 20,
-      onEvict: (item) => evicted.push(item.id),
     });
     queue.setSelection([request("a"), request("b")]);
     await flush();
@@ -475,40 +473,73 @@ describe("content queue", () => {
     queue.setSelection([request("a"), request("b"), request("c")]);
     await flush();
     expect(queue.snapshot()).toMatchObject({ decodedBytes: 20, cached: 2 });
-    expect(evicted).toEqual(["b"]);
+    // Eviction drops reuse ownership while the current consumer can still
+    // finish using its decode. Withdrawing that demand releases the payload.
+    expect(queue.get("b")?.id).toBe("b");
+    queue.setSelection([request("a"), request("c")]);
     expect([...queue.contents().keys()]).toEqual(["a", "c"]);
     expect(queue.get("b")).toBeUndefined();
     expect(queue.get("a")?.id).toBe("a");
     expect(queue.get("c")?.id).toBe("c");
   });
 
-  it("reopens an evicted delivery without cancelling unrelated work", async () => {
+  it("releases uncached generations on withdrawal and reuses live decodes", async () => {
     const waiting = deferred<ReturnType<typeof ok>>();
     const fetcher = vi.fn(async (url: string) =>
       url.endsWith("/c.glb") ? waiting.promise : ok(),
     );
     const { queue, decoded } = makeQueue({
-      maxDecodedBytes: 10,
+      maxDecodedBytes: 0,
       fetch: fetcher,
     });
-    queue.setSelection([request("a")]);
-    await flush();
-    queue.setSelection([request("a"), request("b")]);
-    await flush();
-    expect(queue.get("a")).toBeUndefined();
     queue.setSelection([request("a"), request("b"), request("c")]);
     await flush();
-    expect(fetcher).toHaveBeenCalledTimes(3);
-    queue.setSelection([request("a"), request("b"), request("c")], {
-      requeueUncached: new Set(["a", "b", "c"]),
-    });
-    await flush();
-    expect(fetcher).toHaveBeenCalledTimes(4);
-    expect(decoded).toEqual(["a", "b", "a"]);
+    queue.trimCache(0);
+    expect(queue.get("a")?.id).toBe("a");
+    expect(queue.get("b")?.id).toBe("b");
+    queue.setSelection([request("b"), request("c")]);
+    expect(queue.get("a")).toBeUndefined();
+    queue.setSelection([request("a"), request("b"), request("c")]);
     waiting.resolve(ok());
     await flush();
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(decoded.filter((id) => id === "a")).toHaveLength(2);
+    expect(decoded.filter((id) => id === "b")).toHaveLength(1);
     expect(queue.snapshot()).toMatchObject({ active: 0, queued: 0, ready: 3 });
     queue.dispose();
+  });
+
+  it("charges a shared decoded buffer until both views release their ownership", async () => {
+    const pool = createMemoryPool({ totalBytes: 256 });
+    const buffer = new ArrayBuffer(42);
+    const makeView = (cacheBytes: number) => {
+      const owner = pool.createOwner();
+      const { queue } = makeQueue({
+        memory: owner,
+        maxDecodedBytes: cacheBytes,
+        decodedBuffers: () => [buffer],
+        decodedByteLength: () => buffer.byteLength,
+      });
+      queue.setSelection([request("a")]);
+      return { owner, queue };
+    };
+    const first = makeView(0);
+    const second = makeView(42);
+    await flush();
+    expect(pool.stats().cpuRetainedBytes).toBe(42);
+    expect(first.queue.get("a")?.id).toBe("a");
+    expect(second.queue.get("a")?.id).toBe("a");
+
+    second.queue.trimCache(0);
+    first.queue.dispose();
+    first.owner.close();
+    expect(second.queue.get("a")?.id).toBe("a");
+    expect(pool.stats().cpuRetainedBytes).toBe(42);
+    second.queue.setSelection([]);
+    expect(second.queue.get("a")).toBeUndefined();
+    expect(pool.stats().cpuRetainedBytes).toBe(0);
+    second.queue.dispose();
+    second.owner.close();
   });
 
   it("delivers oversize content without caching or evicting retained entries", async () => {
@@ -520,7 +551,6 @@ describe("content queue", () => {
         bytes: item.id === "oversize" ? 20 : 5,
       }),
       onContent: (item) => events.push(`content:${item.id}`),
-      onEvict: (item) => events.push(`evict:${item.id}`),
     });
     queue.setSelection([request("small")]);
     await flush();
@@ -530,6 +560,8 @@ describe("content queue", () => {
     expect(events).toEqual(["content:small", "content:oversize"]);
     expect(queue.snapshot()).toMatchObject({ cached: 1, decodedBytes: 5 });
     expect(queue.get("small")?.id).toBe("small");
+    expect(queue.get("oversize")?.id).toBe("oversize");
+    queue.setSelection([request("small")]);
     expect(queue.get("oversize")).toBeUndefined();
   });
 

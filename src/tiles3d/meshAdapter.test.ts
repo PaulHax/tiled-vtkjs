@@ -504,7 +504,19 @@ describe("vtk mesh adapter", () => {
       levels: [{ width: 16, height: 16, data: new Uint8Array(256) }],
     });
     adapter.setResourceCeilingBytes(479);
-    expect(adapter.submitTile("tile", payload)).toBe("budget-blocked");
+    expect(adapter.submitTile("tile", payload)).toMatchObject({
+      status: "blocked",
+      refusal: {
+        domain: "renderer",
+        limitBytes: 479,
+        estimate: {
+          reason: "configured-limit",
+          finalBytes: 480,
+          peakBytes: 480,
+          wake: "policy",
+        },
+      },
+    });
     expect(scheduler.hasPending()).toBe(false);
     adapter.setResourceCeilingBytes(480);
     expect(adapter.submitTile("tile", payload)).toBe("queued");

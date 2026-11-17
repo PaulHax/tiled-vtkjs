@@ -196,6 +196,7 @@ type VisitResult = {
 type MaterializedHierarchy = {
   readonly root: TilesetTile;
   readonly tileById: ReadonlyMap<string, TilesetTile>;
+  readonly subtreeRequestByTileId: ReadonlyMap<string, TileContentRequest>;
   readonly unknownRequestByTileId: ReadonlyMap<string, TileContentRequest>;
 };
 
@@ -252,6 +253,7 @@ const explicitHierarchy = (root: TilesetTile): MaterializedHierarchy => {
   return {
     root,
     tileById,
+    subtreeRequestByTileId: new Map(),
     unknownRequestByTileId: new Map(),
   };
 };
@@ -262,6 +264,7 @@ const implicitHierarchy = (
 ): MaterializedHierarchy => {
   const descriptor = documentRoot.implicitTiling!;
   const tileById = new Map<string, TilesetTile>();
+  const subtreeRequestByTileId = new Map<string, TileContentRequest>();
   const unknownRequestByTileId = new Map<string, TileContentRequest>();
   const entryById = new Map(
     snapshot?.entries.map((entry) => [entry.id, entry]) ?? [],
@@ -355,6 +358,7 @@ const implicitHierarchy = (
         implicitAddress: address,
         ...(address.level === 0 ? { implicitTiling: descriptor } : {}),
       });
+      subtreeRequestByTileId.set(id, request);
       tileById.set(id, tile);
       return tile;
     };
@@ -373,6 +377,7 @@ const implicitHierarchy = (
   return {
     root: buildSubtree(rootAddress, documentRoot.boundingVolume),
     tileById,
+    subtreeRequestByTileId,
     unknownRequestByTileId,
   };
 };
@@ -503,6 +508,8 @@ const traverseHierarchy = (
     }
     requestOrder.set(tile.id, [depth, view.centerRayOffset(bounds.center)]);
 
+    const subtreeRequest = hierarchy.subtreeRequestByTileId.get(tile.id);
+    if (subtreeRequest) neededSubtrees.set(subtreeRequest.id, subtreeRequest);
     const unknownRequest = hierarchy.unknownRequestByTileId.get(tile.id);
     if (unknownRequest) {
       neededSubtrees.set(unknownRequest.id, unknownRequest);

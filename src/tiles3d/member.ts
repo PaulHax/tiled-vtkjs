@@ -30,12 +30,20 @@ import {
 import {
   createContentQueue,
   type ContentQueue,
-  type ContentQueueEntrySnapshot,
   type ContentQueueSnapshot,
 } from "./contentQueue";
-import type { DecodedTileContent, DecodeWasmUrls } from "./decode";
+import {
+  TileDecodeError,
+  type DecodedTileContent,
+  type DecodeWasmUrls,
+} from "./decode";
 import { createMeshContentAdapter } from "./meshContentAdapter";
-import type { TileContentAdapter } from "./contentAdapter";
+import {
+  TileRenderingProfileError,
+  type TileContentAdapter,
+  type TileSubmissionOutcome,
+  type TileSubmissionRefusal,
+} from "./contentAdapter";
 import { createMeshPickSet } from "./meshPicking";
 import {
   DEFAULT_TILES3D_SUBTREE_CACHE_BYTES,
@@ -154,9 +162,6 @@ export const createTiles3dMember = (
   let loadController: AbortController | null = null;
   let queue: ContentQueue<DecodedTileContent> | null = null;
   let queueSnapshot: ContentQueueSnapshot | null = null;
-  // Traversal asks readiness for every tile it visits, so the snapshot is
-  // indexed on arrival instead of scanned per tile.
-  let queueEntryById = new Map<string, ContentQueueEntrySnapshot>();
   let subtreeQueue: ContentQueue<ParsedSubtree> | null = null;
   let subtreeSnapshot: ContentQueueSnapshot | null = null;
   let subtreeHierarchy: SubtreeHierarchyState | null = null;
@@ -166,19 +171,29 @@ export const createTiles3dMember = (
   let lastError: string | null = null;
   let workProgressSerial = 0;
   let selectionPasses = 0;
-  const requested = new Set<string>();
-  const desiredRequests = new Set<string>();
-  const decoded = new Set<string>();
-  const admissionBlocked = new Set<string>();
-  const admissionFailed = new Set<string>();
+  type RealizationDemand = {
+    blocked?: {
+      readonly refusal: TileSubmissionRefusal;
+      readonly replacement: string | null;
+      readonly group: boolean;
+      readonly availability: number;
+    };
+  };
+  // These records are scoped to this adapter, which owns the live resources
+  // in this view and validates their placement before presenting them.
+  const demand = new Map<string, RealizationDemand>();
+  let realizationWakeQueued = false;
   let refreshing = false;
   let refreshAgain = false;
   let drawSetDirty = true;
   let rootMemoryBytes = 0;
   let sourceMemory: MemoryLease | undefined;
+  let sourceRefusal: ResourcePolicyError | null = null;
   let lastPolicyRevision = context.memory.policyRevision();
   let lastAvailability = context.memory.availability();
-  let retryOnAvailability = false;
+  let rendererRefusal:
+    | { readonly error: ResourcePolicyError; readonly availability: number }
+    | undefined;
   let resourceState: Tiles3dMemberStats["resourceState"] = { status: "ready" };
   const setResourceState = (
     next: Tiles3dMemberStats["resourceState"],
@@ -187,24 +202,65 @@ export const createTiles3dMember = (
     safeCall(() => config.onResourceState?.(next));
     context.onWorkChange?.();
   };
-  const policyRefused = (error: ResourcePolicyError): void => {
-    retryOnAvailability = error.retryable;
-    lastAvailability = context.memory.availability();
-    queueMicrotask(() => {
-      lastAvailability = context.memory.availability();
-    });
+  const noteResourceRecovery = (): void => {
+    if (
+      resourceState.status === "blocked" &&
+      !sourceRefusal &&
+      !rendererRefusal &&
+      !memoryConstrained &&
+      !blockedGroupAncestors.size &&
+      !queueSnapshot?.blocked &&
+      !subtreeSnapshot?.blocked &&
+      ![...demand.values()].some((tile) => tile.blocked)
+    )
+      setResourceState({ status: "ready" });
+  };
+
+  const policyRefused = (error: TileSubmissionRefusal): void => {
+    if (!(error instanceof ResourcePolicyError)) {
+      setResourceState({ status: "blocked", ...error });
+      return;
+    }
     setResourceState({
       status: "blocked",
       domain: error.domain,
       requestedBytes: error.requestedBytes,
       limitBytes: error.limitBytes,
       retryable: error.retryable,
-      reason:
-        adapter.workState().residentBytes > 0
-          ? "transition-unavailable"
-          : "configured-limit",
+      ...error.estimate,
     });
   };
+
+  const retryRealizations = (
+    wake: "availability" | "presentation",
+  ): boolean => {
+    const availability = context.memory.availability();
+    let retry = false;
+    for (const tile of demand.values()) {
+      const blocked = tile.blocked;
+      if (
+        blocked?.refusal instanceof ResourcePolicyError &&
+        blocked.refusal.estimate.wake === wake &&
+        (wake === "presentation" || availability !== blocked.availability)
+      ) {
+        tile.blocked = undefined;
+        retry = true;
+      }
+    }
+    return retry;
+  };
+
+  const onPresentationChange = (): void => {
+    syncPickPresentation();
+    if (realizationWakeQueued || !demand.size) return;
+    realizationWakeQueued = true;
+    queueMicrotask(() => {
+      realizationWakeQueued = false;
+      if (!disposed && active && retryRealizations("presentation"))
+        refreshSelection();
+    });
+  };
+
   const memory = context.memory.createOwner({
     reclaim(domain: MemoryDomain) {
       if (domain === "cpu") {
@@ -219,8 +275,13 @@ export const createTiles3dMember = (
   const report = (error: unknown): void => {
     errorCount += 1;
     lastError = errorMessage(error);
+    const cause = error instanceof Error ? error.cause : undefined;
+    const unsupported =
+      error instanceof TileRenderingProfileError ||
+      (error instanceof TileDecodeError && error.stage === "profile") ||
+      (cause instanceof TileDecodeError && cause.stage === "profile");
     setResourceState({
-      status: "error",
+      status: unsupported ? "unsupported" : "error",
       errorName: error instanceof Error ? error.name : "Error",
       message: lastError,
     });
@@ -238,22 +299,39 @@ export const createTiles3dMember = (
     scheduleRender: context.scheduleRender,
     submissions: context.submissions,
     visible: active,
-    onError: report,
+    onError(error) {
+      report(error);
+      const generation = configGeneration;
+      queueMicrotask(() => {
+        if (active && generation === configGeneration) refreshSelection();
+      });
+    },
     memory,
     memoryPool: context.memory,
-    onPresentationChange: () => syncPickPresentation(),
-    onAdmissionRefusal: (ids, error) =>
+    onPresentationChange,
+    onAdmissionRefusal(ids, error) {
+      const affected = ids.map((id) => ({ id, tile: demand.get(id) }));
       queueMicrotask(() => {
         if (disposed || !active) return;
+        const cancelled = affected.flatMap(({ id, tile }) =>
+          tile && demand.get(id) === tile && adapter.tileState(id) === "absent"
+            ? [id]
+            : [],
+        );
+        if (!cancelled.length) return;
         policyRefused(error);
-        for (const id of ids) {
-          if (!requested.has(id)) continue;
-          admissionBlocked.add(id);
-          blockGroupUnder(id);
-        }
+        for (const id of cancelled) rememberRefusal([id], null, error);
         refreshSelection();
-      }),
-    onPolicyRefusal: policyRefused,
+      });
+    },
+    onPolicyRefusal(error) {
+      if (error instanceof ResourcePolicyError)
+        rendererRefusal = {
+          error,
+          availability: context.memory.availability(),
+        };
+      policyRefused(error);
+    },
   });
   const pickSet = createMeshPickSet();
 
@@ -300,13 +378,6 @@ export const createTiles3dMember = (
 
   const traversalQualityFraction = (): number =>
     memoryConstrained ? 1 : allocation.qualityFraction;
-
-  const setQueueSnapshot = (snapshot: ContentQueueSnapshot | null): void => {
-    queueSnapshot = snapshot;
-    queueEntryById = new Map(
-      snapshot ? snapshot.entries.map((entry) => [entry.id, entry]) : [],
-    );
-  };
 
   const setSubtreeSnapshot = (snapshot: ContentQueueSnapshot | null): void => {
     subtreeSnapshot = snapshot;
@@ -428,11 +499,11 @@ export const createTiles3dMember = (
         if (state === "submitted") return false;
         // Nor is a sibling that was itself refused still coming: two refused
         // siblings counting each other would wait for each other forever.
-        if (admissionBlocked.has(candidate)) return false;
+        if (demand.get(candidate)?.blocked) return false;
         return (
           state === "queued" ||
-          decoded.has(candidate) ||
-          (requested.has(candidate) && readiness(candidate) !== "failed")
+          queue?.state(candidate)?.status === "ready" ||
+          (demand.has(candidate) && readiness(candidate) !== "failed")
         );
       }),
     );
@@ -444,49 +515,84 @@ export const createTiles3dMember = (
       descendants.every((candidate) => {
         const state = adapter.tileState(candidate);
         return (
-          state === "queued" || state === "submitted" || decoded.has(candidate)
+          state === "queued" ||
+          state === "submitted" ||
+          queue?.state(candidate)?.status === "ready"
         );
       })
     );
   };
 
-  const trySubmitDesiredGroup = (id: string) => {
-    if (!traversal || !queue) return null;
+  const rememberRefusal = (
+    ids: readonly string[],
+    replacement: string | null,
+    refusal: TileSubmissionRefusal,
+  ): void => {
+    const blocked = {
+      refusal,
+      replacement,
+      group: ids.length > 1,
+      availability: context.memory.availability(),
+    };
+    for (const id of ids) {
+      const tile = demand.get(id);
+      if (tile) tile.blocked = blocked;
+    }
+  };
+
+  const recordSubmission = (
+    ids: readonly string[],
+    replacement: string,
+    outcome: TileSubmissionOutcome,
+  ): void => {
+    if (outcome === "queued") {
+      for (const id of ids) {
+        const tile = demand.get(id);
+        if (tile) tile.blocked = undefined;
+      }
+      return;
+    }
+    if (outcome === "failed") return;
+    const { refusal } = outcome;
+    rememberRefusal(ids, replacement, refusal);
+    policyRefused(refusal);
+  };
+
+  const trySubmitDesiredGroup = (
+    id: string,
+  ): TileSubmissionOutcome | undefined => {
+    if (!traversal || !queue) return undefined;
     const ancestor = submittedAncestors(id)[0];
-    if (!ancestor) return null;
-    // Some siblings can fit alongside the ancestor before the rest arrive.
-    // Keep those admitted resources and replace the ancestor with only the
-    // remaining siblings; requiring the entire group to be absent can leave
-    // a partially admitted frontier waiting forever at its memory ceiling.
+    if (!ancestor) return undefined;
+    // Already submitted siblings keep their realization and count toward
+    // complete replacement coverage.
     const desired = desiredDescendants(ancestor).filter(
       (candidate) => adapter.tileState(candidate) !== "submitted",
     );
+    if (desired.length < 2) return undefined;
+    const replacement = [ancestor, ...desired].join("\n");
     if (
-      desired.length < 2 ||
-      desired.some(
-        (candidate) =>
-          adapter.tileState(candidate) !== "absent" || !decoded.has(candidate),
-      )
-    ) {
-      return null;
+      desired.some((candidate) => {
+        const blocked = demand.get(candidate)?.blocked;
+        return (
+          blocked?.replacement === null || blocked?.replacement === replacement
+        );
+      })
+    )
+      return undefined;
+    const entries = [];
+    for (const candidate of desired) {
+      if (adapter.tileState(candidate) !== "absent") return undefined;
+      const content = queue.get(candidate);
+      if (!content) return undefined;
+      entries.push({
+        id: candidate,
+        content,
+        onSubmitted: () => onAdmitted(candidate),
+      });
     }
-    const entries = desired.flatMap((candidate) => {
-      const content = queue!.get(candidate);
-      return content
-        ? [
-            {
-              id: candidate,
-              content,
-              onSubmitted: () => onAdmitted(candidate),
-            },
-          ]
-        : [];
-    });
-    if (entries.length !== desired.length) return null;
     const outcome = adapter.submitTileGroup(entries, [ancestor]);
-    if (outcome === "queued") {
-      for (const candidate of desired) admissionBlocked.delete(candidate);
-    }
+    recordSubmission(desired, replacement, outcome);
     return outcome;
   };
 
@@ -507,9 +613,6 @@ export const createTiles3dMember = (
     } else {
       if (blockedGroupAncestors.has(ancestor)) return;
       blockedGroupAncestors.add(ancestor);
-      for (const candidate of desiredDescendants(ancestor)) {
-        admissionBlocked.add(candidate);
-      }
     }
     constrainedDesiredSignature = unconstrainedDesiredSignature();
     refreshSelection();
@@ -533,48 +636,16 @@ export const createTiles3dMember = (
     blockedGroupAncestors.clear();
     irreducibleBudget = false;
     constrainedDesiredSignature = null;
+    for (const tile of demand.values()) tile.blocked = undefined;
+    rendererRefusal = undefined;
     adapter.clearRequiredBytes();
     if (resourceState.status === "blocked")
       setResourceState({ status: "ready" });
   };
 
   const clearAdmissionState = (): void => {
-    requested.clear();
-    desiredRequests.clear();
-    decoded.clear();
-    admissionBlocked.clear();
-    admissionFailed.clear();
-    lostBlockedContent.clear();
-  };
-
-  const lostBlockedContent = new Set<string>();
-  let cacheBackoffQueued = false;
-  const backoffAfterCacheLoss = (id: string): void => {
-    if (!admissionBlocked.has(id)) return;
-    lostBlockedContent.add(id);
-    if (cacheBackoffQueued) return;
-    cacheBackoffQueued = true;
-    // Eviction runs inside the queue's cache mutation. Wait until that
-    // transaction and its content delivery finish before changing selection.
-    queueMicrotask(() => {
-      cacheBackoffQueued = false;
-      const lost = [...lostBlockedContent];
-      lostBlockedContent.clear();
-      if (disposed || !active) return;
-      for (const candidate of lost) {
-        if (
-          requested.has(candidate) &&
-          admissionBlocked.has(candidate) &&
-          adapter.tileState(candidate) === "absent" &&
-          !queue?.get(candidate)
-        ) {
-          if (candidate === source?.root.id && memoryConstrained) {
-            latchIrreducibleBudget();
-            refreshSelection();
-          } else blockGroupUnder(candidate);
-        }
-      }
-    });
+    demand.clear();
+    rootMemoryBytes = 0;
   };
 
   const retryIfDesiredSelectionChanged = (): void => {
@@ -586,7 +657,7 @@ export const createTiles3dMember = (
   const readiness = (id: string) => {
     const state = adapter.tileState(id);
     if (state === "submitted") return "submitted" as const;
-    if (state === "failed" || admissionFailed.has(id)) return "failed" as const;
+    if (state === "failed" || demand.get(id)?.blocked) return "failed" as const;
     // A root that will not fit the member's whole byte allowance is terminal
     // for this budget, not still arriving, so it never holds `workPending`:
     // the view governor stops sampling capacity for every member while any of
@@ -594,8 +665,9 @@ export const createTiles3dMember = (
     // reopens the tile.
     if (irreducibleBudget && source && id === source.root.id)
       return "failed" as const;
-    if (decoded.has(id)) return "decoded" as const;
-    const entry = queueEntryById.get(id);
+    if (state === "queued") return "loading" as const;
+    const entry = queue?.state(id);
+    if (entry?.status === "ready") return "decoded" as const;
     if (entry?.status === "failed" || entry?.status === "blocked")
       return "failed" as const;
     if (entry) return "loading" as const;
@@ -635,7 +707,7 @@ export const createTiles3dMember = (
     pickSet.replaceDrawn(adapter.pickableMeshTiles());
   };
 
-  const refreshSelection = (): void => {
+  const refreshSelection = (resolvedId?: string): void => {
     if (disposed) return;
     drawSetDirty = true;
     if (refreshing) {
@@ -647,22 +719,19 @@ export const createTiles3dMember = (
       if (!active || !source || !camera || !queue) {
         queue?.setSelection([]);
         subtreeQueue?.setSelection([]);
-        for (const id of requested) adapter.cancelTile(id);
-        requested.clear();
-        desiredRequests.clear();
+        for (const id of demand.keys()) adapter.cancelTile(id);
+        demand.clear();
         updateDrawSet(true);
         return;
       }
       selectionPasses += 1;
       const next = select(traversalMaximumSse(), traversalQualityFraction());
-      const newlyDesired = new Set(
-        next.desiredTileIds.filter(
-          (id) =>
-            !desiredRequests.has(id) && adapter.tileState(id) === "absent",
-        ),
-      );
-      desiredRequests.clear();
-      for (const id of next.desiredTileIds) desiredRequests.add(id);
+      const previousDesired = traversal?.desiredTileIds;
+      if (
+        previousDesired?.length !== next.desiredTileIds.length ||
+        next.desiredTileIds.some((id, index) => id !== previousDesired[index])
+      )
+        for (const tile of demand.values()) tile.blocked = undefined;
       traversal = next;
       subtreeQueue?.setSelection(next.neededSubtreeRequests);
       const nextContentRequests = contentRequests(
@@ -672,93 +741,94 @@ export const createTiles3dMember = (
       const nextRequested = new Set(
         nextContentRequests.map((request) => request.id),
       );
-      for (const id of requested) {
+      for (const id of demand.keys()) {
         if (nextRequested.has(id)) continue;
         adapter.cancelTile(id);
         if (!next.drawnTileIds.includes(id)) adapter.retireTile(id);
-        decoded.delete(id);
-        admissionBlocked.delete(id);
-        admissionFailed.delete(id);
+        demand.delete(id);
       }
-      requested.clear();
-      for (const id of nextRequested) requested.add(id);
-      // Renderer residency outlives the decoded CPU cache. Restore those
-      // immutable resources before asking the content queue to fetch them.
       for (const id of nextRequested) {
-        if (adapter.restoreTile(id) === "failed") admissionFailed.add(id);
-      }
-      // Delivery records can outlive both cached payloads and cancelled
-      // realizations. Existing refusal latches still govern their own retries.
-      const requeueUncached = new Set(newlyDesired);
-      if (!irreducibleBudget) {
-        for (const id of nextRequested) {
-          if (
-            adapter.tileState(id) === "absent" &&
-            !admissionBlocked.has(id) &&
-            !admissionFailed.has(id) &&
-            queueEntryById.get(id)?.status === "ready" &&
-            queue.get(id) === undefined
-          )
-            requeueUncached.add(id);
-        }
-      }
-      // Cancelling a deselected tile cancels its whole replacement group, so
-      // a decoded sibling that is still wanted goes back through admission
-      // below with the refused ones.
-      for (const id of nextRequested) {
-        if (
-          decoded.has(id) &&
-          !admissionFailed.has(id) &&
-          adapter.tileState(id) === "absent"
-        ) {
-          admissionBlocked.add(id);
-        }
+        if (!demand.has(id)) demand.set(id, {});
+        adapter.restoreTile(id);
       }
       queue.setSelection(
-        nextContentRequests.filter(
-          (request) => adapter.tileState(request.id) !== "submitted",
-        ),
-        { requeueUncached },
-      );
-      for (const id of nextRequested) {
-        if (!admissionBlocked.has(id) || adapter.tileState(id) !== "absent")
-          continue;
-        const content = queue.get(id);
-        if (content && !irreducibleBudget) {
-          // A regional backoff can complete a replacement set without a new
-          // decode callback. Reconsider the group against the new frontier.
-          const groupOutcome = trySubmitDesiredGroup(id);
-          if (groupOutcome === "queued") continue;
-          if (groupOutcome === "budget-blocked") {
-            blockGroupUnder(id);
-            break;
-          }
-          const replacements = replacementsForAdmission(id);
-          const outcome = adapter.submitTile(
-            id,
-            content,
-            () => onAdmitted(id),
-            replacements,
+        nextContentRequests.filter(({ id }) => {
+          const state = adapter.tileState(id);
+          return (
+            state !== "submitted" &&
+            state !== "failed" &&
+            !(irreducibleBudget && id === source?.root.id)
           );
-          if (outcome === "queued") admissionBlocked.delete(id);
-          else if (outcome === "failed") {
-            admissionBlocked.delete(id);
-            admissionFailed.add(id);
-          } else if (id === source.root.id && memoryConstrained) {
-            latchIrreducibleBudget();
-            refreshAgain = true;
-          } else if (
-            !coveredSoonByDesiredDescendants(id) &&
-            !waitingForSiblingBeforeReplacement(id)
-          ) {
-            // Siblings may have finished since this payload was refused.
-            // Reevaluate waiting here as well as in the decode callback.
-            blockGroupUnder(id);
-            break;
+        }),
+      );
+      const admissionOrder =
+        resolvedId && nextRequested.has(resolvedId)
+          ? [
+              resolvedId,
+              ...[...nextRequested].filter((id) => id !== resolvedId),
+            ]
+          : nextRequested;
+      for (const id of admissionOrder) {
+        if (adapter.tileState(id) !== "absent") continue;
+        const content = queue.get(id);
+        if (!content || (irreducibleBudget && id === source.root.id)) continue;
+        if (id === source.root.id)
+          rootMemoryBytes = adapter.estimateTileBytes(content);
+
+        const groupOutcome = trySubmitDesiredGroup(id);
+        if (groupOutcome === "queued") continue;
+        if (groupOutcome && groupOutcome !== "failed") {
+          if (
+            groupOutcome.refusal instanceof ResourcePolicyError &&
+            groupOutcome.refusal.retryable
+          )
+            continue;
+          blockGroupUnder(id);
+          break;
+        }
+
+        let previous = demand.get(id)?.blocked;
+        if (!previous?.group && previous?.replacement !== null) {
+          const replacements = replacementsForAdmission(id);
+          const replacement = replacements.join(",");
+          if (previous?.replacement !== replacement) {
+            const outcome = adapter.submitTile(
+              id,
+              content,
+              () => onAdmitted(id),
+              replacements,
+            );
+            recordSubmission([id], replacement, outcome);
+            if (outcome === "queued" || outcome === "failed") continue;
+            previous = demand.get(id)?.blocked;
           }
         }
+
+        if (
+          !previous ||
+          (previous.refusal instanceof ResourcePolicyError &&
+            previous.refusal.retryable)
+        )
+          continue;
+        if (
+          coveredSoonByDesiredDescendants(id) ||
+          waitingForSiblingBeforeReplacement(id)
+        )
+          continue;
+        if (id === source.root.id) {
+          if (!memoryConstrained) {
+            memoryConstrained = true;
+            constrainedDesiredSignature = unconstrainedDesiredSignature();
+          }
+          latchIrreducibleBudget();
+          refreshAgain = true;
+        } else {
+          blockGroupUnder(id);
+        }
+        break;
       }
       updateDrawSet(true);
+      noteResourceRecovery();
     } finally {
       refreshing = false;
       context.onWorkChange?.();
@@ -770,11 +840,12 @@ export const createTiles3dMember = (
   };
 
   const onAdmitted = (id: string): void => {
-    if (disposed || !active || !requested.has(id)) {
+    const tile = demand.get(id);
+    if (disposed || !active || !tile) {
       adapter.retireTile(id);
       return;
     }
-    admissionBlocked.delete(id);
+    tile.blocked = undefined;
     // Admission changes REPLACE coverage. Re-run selection so an ancestor is
     // removed from both the fetch obligation and renderer only after every
     // required descendant has crossed the shared admission boundary.
@@ -783,7 +854,7 @@ export const createTiles3dMember = (
     context.onWorkChange?.();
   };
 
-  const createQueue = (tileset: TilesetSource): void => {
+  const createQueue = (): void => {
     queue?.dispose();
     queue = createContentQueue({
       revision: config.revision,
@@ -821,58 +892,9 @@ export const createTiles3dMember = (
         }
       },
       decodedByteLength: decodedBytes,
-      onContent: (request, content) => {
+      onContent: ({ id }) => {
         workProgressSerial += 1;
-        if (disposed || !active || !requested.has(request.id)) return;
-        if (request.id === tileset.root.id)
-          rootMemoryBytes = adapter.estimateTileBytes(content);
-        decoded.add(request.id);
-        const groupOutcome = trySubmitDesiredGroup(request.id);
-        if (groupOutcome === "queued") {
-          updateDrawSet();
-          return;
-        }
-        if (groupOutcome === "budget-blocked") {
-          // The whole replacement set is decoded and it did not fit, so
-          // nothing further is coming for this branch and neither patience
-          // guard below applies. Stop refining past the ancestor it would have
-          // replaced and leave the rest of the tileset at full quality.
-          blockGroupUnder(request.id);
-          return;
-        }
-        const replacements = replacementsForAdmission(request.id);
-        const outcome = adapter.submitTile(
-          request.id,
-          content,
-          () => onAdmitted(request.id),
-          replacements,
-        );
-        if (outcome === "budget-blocked") {
-          admissionBlocked.add(request.id);
-          if (!queue?.get(request.id)) backoffAfterCacheLoss(request.id);
-          if (coveredSoonByDesiredDescendants(request.id)) {
-            updateDrawSet();
-            return;
-          }
-          if (waitingForSiblingBeforeReplacement(request.id)) {
-            updateDrawSet();
-            return;
-          }
-          if (!memoryConstrained) {
-            blockGroupUnder(request.id);
-          } else if (request.id === tileset.root.id) {
-            latchIrreducibleBudget();
-            refreshSelection();
-          }
-        } else if (outcome === "failed") {
-          admissionFailed.add(request.id);
-        }
-        updateDrawSet();
-      },
-      onEvict: (request) => {
-        workProgressSerial += 1;
-        decoded.delete(request.id);
-        backoffAfterCacheLoss(request.id);
+        if (!disposed && active && !refreshing) refreshSelection(id);
       },
       onError: (_request, error) => {
         workProgressSerial += 1;
@@ -881,14 +903,12 @@ export const createTiles3dMember = (
       onPolicyRefusal: (request, error) => {
         workProgressSerial += 1;
         policyRefused(error);
-        admissionFailed.add(request.id);
-        if (request.id === tileset.root.id) latchIrreducibleBudget();
-        else blockGroupUnder(request.id);
-        refreshSelection();
+        if (!error.retryable && request.id !== source?.root.id)
+          blockGroupUnder(request.id);
       },
       onStateChange: (snapshot) => {
         workProgressSerial += 1;
-        setQueueSnapshot(snapshot);
+        queueSnapshot = snapshot;
         context.onWorkChange?.();
       },
     });
@@ -914,6 +934,7 @@ export const createTiles3dMember = (
       onPolicyRefusal: (_request, error) => {
         workProgressSerial += 1;
         policyRefused(error);
+        if (error.retryable) return;
         setSubtreeSnapshot(subtreeQueue?.snapshot() ?? null);
         refreshSelection();
       },
@@ -945,12 +966,13 @@ export const createTiles3dMember = (
     const controller = new AbortController();
     loadController = controller;
     sourceState = "loading";
+    sourceRefusal = null;
     sourceMemory?.release();
     sourceMemory = undefined;
     source = null;
     materializedTileById.clear();
     traversal = null;
-    setQueueSnapshot(null);
+    queueSnapshot = null;
     context.onWorkChange?.();
     void memory.admission
       .run<{ loaded: TilesetSource; lease: MemoryLease }>({
@@ -997,7 +1019,7 @@ export const createTiles3dMember = (
           materializedTileById = new Map(loaded.tileById);
           workProgressSerial += 1;
           sourceState = "ready";
-          createQueue(loaded);
+          createQueue();
           createHierarchyQueue(loaded);
           refreshSelection();
           context.scheduleRender();
@@ -1011,8 +1033,8 @@ export const createTiles3dMember = (
             return;
           sourceState = "failed";
           workProgressSerial += 1;
-          const refusal = resourcePolicyError(error);
-          if (refusal) policyRefused(refusal);
+          sourceRefusal = resourcePolicyError(error);
+          if (sourceRefusal) policyRefused(sourceRefusal);
           else report(error);
         },
       );
@@ -1065,7 +1087,7 @@ export const createTiles3dMember = (
         loadGeneration += 1;
         queue?.setSelection([]);
         subtreeQueue?.setSelection([]);
-        for (const id of requested) adapter.cancelTile(id);
+        for (const id of demand.keys()) adapter.cancelTile(id);
         adapter.clearTiles();
         pickSet.replaceDrawn([]);
         clearAdmissionState();
@@ -1098,7 +1120,6 @@ export const createTiles3dMember = (
         next.verticalExaggeration !== config.verticalExaggeration ||
         next.verticalPivotZ !== config.verticalPivotZ ||
         next.geometricErrorScale !== config.geometricErrorScale;
-      const cacheIncreased = next.cacheBytes > config.cacheBytes;
       config = next;
       if (placementChanged) applyPlacement();
       if (sourceChanged || decodeChanged) {
@@ -1106,7 +1127,7 @@ export const createTiles3dMember = (
         configGeneration += 1;
         queue?.dispose();
         queue = null;
-        setQueueSnapshot(null);
+        queueSnapshot = null;
         subtreeQueue?.dispose();
         subtreeQueue = null;
         setSubtreeSnapshot(null);
@@ -1120,7 +1141,6 @@ export const createTiles3dMember = (
         clearBudgetConstraint();
         if (active) beginLoad();
       } else {
-        if (cacheIncreased) clearBudgetConstraint();
         queue?.configure({
           maxConcurrency: config.concurrency,
           maxDecodedBytes: config.cacheBytes,
@@ -1138,37 +1158,29 @@ export const createTiles3dMember = (
       if (!disposed && interactionDepth > 0) interactionDepth -= 1;
     },
     prepareFrame() {
-      const revision = context.memory.policyRevision();
-      const availability = context.memory.availability();
-      const policyChanged = revision !== lastPolicyRevision;
-      if (
-        !disposed &&
-        active &&
-        (policyChanged ||
-          (retryOnAvailability && availability !== lastAvailability))
-      ) {
-        lastPolicyRevision = revision;
-        lastAvailability = availability;
-        if (sourceState === "failed" && resourceState.status === "blocked")
-          beginLoad();
-        clearBudgetConstraint();
-        admissionFailed.clear();
-        queue?.retryBlocked(!policyChanged);
-        subtreeQueue?.retryBlocked(!policyChanged);
-        const uncached = new Set(
-          [...admissionBlocked].filter(
-            (id) => requested.has(id) && queue?.get(id) === undefined,
-          ),
-        );
-        for (const id of uncached) {
-          admissionBlocked.delete(id);
-          decoded.delete(id);
+      if (!disposed && active) {
+        const revision = context.memory.policyRevision();
+        const availability = context.memory.availability();
+        if (revision !== lastPolicyRevision) {
+          lastPolicyRevision = revision;
+          clearBudgetConstraint();
+          if (sourceRefusal) beginLoad();
+          queue?.retryBlocked();
+          subtreeQueue?.retryBlocked();
+          refreshSelection();
+        } else if (availability !== lastAvailability) {
+          let retry = retryRealizations("availability");
+          if (
+            rendererRefusal?.error.estimate.wake === "availability" &&
+            rendererRefusal.availability !== availability
+          ) {
+            rendererRefusal = undefined;
+            adapter.clearRequiredBytes();
+            retry = true;
+          }
+          if (retry) refreshSelection();
         }
-        queue?.setSelection(
-          contentRequests(materializedTileById, [...requested]),
-          { requeueUncached: uncached },
-        );
-        refreshSelection();
+        lastAvailability = availability;
       }
       if (!disposed && drawSetDirty) updateDrawSet();
     },
@@ -1236,13 +1248,9 @@ export const createTiles3dMember = (
       // Trim the reuse pool before judging the new share: pooled tiles are
       // held on speculation, and counting them would call a share that still
       // fits everything drawn a memory constraint.
-      const cancelled = adapter.setResourceCeilingBytes(
-        allocation.memoryBudgetBytes,
-      );
+      adapter.setResourceCeilingBytes(allocation.memoryBudgetBytes);
       if (allocation.memoryBudgetBytes > previousMemoryBudgetBytes) {
         clearBudgetConstraint();
-        admissionFailed.clear();
-        queue?.retryBlocked();
       } else if (
         adapter.workState().residentBytes > allocation.memoryBudgetBytes
       ) {
@@ -1262,36 +1270,7 @@ export const createTiles3dMember = (
       } else {
         retryIfDesiredSelectionChanged();
       }
-      for (const id of cancelled) {
-        if (requested.has(id)) admissionBlocked.add(id);
-      }
       refreshSelection();
-      // An oversize decoded value is deliberately not cached by ContentQueue.
-      // If it was blocked by the previous GPU allowance, explicitly reopen it
-      // so the larger allocation can fetch/decode again instead of leaving a
-      // permanently-ready entry with no retained payload.
-      const uncachedBlocked = new Set(
-        [...admissionBlocked].filter(
-          (id) => requested.has(id) && queue?.get(id) === undefined,
-        ),
-      );
-      if (queue && uncachedBlocked.size > 0) {
-        for (const id of uncachedBlocked) {
-          admissionBlocked.delete(id);
-          admissionFailed.delete(id);
-          decoded.delete(id);
-        }
-        queue.setSelection(
-          contentRequests(
-            materializedTileById,
-            [...requested].filter(
-              (id) => adapter.tileState(id) !== "submitted",
-            ),
-          ),
-          { requeueUncached: uncachedBlocked },
-        );
-        refreshSelection();
-      }
     },
 
     pick: (view, cssX, cssY) =>
