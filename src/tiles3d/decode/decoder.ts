@@ -1696,6 +1696,95 @@ const actualBytes = (
   };
 };
 
+const checkedGeometryBytes = (bytes: number): number => {
+  if (!Number.isSafeInteger(bytes))
+    throw new Error("decoded geometry estimate exceeds the safe integer range");
+  return bytes;
+};
+
+const primitiveInstanceBytes = (
+  primitive: GltfPrimitive,
+  json: GltfJson,
+): number => {
+  // Accessor expansion, transformed Float64 positions, RTC rebasing, colors and
+  // strip triangulation allocate independently for every node using a mesh.
+  let bytes = 128;
+  for (const reference of Object.values(primitive.attributes)) {
+    if (typeof reference !== "number") continue;
+    const accessor = requireIndex(json.accessors, reference, "accessor");
+    bytes += accessor.count * (COMPONENTS[accessor.type] ?? 0) * 4 * 4;
+  }
+  if (typeof primitive.indices === "number") {
+    const accessor = requireIndex(
+      json.accessors,
+      primitive.indices,
+      "accessor",
+    );
+    bytes += accessor.count * 4 * 4;
+  } else if (
+    primitive.mode === 5 &&
+    typeof primitive.attributes.POSITION === "number"
+  ) {
+    const accessor = requireIndex(
+      json.accessors,
+      primitive.attributes.POSITION,
+      "POSITION",
+    );
+    bytes += accessor.count * 3 * 4;
+  }
+  return checkedGeometryBytes(bytes);
+};
+
+/** Estimate the active scene without expanding repeated node subtrees. */
+const sceneInstanceBytes = (json: GltfJson): number => {
+  const scene = requireIndex(json.scenes, json.scene ?? 0, "active scene");
+  const estimates = new Map<number, number>();
+  const meshEstimates = new Map<number, number>();
+  const visiting = new Set<number>();
+  let total = 0;
+  for (const root of scene.nodes ?? []) {
+    const stack: { index: number; exiting: boolean }[] = [
+      { index: root, exiting: false },
+    ];
+    while (stack.length) {
+      const { index, exiting } = stack.pop()!;
+      if (estimates.has(index)) continue;
+      if (!exiting && visiting.has(index))
+        throw new Error("glTF node graph contains a cycle");
+      const node = requireIndex(json.nodes, index, "node");
+      if (!exiting) {
+        visiting.add(index);
+        stack.push({ index, exiting: true });
+        for (const child of node.children ?? [])
+          stack.push({ index: child, exiting: false });
+        continue;
+      }
+      let bytes = 128;
+      if (node.mesh !== undefined) {
+        let meshBytes = meshEstimates.get(node.mesh);
+        if (meshBytes === undefined) {
+          const mesh = requireIndex(json.meshes, node.mesh, "mesh");
+          meshBytes = mesh.primitives.reduce(
+            (sum, primitive) =>
+              checkedGeometryBytes(
+                sum + primitiveInstanceBytes(primitive, json),
+              ),
+            0,
+          );
+          meshEstimates.set(node.mesh, meshBytes);
+        }
+        bytes += meshBytes;
+      }
+      for (const child of node.children ?? [])
+        bytes = checkedGeometryBytes(bytes + estimates.get(child)!);
+      estimates.set(index, checkedGeometryBytes(bytes));
+      visiting.delete(index);
+    }
+    total = checkedGeometryBytes(total + estimates.get(root)!);
+  }
+  return total;
+};
+
 const decodeTileContentInner = async (
   request: DecodeTileRequest,
   options: DecodeTileOptions = {},
@@ -1742,6 +1831,9 @@ const decodeTileContentInner = async (
       }
       geometry += accessor.count * components * 4 * 3;
     }
+    geometry = checkedGeometryBytes(
+      geometry + sceneInstanceBytes(originalJson),
+    );
     await options.reserveMemory(geometry);
   }
   validateRequiredExtensions(originalJson, request.contentUrl);
