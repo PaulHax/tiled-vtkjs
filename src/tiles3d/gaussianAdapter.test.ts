@@ -465,6 +465,52 @@ describe("Gaussian admission ownership", () => {
     },
   );
 
+  it.each([false, true])(
+    "updates selected compact coverage placement coherently (mixed=%s)",
+    async (mixed) => {
+      const f = fixture();
+      try {
+        await preparePartial(f, mixed);
+        f.hold();
+        const matrix = [...IDENTITY];
+        matrix[12] = 0.6;
+        f.adapter.setBaseMatrix(matrix);
+        await f.started();
+        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
+          mixed ? ["a", "b"] : [],
+        );
+        expect(f.adapter.presentationMatrix()[12]).toBe(0);
+        f.release();
+        await f.settle();
+        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
+          mixed ? ["a", "b"] : [],
+        );
+        expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
+        expect(f.adapter.tileState("newA")).toBe("submitted");
+        expect(f.adapter.tileState("newB")).toBe("submitted");
+        expect(f.pool.stats().rendererBytes).toBe(
+          f.factory.stats(f.renderer)?.residentBytes,
+        );
+        expect(f.errors).toEqual([]);
+        expect(f.refusals).toEqual([]);
+        f.dispose();
+        expect(f.pool.stats()).toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          activeOperations: 0,
+          owners: 0,
+        });
+      } finally {
+        f.dispose();
+      }
+    },
+  );
+
   it("releases an unpublished partial-selection atlas when the complete old frontier is reselected", async () => {
     const f = fixture();
     try {

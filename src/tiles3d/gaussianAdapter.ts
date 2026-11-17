@@ -1296,7 +1296,18 @@ const createManager = (
       );
       const covers = (value: Storage | null): value is Storage =>
         value !== null &&
-        [...drawn].every((tile) => value.tiles.includes(tile));
+        [...drawn].every((tile) => value.tiles.includes(tile)) &&
+        value.primitives
+          .filter((packed) => drawn.has(packed.tile))
+          .every((packed) => {
+            const current = multiply(
+              packed.tile.owner.base,
+              packed.primitive.modelToScene,
+            );
+            return packed.matrix.every(
+              (component, index) => component === current[index],
+            );
+          });
       presentationTilesForSort = requestedPresentation;
       presentationAcceptsPlacement = true;
       if (covers(candidate)) {
@@ -1315,7 +1326,6 @@ const createManager = (
         }
         presentationStorage = storage;
         presentationMemory = displayedMemory;
-        presentationAcceptsPlacement = false;
       } else {
         const selected = [...drawn].sort(
           (left, right) => left.generation - right.generation,
