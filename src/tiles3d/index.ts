@@ -30,6 +30,7 @@ export {
   DecodeWorkerPoolDisposedError,
   TileDecodeError,
   TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
   type CompressedTextureFormat,
   type DecodeWasmUrls,
   type DecodeWorkerLike,
@@ -38,7 +39,33 @@ export {
   type TextureCapabilities,
   type TileDecodeStage,
   type DecodedTileContent,
+  type DecodedPrimitive,
+  type DecodedMeshPrimitive,
+  type DecodedMeshTileContent,
+  type DecodedGaussianPrimitive,
+  type GaussianAppearanceProfile,
   type DecodeTileRequest,
 } from "./decode";
 
 export { createEcefToEnuTransform, wgs84ToEcef } from "./rtc";
+
+export {
+  TileContentRealizationError,
+  type TileContentAdapter,
+  type TileContentAdapterFactory,
+  type TileContentAdapterOptions,
+  type TileContentAdapterStats,
+} from "./contentAdapter";
+
+export {
+  createGaussianDistanceSorter,
+  createGaussianSortController,
+  createGaussianSortWorkerBackend,
+  type GaussianCameraPosition,
+  type GaussianSortBackend,
+  type GaussianSortJob,
+  type GaussianSortPresentation,
+  type GaussianSortRange,
+  type GaussianSortRangeIdentity,
+  type GaussianSortWorkerLike,
+} from "./gaussianSort";

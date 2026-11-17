@@ -15,6 +15,19 @@ export const collectContentBuffers = (
   const geometry = new Set<ArrayBuffer>();
   const textures = new Set<ArrayBuffer>();
   for (const primitive of primitives) {
+    if (primitive.kind === "gaussian") {
+      for (const array of [
+        primitive.positions,
+        primitive.rotations,
+        primitive.scales,
+        primitive.opacities,
+        primitive.sphericalHarmonics,
+        primitive.modelToScene,
+      ]) {
+        if (array.buffer instanceof ArrayBuffer) geometry.add(array.buffer);
+      }
+      continue;
+    }
     for (const array of [
       primitive.positions,
       primitive.normals,

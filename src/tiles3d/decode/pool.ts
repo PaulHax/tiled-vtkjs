@@ -12,6 +12,7 @@ import {
 import {
   TileDecodeError,
   TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
   type TileDecodeStage,
 } from "./types";
 
@@ -60,6 +61,8 @@ type DecodeWorkerErrorMessage = {
     readonly requestedBytes?: number;
     readonly limitBytes?: number;
     readonly retryable?: boolean;
+    readonly property?: string;
+    readonly value?: unknown;
   };
 };
 
@@ -387,20 +390,29 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
                   payload.tileUri,
                   payload.extension,
                 )
-              : payload?.name === "TileDecodeError" &&
+              : payload?.name === "TileUnsupportedGaussianProfileError" &&
                   typeof payload.tileUri === "string" &&
-                  (payload.stage === "profile" || payload.stage === "decode") &&
-                  typeof payload.reason === "string"
-                ? new TileDecodeError(
+                  typeof payload.property === "string"
+                ? new TileUnsupportedGaussianProfileError(
                     payload.tileUri,
-                    payload.stage,
-                    payload.reason,
+                    payload.property,
+                    payload.value,
                   )
-                : new DecodeWorkerError(
-                    typeof payload?.message === "string"
-                      ? payload.message
-                      : "decode worker returned an invalid error",
-                  );
+                : payload?.name === "TileDecodeError" &&
+                    typeof payload.tileUri === "string" &&
+                    (payload.stage === "profile" ||
+                      payload.stage === "decode") &&
+                    typeof payload.reason === "string"
+                  ? new TileDecodeError(
+                      payload.tileUri,
+                      payload.stage,
+                      payload.reason,
+                    )
+                  : new DecodeWorkerError(
+                      typeof payload?.message === "string"
+                        ? payload.message
+                        : "decode worker returned an invalid error",
+                    );
         this.#reject(active, decodeError);
       }
     }

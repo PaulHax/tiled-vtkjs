@@ -19,6 +19,7 @@ import {
   capabilityTarget,
   TileUnsupportedExtensionError,
   type DecodeTileRequest,
+  type DecodedMeshTileContent,
   type TextureCapabilities,
 } from ".";
 import {
@@ -28,6 +29,16 @@ import {
   normalizeTextureCoordinates,
   type DecodeTileOptions,
 } from "./decoder";
+
+const decodeMeshTileContent = async (
+  ...args: Parameters<typeof decodeTileContent>
+): Promise<DecodedMeshTileContent> => {
+  const result = await decodeTileContent(...args);
+  if (!result.primitives.every((primitive) => primitive.kind === "mesh")) {
+    throw new Error("expected mesh-only fixture");
+  }
+  return { ...result, primitives: result.primitives };
+};
 
 let fixtureDirectory = "";
 
@@ -226,11 +237,11 @@ describe("decoded tile contract", () => {
       ...(await request("level-0-root.glb")),
       content: await transformedPointGlb(100),
     };
-    const decoded = await decodeTileContent(input);
+    const decoded = await decodeMeshTileContent(input);
     expect(decoded.primitives).toHaveLength(100);
     expect(decoded.byteEstimate.geometry).toBeGreaterThan(1_000);
     await expect(
-      decodeTileContent(input, {
+      decodeMeshTileContent(input, {
         reserveMemory: async (bytes) => {
           if (bytes > 1_000)
             throw new ResourcePolicyError("work", bytes, 1_000);
@@ -249,7 +260,7 @@ describe("decoded tile contract", () => {
       json.nodes[0].children = children;
       const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
       await expect(
-        decodeTileContent(
+        decodeMeshTileContent(
           { ...(await request("level-0-root.glb")), content },
           {
             reserveMemory: async () => {},
@@ -270,7 +281,7 @@ describe("decoded tile contract", () => {
     );
     const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
     await expect(
-      decodeTileContent(
+      decodeMeshTileContent(
         { ...(await request("level-0-root.glb")), content },
         {
           reserveMemory: async () => {},
@@ -283,7 +294,9 @@ describe("decoded tile contract", () => {
 
   it("rejects an unimplemented required extension with a named tile/profile error", async () => {
     await expect(
-      decodeTileContent(await checkedInRequest("unsupported-extension.gltf")),
+      decodeMeshTileContent(
+        await checkedInRequest("unsupported-extension.gltf"),
+      ),
     ).rejects.toMatchObject({
       name: "TileUnsupportedExtensionError",
       tileUri: "https://fixture.invalid/content/unsupported-extension.gltf",
@@ -291,7 +304,9 @@ describe("decoded tile contract", () => {
       extension: "EXT_mesh_gpu_instancing",
     });
     await expect(
-      decodeTileContent(await checkedInRequest("unsupported-extension.gltf")),
+      decodeMeshTileContent(
+        await checkedInRequest("unsupported-extension.gltf"),
+      ),
     ).rejects.toBeInstanceOf(TileUnsupportedExtensionError);
   });
 
@@ -320,7 +335,7 @@ describe("decoded tile contract", () => {
   };
 
   it("decodes meshopt-compressed geometry", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await checkedInRequest("meshopt-quad.glb"),
     );
     expect(result.primitives).toHaveLength(1);
@@ -338,7 +353,7 @@ describe("decoded tile contract", () => {
    * the only way to see that the repair ran.
    */
   it("repairs colliding meshopt fallback-buffer offsets", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await checkedInRequest("meshopt-quad-collision.glb"),
     );
     expect(absoluteVertices(result)).toEqual(MESHOPT_QUAD_VERTICES);
@@ -348,7 +363,7 @@ describe("decoded tile contract", () => {
   });
 
   it("pins Y-up conversion and rejects indices outside POSITION", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await checkedInRequest("y-up-triangle.gltf"),
     );
     const positions = result.primitives[0]!.positions;
@@ -364,7 +379,7 @@ describe("decoded tile contract", () => {
     ]);
 
     await expect(
-      decodeTileContent(await checkedInRequest("invalid-index.gltf")),
+      decodeMeshTileContent(await checkedInRequest("invalid-index.gltf")),
     ).rejects.toMatchObject({
       name: "TileDecodeError",
       stage: "decode",
@@ -373,7 +388,7 @@ describe("decoded tile contract", () => {
   });
 
   it("decodes the license-recorded Khronos orientation asset in the Y-up profile", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await checkedInRequest("orientation-test.glb"),
       testOptions,
     );
@@ -388,7 +403,7 @@ describe("decoded tile contract", () => {
   });
 
   it("accepts required unlit and carries it into renderer-neutral material", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await checkedInRequest("unlit-triangle.gltf"),
     );
     expect(result.primitives[0]?.material.raw).toMatchObject({
@@ -399,7 +414,7 @@ describe("decoded tile contract", () => {
   it("rejects glTF sampler enums before they reach a renderer backend", async () => {
     const embedded = embeddedGltf({ sampler: { magFilter: 7 } });
     await expect(
-      decodeTileContent(
+      decodeMeshTileContent(
         {
           ...(await request("level-0-root.glb")),
           content: embedded.content,
@@ -412,7 +427,7 @@ describe("decoded tile contract", () => {
   });
 
   it("applies glTF nodes, then mandatory Y-up correction, then tile and scene transforms", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       {
         ...(await request("level-0-root.glb")),
         content: await transformedPointGlb(),
@@ -462,7 +477,7 @@ describe("decoded tile contract", () => {
   });
 
   it("decodes uncompressed multi-primitive GLB into owned, plain data", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await request("level-0-root.glb"),
       testOptions,
     );
@@ -515,7 +530,7 @@ describe("decoded tile contract", () => {
   });
 
   it("preserves authored alpha modes and cutoffs as typed material data", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       {
         ...(await request("level-0-root.glb")),
         content: await authoredAlphaGlb(),
@@ -544,7 +559,7 @@ describe("decoded tile contract", () => {
   });
 
   it("decodes Draco geometry without retaining the parsed asset graph", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await request(`${FIXTURE_CODEC_TILES.draco}.glb`),
       {
         ...testOptions,
@@ -803,7 +818,7 @@ describe("decoded tile contract", () => {
           },
         ],
       };
-      const decoded = await decodeTileContent(
+      const decoded = await decodeMeshTileContent(
         {
           ...(await request("level-0-root.glb")),
           content: new TextEncoder().encode(JSON.stringify(json)).buffer,
@@ -898,7 +913,7 @@ describe("decoded tile contract", () => {
         },
       ],
     };
-    const decoded = await decodeTileContent(
+    const decoded = await decodeMeshTileContent(
       {
         ...(await request("level-0-root.glb")),
         content: new TextEncoder().encode(JSON.stringify(json)).buffer,
@@ -914,18 +929,18 @@ describe("decoded tile contract", () => {
 
   it("fails closed instead of falling back to remote codec defaults", async () => {
     await expect(
-      decodeTileContent(
+      decodeMeshTileContent(
         await request(`${FIXTURE_CODEC_TILES.draco}.glb`),
         testOptions,
       ),
     ).rejects.toThrow(/Draco.*injected/i);
     await expect(
-      decodeTileContent(await request(`${FIXTURE_CODEC_TILES.ktx2}.glb`)),
+      decodeMeshTileContent(await request(`${FIXTURE_CODEC_TILES.ktx2}.glb`)),
     ).rejects.toThrow(/KTX2.*injected/i);
   });
 
   it("deduplicates a shared RGBA texture and accounts actual retained bytes", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await request("level-0-root.glb"),
       testOptions,
     );
@@ -1009,7 +1024,7 @@ describe("decoded tile contract", () => {
     });
     const fetched: string[] = [];
     let decodedImage: { bytes: Uint8Array; mimeType: string } | undefined;
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       {
         ...(await request("level-0-root.glb")),
         content,
@@ -1052,7 +1067,7 @@ describe("decoded tile contract", () => {
       bufferUri: "%252e/mesh%252Ebin",
     });
     const fetched: string[] = [];
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       {
         ...(await request("level-0-root.glb")),
         content,
@@ -1077,7 +1092,7 @@ describe("decoded tile contract", () => {
       bufferUri: "data:application/octet-stream;base64,%%%",
     });
     await expect(
-      decodeTileContent(
+      decodeMeshTileContent(
         {
           ...(await request("level-0-root.glb")),
           content,
@@ -1097,7 +1112,7 @@ describe("decoded tile contract", () => {
     "keeps all logical KTX2 mips for %s and counts the selected blocks",
     async (key, format, loadersFormat) => {
       const seenFormats: string[] = [];
-      const result = await decodeTileContent(
+      const result = await decodeMeshTileContent(
         await request(
           `${FIXTURE_CODEC_TILES.ktx2}.glb`,
           capabilities(key, [format]),
@@ -1146,7 +1161,7 @@ describe("decoded tile contract", () => {
   );
 
   it("uses one full-resolution RGBA representation when compression is unavailable", async () => {
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await request(
         `${FIXTURE_CODEC_TILES.ktx2}.glb`,
         capabilities("rgba", []),
@@ -1175,7 +1190,7 @@ describe("decoded tile contract", () => {
 
   it("separates Basis runtime initialization from per-texture transcode timing", async () => {
     const ticks = [0, 10, 14, 20, 27, 30];
-    const result = await decodeTileContent(
+    const result = await decodeMeshTileContent(
       await request(
         `${FIXTURE_CODEC_TILES.ktx2}.glb`,
         capabilities("bc7", ["bc7"]),
@@ -1242,7 +1257,7 @@ it.each(["VEC3", "VEC4"] as const)(
           .setMesh(document.createMesh().addPrimitive(primitive)),
       );
     const bytes = await new NodeIO().writeBinary(document);
-    const result = await decodeTileContent({
+    const result = await decodeMeshTileContent({
       ...(await request("level-0-root.glb")),
       content: Uint8Array.from(bytes).buffer,
     });

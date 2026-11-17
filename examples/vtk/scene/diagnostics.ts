@@ -8,6 +8,7 @@
  * looking at. In a two-member scene those columns side by side are the demo.
  */
 
+import type { GaussianRendererStats } from "../../../src/tiles3d/gaussianAdapter";
 import type { StreamedSceneCoordinatorStats } from "../../../src";
 import type { PointCloudMemberStats } from "../../../src/points/pointCloudMember";
 import type { Tiles3dMemberStats } from "../../../src/tiles3d/memberTypes";
@@ -24,6 +25,7 @@ export type MemberRow = {
 export type DiagnosticsInput = {
   readonly coordinator: StreamedSceneCoordinatorStats;
   readonly rows: readonly MemberRow[];
+  readonly gaussian?: GaussianRendererStats | null;
   readonly frameMs: number;
   readonly rendererName: string;
   readonly textureFormat: string;
@@ -129,6 +131,18 @@ export const renderDiagnostics = (
         ["frame", `${input.frameMs.toFixed(1)} ms`],
         ["regime", coordinator.governor.regime],
         ["view quality", percent(coordinator.viewQualityFraction)],
+        ...(input.gaussian && input.gaussian.residentSplats > 0
+          ? ([
+              ["drawn splats", count(input.gaussian.displayedSplats)],
+              ["splat resources", megabytes(input.gaussian.residentBytes)],
+              [
+                "splat sort",
+                input.gaussian.pendingSort
+                  ? "working"
+                  : `${input.gaussian.sortMs.toFixed(1)} ms`,
+              ],
+            ] as Field[])
+          : []),
         ["submission queue", megabytes(coordinator.submissions.queuedBytes)],
         [
           "frame admission",

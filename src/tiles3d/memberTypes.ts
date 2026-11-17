@@ -6,7 +6,6 @@ import type {
   TextureCapabilities,
 } from "./decode";
 import type { Allocation } from "../core/streamedMember";
-import type { MeshAdapterStats } from "./meshAdapter";
 import type { MemoryDomain } from "../core/memoryResources";
 
 export type Tiles3dResourceState =
@@ -25,6 +24,10 @@ export type Tiles3dResourceState =
       readonly message: string;
     }
   | { readonly status: "stalled"; readonly message: string };
+import type {
+  TileContentAdapterFactory,
+  TileContentAdapterStats,
+} from "./contentAdapter";
 
 export const DEFAULT_MAXIMUM_SCREEN_SPACE_ERROR_PX = 16;
 export const DEFAULT_TILES3D_CACHE_BYTES = 128 * 1024 * 1024;
@@ -69,6 +72,8 @@ export type Tiles3dMemberServices = {
   /** Caller-owned pool. Dispose it after disposing every member that uses it. */
   readonly workers: DecodeWorkerPoolHandle;
   readonly textureCapabilities: TextureCapabilities;
+  /** View-owned realization, shared across members when the renderer needs global order. */
+  readonly createContentAdapter?: TileContentAdapterFactory;
 };
 
 export type Tiles3dMemberConfig = {
@@ -134,7 +139,7 @@ export type Tiles3dMemberStats = {
   readonly decode: ReturnType<
     NonNullable<import("./decode").DecodeWorkerPoolHandle["stats"]>
   > | null;
-  readonly renderer: MeshAdapterStats;
+  readonly renderer: TileContentAdapterStats;
   readonly submissions: {
     readonly queuedJobs: number;
     readonly queuedBytes: number;
