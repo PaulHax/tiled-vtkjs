@@ -1441,6 +1441,29 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("retires part of a frontier without reuploading its accepted geometry", async () => {
+    const f = fixture();
+    try {
+      await f.show("a", 8);
+      expect(f.adapter.submitTile("b", field(5))).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      const before = f.factory.stats(f.renderer)?.attributeUploadBytes;
+      f.adapter.retireTile("b");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a"]);
+      expect(f.factory.stats(f.renderer)).toMatchObject({
+        displayedSplats: 8,
+        attributeUploadBytes: before,
+        pendingPreparation: false,
+      });
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("retires stable tuples without requiring extra capacity for optional compaction", async () => {
     const f = fixture();
     try {

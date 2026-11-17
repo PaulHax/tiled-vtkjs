@@ -2125,39 +2125,28 @@ const createManager = (
         candidate = storage;
         releaseRetiredSources();
       }
+      // Compact only when a replacement was admitted with a compact
+      // destination. Unused stable ranges can be reused by future demand.
+      const compact =
+        compactGroup !== null &&
+        groupReady(compactGroup) &&
+        (candidate?.signature !== signature || candidate.arena !== arena);
+      let nextArena = compact ? createGaussianStorage() : arena;
+      if (!compact)
+        arena.retireExcept(
+          retainRanges(
+            arena,
+            requests.map((request) => request.key),
+          ),
+        );
+      const projectedCapacity = nextArena.requiredCapacity(requests);
       if (
-        arenaMemory !== realizedMemory &&
-        arenaCapacity !== arena.capacity &&
-        arena.requiredCapacity(requests) === arena.capacity
-      ) {
-        // Cancel speculative growth before optional compaction chooses another
-        // reservation. The realized atlas remains charged independently.
-        arenaMemory?.release();
-        arenaMemory = realizedMemory;
-        arenaCapacity = arena.capacity;
-      }
-      const compactArena = createGaussianStorage();
-      const compactCapacity = compactArena.requiredCapacity(requests);
-      let compact =
-        compactCapacity < arena.capacity ||
-        (compactGroup !== null && groupReady(compactGroup));
-      if (candidate?.signature === signature && candidate.arena === arena)
-        compact = false;
-      let nextArena = compact ? compactArena : arena;
-      const retainedKeys = retainRanges(
-        arena,
-        requests.map((request) => request.key),
-      );
-      if (!compact) arena.retireExcept(retainedKeys);
-      let projectedCapacity = nextTiles.length
-        ? nextArena.requiredCapacity(requests)
-        : 0;
-      if (
-        arenaMemory !== realizedMemory &&
         !compact &&
+        arenaMemory !== realizedMemory &&
         projectedCapacity === arena.capacity &&
         arenaCapacity !== arena.capacity
       ) {
+        // Retirement can make speculative growth unnecessary.
         arenaMemory?.release();
         arenaMemory = realizedMemory;
         arenaCapacity = arena.capacity;
@@ -2167,47 +2156,30 @@ const createManager = (
         arenaMemory !== realizedMemory &&
         arenaMemory !== displayedMemory &&
         arenaCapacity === projectedCapacity;
-      try {
+      if (
+        !reservedCompaction &&
+        (compact || projectedCapacity !== arenaCapacity)
+      ) {
         if (
-          !reservedCompaction &&
-          (compact || projectedCapacity !== arenaCapacity)
+          arenaMemory &&
+          arenaMemory !== displayedMemory &&
+          arenaMemory !== realizedMemory
         ) {
-          if (
-            arenaMemory &&
-            arenaMemory !== displayedMemory &&
-            arenaMemory !== realizedMemory
-          ) {
-            throw new ResourcePolicyError(
-              "renderer",
-              projectedCapacity * gpuBytesPerTuple,
-              memoryPool.stats().totalBytes,
-              true,
-            );
-          }
-          const nextMemory = memory.reserveRenderer(
+          throw new ResourcePolicyError(
+            "renderer",
             projectedCapacity * gpuBytesPerTuple,
-            {
-              cpuBytes: projectedCapacity * 60,
-              replacing: arenaMemory ? [arenaMemory] : [],
-            },
+            memoryPool.stats().totalBytes,
+            true,
           );
-          arenaMemory = nextMemory;
-          arenaCapacity = projectedCapacity;
         }
-      } catch (error) {
-        // Retirement can publish safely in the existing tuple ranges. An
-        // optional capacity reduction must not require spare transition bytes.
-        if (
-          !compact ||
-          !(error instanceof ResourcePolicyError) ||
-          compactGroup !== null
-        )
-          throw error;
-        projectedCapacity = arena.requiredCapacity(requests);
-        if (projectedCapacity !== arenaCapacity) throw error;
-        compact = false;
-        nextArena = arena;
-        arena.retireExcept(retainedKeys);
+        arenaMemory = memory.reserveRenderer(
+          projectedCapacity * gpuBytesPerTuple,
+          {
+            cpuBytes: projectedCapacity * 60,
+            replacing: arenaMemory ? [arenaMemory] : [],
+          },
+        );
+        arenaCapacity = projectedCapacity;
       }
       if (
         projectedCapacity > nextArena.capacity &&
