@@ -367,6 +367,18 @@ const validateProfile = (primitive: DecodedGaussianPrimitive): void => {
 const allocationKey = (tile: Tile, index: number): string =>
   `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`;
 
+const matchesStorage = (
+  value: Storage | null,
+  arena: Storage["arena"],
+  signature: string,
+): boolean =>
+  value?.arena === arena &&
+  value.signature === signature &&
+  value.bufferRevision === arena.bufferRevision &&
+  value.primitives.every(({ allocationKey, allocationRevision }) =>
+    arena.owns(allocationKey, allocationRevision),
+  );
+
 const makeStorage = (
   tiles: Tile[],
   previous: Storage | null,
@@ -378,7 +390,7 @@ const makeStorage = (
         `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
     )
     .join("|");
-  if (previous?.signature === signature) return previous;
+  if (previous && matchesStorage(previous, arena, signature)) return previous;
   if (!tiles.length) arena.clear();
   const count = tiles.reduce((sum, tile) => sum + tile.count, 0);
   arena.grow(
@@ -2142,8 +2154,7 @@ const createManager = (
       if (
         storage &&
         candidate !== storage &&
-        storage.signature === signature &&
-        storage.arena.positions === storage.positions &&
+        matchesStorage(storage, storage.arena, signature) &&
         displayedMemory
       ) {
         // After cancellation the published arena can serve these ranges.
@@ -2162,7 +2173,7 @@ const createManager = (
       const compact =
         compactGroup !== null &&
         groupReady(compactGroup) &&
-        (candidate?.signature !== signature || candidate.arena !== arena);
+        !matchesStorage(candidate, arena, signature);
       let nextArena = compact ? createGaussianStorage() : arena;
       if (!compact)
         arena.retireExcept(

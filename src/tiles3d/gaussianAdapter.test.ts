@@ -1441,6 +1441,42 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("redraws a readmitted parent after retiring its detailed children", async () => {
+    const f = fixture();
+    try {
+      await f.show("root", 3);
+      const children = ["root/0", "root/1"];
+      expect(
+        f.adapter.submitTileGroup(
+          children.map((id) => ({ id, content: field(3) })),
+          ["root"],
+        ),
+      ).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(children);
+      f.adapter.retireTile("root");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(children);
+      f.move(100);
+      expect(
+        f.adapter.submitTile(
+          "root",
+          field(3),
+          () => {
+            for (const child of children) f.adapter.retireTile(child);
+            f.adapter.setDrawnTiles(["root"]);
+          },
+          children,
+        ),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["root"]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("retires part of a frontier without reuploading its accepted geometry", async () => {
     const f = fixture();
     try {
