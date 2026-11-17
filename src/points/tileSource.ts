@@ -9,6 +9,7 @@
 
 import type { VoxelKey } from "./octree";
 import type { Bounds, Vec3 } from "../core/geometry";
+import type { MemoryWork } from "../core/memoryResources";
 
 export type TileSourceMetadata = {
   /** Total points in the dataset. */
@@ -79,6 +80,8 @@ export type LoadOptions = {
    * take the same options.
    */
   readonly signal?: AbortSignal;
+  /** Shared operation ownership, retained until physical completion. */
+  readonly memory?: MemoryWork;
 };
 
 /** A source of octree point-cloud tiles. */

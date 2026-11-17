@@ -41,6 +41,7 @@ import { finiteAbove, finiteNonNegative } from "../core/numeric";
 import { keyToString } from "./octree";
 import { setActorPointSize, setMapperPointCount } from "./drawState";
 import { tileBytes, type TileData } from "./tileSource";
+import type { MemoryOwner, MemoryLease } from "../core/memoryResources";
 
 export type RendererAdapterOptions = {
   /** vtk.js renderer the tile actors are added to. */
@@ -56,9 +57,12 @@ export type RendererAdapterOptions = {
   devicePixelRatio?: number;
   /** Initial visibility. Default true. Tiles added while hidden stay hidden. */
   visible?: boolean;
+  memory?: MemoryOwner;
 };
 
 export type RendererAdapter = {
+  reserveTile(key: string, tile: TileData): MemoryLease | undefined;
+  trimReuse(): void;
   /**
    * Apply one controller batch (typically wired as `onTiles`). Batches apply
    * whether or not the adapter is visible; an addition for a key already on
@@ -175,6 +179,7 @@ export type RendererAdapterStats = {
 };
 
 type TileActors = {
+  memory?: MemoryLease;
   actor: VtkActor;
   mapper: VtkPointGaussianMapper;
   polyData: VtkPolyData;
@@ -246,10 +251,10 @@ export const createRendererAdapter = (
   const reuseDepths = Array.from({ length: REUSE_DEPTH_BUCKETS }, () => 0);
 
   const holdSubmitted = (keyString: string, entry: TileActors): void => {
+    renderer.addActor(entry.actor);
     tiles.set(keyString, entry);
     submittedPoints += entry.tile.pointCount;
     submittedBytes += entry.resourceBytes;
-    renderer.addActor(entry.actor);
   };
 
   const dropSubmitted = (keyString: string, entry: TileActors): void => {
@@ -314,38 +319,60 @@ export const createRendererAdapter = (
     entry.actor.setUserMatrix(translatedMatrix(baseMatrix, entry.tile.origin));
   };
 
-  const createTile = (keyString: string, tile: TileData): TileActors => {
+  const createTile = (
+    keyString: string,
+    tile: TileData,
+    memory?: MemoryLease,
+  ): TileActors => {
     builtTiles += 1;
-    const polyData = vtkPolyData.newInstance();
-    polyData.getPoints().setData(tile.positions, 3);
-    if (tile.rgb !== undefined) {
-      polyData.getPointData().setScalars(
-        vtkDataArray.newInstance({
-          name: "RGB",
-          values: tile.rgb,
-          numberOfComponents: 3,
-        }),
-      );
+    let polyData: ReturnType<typeof vtkPolyData.newInstance> | undefined;
+    let mapper:
+      | ReturnType<typeof vtkPointGaussianMapper.newInstance>
+      | undefined;
+    let actor: ReturnType<typeof vtkActor.newInstance> | undefined;
+    try {
+      polyData = vtkPolyData.newInstance();
+      polyData.getPoints().setData(tile.positions, 3);
+      if (tile.rgb !== undefined) {
+        polyData.getPointData().setScalars(
+          vtkDataArray.newInstance({
+            name: "RGB",
+            values: tile.rgb,
+            numberOfComponents: 3,
+          }),
+        );
+      }
+      mapper = vtkPointGaussianMapper.newInstance({ scaleFactor: 0 });
+      mapper.setInputData(polyData);
+      mapper.setStatic?.(true);
+      actor = vtkActor.newInstance();
+      actor.setMapper(mapper);
+      // Points carry no alpha. Saying so up front spares vtk.js asking the
+      // mapper, which looks its scalars up again, in several passes a frame.
+      actor.setForceOpaque(true);
+      const entry: TileActors = {
+        actor,
+        mapper,
+        polyData,
+        tile,
+        resourceBytes: tileBytes(tile),
+        drawnPointCount: 0,
+        pooledSerial: 0,
+        memory,
+      };
+      memory?.setCpu([
+        tile.positions.buffer as ArrayBuffer,
+        ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+      ]);
+      applyTileState(keyString, entry);
+      return entry;
+    } catch (error) {
+      actor?.delete?.();
+      mapper?.delete?.();
+      polyData?.delete?.();
+      memory?.release();
+      throw error;
     }
-    const mapper = vtkPointGaussianMapper.newInstance({ scaleFactor: 0 });
-    mapper.setInputData(polyData);
-    mapper.setStatic?.(true);
-    const actor = vtkActor.newInstance();
-    actor.setMapper(mapper);
-    // Points carry no alpha. Saying so up front spares vtk.js asking the
-    // mapper, which looks its scalars up again, in several passes a frame.
-    actor.setForceOpaque(true);
-    const entry: TileActors = {
-      actor,
-      mapper,
-      polyData,
-      tile,
-      resourceBytes: tileBytes(tile),
-      drawnPointCount: 0,
-      pooledSerial: 0,
-    };
-    applyTileState(keyString, entry);
-    return entry;
   };
 
   const releaseTile = (entry: TileActors): void => {
@@ -353,6 +380,7 @@ export const createRendererAdapter = (
     entry.actor.delete?.();
     entry.mapper.delete?.();
     entry.polyData.delete?.();
+    entry.memory?.release();
   };
 
   /** Reuse is only sound while an entry still holds the payload being added. */
@@ -379,6 +407,18 @@ export const createRendererAdapter = (
   };
 
   return {
+    reserveTile(key, tile) {
+      const held = tiles.get(key) ?? pendingRelease.get(key);
+      if (held && holdsPayload(held, tile)) return held.memory?.share();
+      trimPool(tileBytes(tile));
+      return options.memory?.reserveRenderer(tileBytes(tile));
+    },
+    trimReuse() {
+      for (const [key, entry] of pendingRelease) {
+        dropPooled(key, entry);
+        releaseTile(entry);
+      }
+    },
     applyDrawPlan(plan) {
       if (disposed) return;
       const next = new Map(
@@ -405,50 +445,70 @@ export const createRendererAdapter = (
         holdPooled(keyString, entry);
         changed = true;
       }
-      for (const { key, tile } of batch.added) {
-        const keyString = keyToString(key);
-        const current = tiles.get(keyString);
-        if (current !== undefined) {
-          // Batches are disjoint deltas, so an addition for a key already on
-          // screen is a payload replacement — never a duplicate. Keeping the
-          // old actor would draw superseded points for the rest of the
-          // session, and its payload can never be reused, so it goes now.
-          if (holdsPayload(current, tile)) {
-            if (
-              current.tile.pointCount === tile.pointCount &&
-              current.tile.origin.every(
-                (value, index) => value === tile.origin[index],
+      for (let index = 0; index < batch.added.length; index += 1) {
+        const { key, tile, memory } = batch.added[index]!;
+        try {
+          const keyString = keyToString(key);
+          const current = tiles.get(keyString);
+          if (current !== undefined) {
+            // Batches are disjoint deltas, so an addition for a key already on
+            // screen is a payload replacement — never a duplicate. Keeping the
+            // old actor would draw superseded points for the rest of the
+            // session, and its payload can never be reused, so it goes now.
+            if (holdsPayload(current, tile)) {
+              memory?.release();
+              if (
+                current.tile.pointCount === tile.pointCount &&
+                current.tile.origin.every(
+                  (value, index) => value === tile.origin[index],
+                )
               )
-            )
+                continue;
+              submittedPoints += tile.pointCount - current.tile.pointCount;
+              current.tile = tile;
+              applyTileState(keyString, current);
+              changed = true;
               continue;
-            submittedPoints += tile.pointCount - current.tile.pointCount;
-            current.tile = tile;
-            applyTileState(keyString, current);
-            changed = true;
-            continue;
+            }
+            dropSubmitted(keyString, current);
+            releaseTile(current);
           }
-          dropSubmitted(keyString, current);
-          releaseTile(current);
-        }
-        const stale = pendingRelease.get(keyString);
-        if (stale !== undefined) {
-          dropPooled(keyString, stale);
-          if (holdsPayload(stale, tile)) {
-            stale.tile = tile;
-            applyTileState(keyString, stale);
-            holdSubmitted(keyString, stale);
-            reusedTiles += 1;
-            const bucket = depthBucket(pooledSerial - 1 - stale.pooledSerial);
-            reuseDepths[bucket] = (reuseDepths[bucket] ?? 0) + 1;
-            changed = true;
-            continue;
+          const stale = pendingRelease.get(keyString);
+          if (stale !== undefined) {
+            dropPooled(keyString, stale);
+            if (holdsPayload(stale, tile)) {
+              memory?.release();
+              stale.tile = tile;
+              try {
+                applyTileState(keyString, stale);
+                holdSubmitted(keyString, stale);
+              } catch (error) {
+                releaseTile(stale);
+                throw error;
+              }
+              reusedTiles += 1;
+              const bucket = depthBucket(pooledSerial - 1 - stale.pooledSerial);
+              reuseDepths[bucket] = (reuseDepths[bucket] ?? 0) + 1;
+              changed = true;
+              continue;
+            }
+            releaseTile(stale);
           }
-          releaseTile(stale);
+          trimPool(tileBytes(tile));
+          const entry = createTile(keyString, tile, memory);
+          try {
+            holdSubmitted(keyString, entry);
+          } catch (error) {
+            releaseTile(entry);
+            throw error;
+          }
+          changed = true;
+        } catch (error) {
+          memory?.release();
+          for (const remainder of batch.added.slice(index + 1))
+            remainder.memory?.release();
+          throw error;
         }
-        trimPool(tileBytes(tile));
-        const entry = createTile(keyString, tile);
-        holdSubmitted(keyString, entry);
-        changed = true;
       }
       // Removals alone must still bring the pool back under its ceiling. A
       // deactivated cloud sends nothing but removals, and trimming only on the

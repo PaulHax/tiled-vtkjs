@@ -200,6 +200,13 @@ describe("traverseTileset", () => {
           status: "failed" as const,
         })),
       },
+      {
+        ...snapshot,
+        entries: snapshot.entries.map((entry) => ({
+          ...entry,
+          status: "blocked" as const,
+        })),
+      },
       snapshot,
     ]) {
       const next = { ...options, subtrees };

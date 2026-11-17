@@ -1,4 +1,5 @@
 import type { Mat4 } from "../../core/mat4";
+import type { MemoryWork } from "../../core/memoryResources";
 
 export type CompressedTextureFormat =
   | "astc-4x4"
@@ -183,7 +184,10 @@ export type DecodeJob = {
 
 /** Minimal pool surface supplied to renderer-neutral members. */
 export type DecodeWorkerPoolHandle = {
-  decode(request: DecodeTileRequest): DecodeJob;
+  decode(
+    request: DecodeTileRequest,
+    options?: { readonly memory?: MemoryWork },
+  ): DecodeJob;
   stats?(): {
     readonly size: number;
     readonly queuedJobs: number;

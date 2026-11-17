@@ -171,6 +171,17 @@ const normalizeInputs = (inputs: GovernorInputs): GovernorInputs => ({
     usableNonNegative(inputs.physicalHierarchyOperations),
   ),
   residentBytes: Math.floor(usableNonNegative(inputs.residentBytes)),
+  ...(inputs.memoryDemand
+    ? {
+        memoryDemand: {
+          minimumBytes: usableNonNegative(inputs.memoryDemand.minimumBytes),
+          desiredBytes:
+            inputs.memoryDemand.desiredBytes === Number.POSITIVE_INFINITY
+              ? Number.POSITIVE_INFINITY
+              : usableNonNegative(inputs.memoryDemand.desiredBytes),
+        },
+      }
+    : {}),
 });
 
 /** Lack-of-progress window before one member is isolated from view gating. */
@@ -410,6 +421,13 @@ export const createStreamedSceneCoordinator = (
       state.inputs = state.active
         ? normalizeInputs(state.member.governorInputs())
         : EMPTY_INPUTS;
+      if (state.active)
+        state.memoryMember?.update({
+          residentBytes: state.inputs.residentBytes,
+          minimumBytes: state.inputs.memoryDemand?.minimumBytes ?? 0,
+          desiredBytes:
+            state.inputs.memoryDemand?.desiredBytes ?? Number.POSITIVE_INFINITY,
+        });
     }
     updateStalls();
     // Fixed members do not consume normalized quality, but their frame cost
@@ -450,10 +468,16 @@ export const createStreamedSceneCoordinator = (
    * the page inside microtasks. Such a report still marks the inputs stale,
    * and the next frame reads them.
    */
+  let preparedAvailability = memory.stats().availabilityRevision;
   const checkInputs = (): void => {
     try {
       if (disposed || !inputsStale) return;
-      if (owesMeasurement(observe()) || allocationOutdated()) {
+      const drained = observe();
+      if (
+        owesMeasurement(drained) ||
+        allocationOutdated() ||
+        preparedAvailability !== memory.stats().availabilityRevision
+      ) {
         options.scheduleRender();
       }
     } finally {
@@ -643,6 +667,7 @@ export const createStreamedSceneCoordinator = (
       for (const state of members) {
         if (state.active) state.member.prepareFrame();
       }
+      preparedAvailability = memory.stats().availabilityRevision;
       submissions.prepareFrame();
       capacityWorkSinceLastReport ||=
         submissions.stats().lastFrameAdmittedJobs > 0;
@@ -682,6 +707,7 @@ export const createStreamedSceneCoordinator = (
     needsFrame: () =>
       !disposed &&
       (submissions.hasPending() ||
+        preparedAvailability !== memory.stats().availabilityRevision ||
         (hasAdaptiveMember() && governor.needsFrame()) ||
         allocationOutdated()),
 

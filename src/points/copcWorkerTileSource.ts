@@ -263,6 +263,15 @@ export const createCopcWorkerTileSource = async (
     },
 
     async loadTile(key: VoxelKey, load?: LoadOptions): Promise<TileData> {
+      const entry = entries.get(keyToString(key));
+      if (entry)
+        load?.memory?.resize(
+          Math.max(
+            load.memory.bytes(),
+            entry.pointCount * (state.copc.header.pointDataRecordLength + 30) +
+              entry.pointDataLength * 2,
+          ),
+        );
       const { channel, request } = tileRequest(key);
       const response = await channel.send(request, load?.signal);
       if (response.type !== "tile") {

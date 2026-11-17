@@ -1,4 +1,5 @@
 import { ADAPTIVE_QUALITY_DEFAULTS } from "../core/adaptiveBudget";
+import { safeCall } from "../core/observers";
 import { createLodController, type LodController } from "./controller";
 import type { PointPresentation } from "./pointPresentation";
 import { pointBudgets } from "./pointQuality";
@@ -14,6 +15,10 @@ import {
   type StreamedMemberContext,
 } from "../core/streamedMember";
 import type { TileSource } from "./tileSource";
+import {
+  ResourcePolicyError,
+  type MemoryDomain,
+} from "../core/memoryResources";
 
 export const DEFAULT_FIXED_POINT_BUDGET = 2_000_000;
 export const DEFAULT_MIN_POINT_BUDGET = ADAPTIVE_QUALITY_DEFAULTS.minBudget;
@@ -34,6 +39,10 @@ export type PointCloudMemberConfig = {
   readonly pointBudget?: number;
   readonly refinementCutoffPx?: number;
   readonly selectionDelayMs?: number;
+  readonly onError?: (error: unknown) => void;
+  readonly onResourceState?: (
+    state: PointCloudMemberStats["resourceState"],
+  ) => void;
 };
 
 export type PointCloudMemberStats = {
@@ -46,6 +55,20 @@ export type PointCloudMemberStats = {
   readonly allocation: Allocation;
   readonly controller: ReturnType<LodController["stats"]>;
   readonly renderer: ReturnType<RendererAdapter["stats"]>;
+  readonly resourceState:
+    | { readonly status: "ready" }
+    | {
+        readonly status: "blocked";
+        readonly domain: MemoryDomain;
+        readonly requestedBytes: number;
+        readonly limitBytes: number;
+        readonly retryable: boolean;
+      }
+    | {
+        readonly status: "error";
+        readonly errorName: string;
+        readonly message: string;
+      };
 };
 
 const pointCountOf = (config: PointCloudMemberConfig): number => {
@@ -76,6 +99,40 @@ export const createPointCloudMember = (
   let active = true;
   let disposed = false;
   let stationaryQualityFraction = 1;
+  let resourceState: PointCloudMemberStats["resourceState"] = {
+    status: "ready",
+  };
+  const setResourceState = (
+    next: PointCloudMemberStats["resourceState"],
+  ): void => {
+    resourceState = next;
+    safeCall(() => config.onResourceState?.(next));
+    context.onWorkChange?.();
+  };
+  let lastAvailability = context.memory.stats().availabilityRevision;
+  let lastPolicy = context.memory.stats().revision;
+  let retryOnAvailability = false;
+  const onPolicyRefusal = (error: ResourcePolicyError): void => {
+    retryOnAvailability = error.retryable;
+    setResourceState({
+      status: "blocked",
+      domain: error.domain,
+      requestedBytes: error.requestedBytes,
+      limitBytes: error.limitBytes,
+      retryable: error.retryable,
+    });
+    lastAvailability = context.memory.stats().availabilityRevision;
+    queueMicrotask(() => {
+      lastAvailability = context.memory.stats().availabilityRevision;
+    });
+    context.onWorkChange?.();
+  };
+  const memory = context.memory.createOwner({
+    reclaim(domain) {
+      if (domain === "cpu") controller.trimCache(0);
+      adapter.trimReuse();
+    },
+  });
   let allocation: Allocation = {
     qualityFraction: 1,
     memoryBudgetBytes: 0,
@@ -90,10 +147,27 @@ export const createPointCloudMember = (
     scheduleRender: context.scheduleRender,
     devicePixelRatio: context.devicePixelRatio,
     visible: active,
+    memory,
   });
+  const report = (error: unknown): void => {
+    resourceState = {
+      status: "error",
+      errorName: error instanceof Error ? error.name : "Error",
+      message: error instanceof Error ? error.message : String(error),
+    };
+    safeCall(() => config.onResourceState?.(resourceState));
+    safeCall(() => config.onError?.(error));
+    context.onWorkChange?.();
+  };
   const controller = createLodController({
     source: config.source,
-    onTiles: adapter.applyBatch,
+    onTiles(batch) {
+      try {
+        adapter.applyBatch(batch);
+      } catch (error) {
+        report(error);
+      }
+    },
     onDrawPlan: adapter.applyDrawPlan,
     scheduleRender: context.scheduleRender,
     onWorkChange: context.onWorkChange,
@@ -103,6 +177,10 @@ export const createPointCloudMember = (
       ? adaptiveMinimum(config)
       : (config.pointBudget ?? DEFAULT_FIXED_POINT_BUDGET),
     memoryBudgetBytes: 0,
+    memory,
+    reserveRenderer: adapter.reserveTile,
+    onPolicyRefusal,
+    onError: report,
     presentation: config.presentation,
     refinementCutoffPx: config.refinementCutoffPx,
     selectionDelayMs: config.selectionDelayMs,
@@ -120,8 +198,29 @@ export const createPointCloudMember = (
 
   const applyPointAllocation = (next: Allocation): void => {
     allocation = next;
-    controller.setMemoryBudgetBytes(next.memoryBudgetBytes);
     adapter.setResourceCeilingBytes(next.memoryBudgetBytes);
+    const demand = controller.governorInputs().memoryDemand;
+    if (
+      active &&
+      demand.desiredBytes > 0 &&
+      demand.minimumBytes > next.memoryBudgetBytes
+    ) {
+      onPolicyRefusal(
+        new ResourcePolicyError(
+          "renderer",
+          demand.minimumBytes,
+          next.memoryBudgetBytes,
+        ),
+      );
+      if (adapter.workState().gpuResidentBytes > 0) return;
+    } else if (
+      resourceState.status === "blocked" &&
+      resourceState.domain === "renderer"
+    ) {
+      setResourceState({ status: "ready" });
+      controller.retryMemory();
+    }
+    controller.setMemoryBudgetBytes(next.memoryBudgetBytes);
     if (!config.adaptive) {
       controller.setPointBudget(
         config.pointBudget ?? DEFAULT_FIXED_POINT_BUDGET,
@@ -177,7 +276,23 @@ export const createPointCloudMember = (
 
     beginInteraction: controller.beginInteraction,
     endInteraction: controller.endInteraction,
-    prepareFrame() {},
+    prepareFrame() {
+      const next = context.memory.stats().availabilityRevision;
+      const policy = context.memory.stats().revision;
+      const policyChanged = policy !== lastPolicy;
+      lastPolicy = policy;
+      if (
+        !disposed &&
+        active &&
+        (policyChanged || (retryOnAvailability && next !== lastAvailability)) &&
+        resourceState.status === "blocked"
+      ) {
+        lastAvailability = next;
+        setResourceState({ status: "ready" });
+        controller.retryMemory();
+        lastAvailability = context.memory.stats().availabilityRevision;
+      }
+    },
 
     governorInputs(): GovernorInputs {
       const narrow = controller.governorInputs();
@@ -208,6 +323,7 @@ export const createPointCloudMember = (
         physicalTileOperations: narrow.physicalTileOperations,
         physicalHierarchyOperations: narrow.physicalHierarchyOperations,
         residentBytes: adapter.workState().gpuResidentBytes,
+        memoryDemand: narrow.memoryDemand,
       };
     },
 
@@ -237,6 +353,7 @@ export const createPointCloudMember = (
         allocation,
         controller: controller.stats(),
         renderer: adapter.stats(),
+        resourceState,
       };
     },
 
@@ -245,6 +362,7 @@ export const createPointCloudMember = (
       disposed = true;
       controller.dispose();
       adapter.dispose();
+      memory.close();
     },
   };
 };

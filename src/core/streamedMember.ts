@@ -75,6 +75,11 @@ export type GovernorInputs = {
   readonly physicalTileOperations: number;
   readonly physicalHierarchyOperations: number;
   readonly residentBytes: number;
+  /** Minimum useful coverage and current demand, including refused admissions. */
+  readonly memoryDemand?: {
+    readonly minimumBytes: number;
+    readonly desiredBytes: number;
+  };
 };
 
 export type AllocationRegime = "moving" | "stationary";

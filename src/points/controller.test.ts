@@ -2092,7 +2092,7 @@ describe("createLodController — selection stats", () => {
     // diagnostic snapshot it was carved out of.
     const agrees = () => {
       const stats = controller.stats();
-      expect(controller.governorInputs()).toEqual({
+      expect(controller.governorInputs()).toMatchObject({
         workRevision: stats.workRevision,
         workPending: stats.workPending,
         memoryBudgetBytes: stats.memoryBudgetBytes,
@@ -2156,15 +2156,21 @@ describe("createLodController — batch coalescing", () => {
     await settle();
     batches.length = 0;
 
+    const flushes: VoidFunction[] = [];
+    const microtasks = vi
+      .spyOn(globalThis, "queueMicrotask")
+      .mockImplementation((job) => {
+        flushes.push(job);
+      });
     deferred.get("0-0-0-0")!.resolve();
-    // Exactly one turn: the fetch continuation claims residency and queues a
-    // flush that has not run yet.
-    await Promise.resolve();
+    await settle();
+    microtasks.mockRestore();
     expect(controller.stats().residentTiles).toBe(1);
     controller.setCamera(AWAY);
     expect(controller.stats().residentTiles).toBe(0);
     await settle();
 
+    for (const flush of flushes) flush();
     expect(violations).toEqual([]);
     expect(batches).toEqual([]);
     expect(visible.size).toBe(0);
@@ -2278,12 +2284,20 @@ describe("createLodController — batch coalescing", () => {
 
     // Residency the consumer has not been told about yet: tearing down must
     // not ask it to remove an actor it never created.
+    const flushes: VoidFunction[] = [];
+    const microtasks = vi
+      .spyOn(globalThis, "queueMicrotask")
+      .mockImplementation((job) => {
+        flushes.push(job);
+      });
     deferred.get("0-0-0-0")!.resolve();
-    await Promise.resolve();
+    await settle();
+    microtasks.mockRestore();
     expect(controller.stats().residentTiles).toBe(1);
     controller.dispose();
     await settle();
 
+    for (const flush of flushes) flush();
     expect(violations).toEqual([]);
     expect(batches).toEqual([]);
     expect(visible.size).toBe(0);
@@ -3126,15 +3140,21 @@ describe("createLodController — pickPoint", () => {
     controller.setCamera(VIEW);
     await settle();
 
+    const flushes: VoidFunction[] = [];
+    const microtasks = vi
+      .spyOn(globalThis, "queueMicrotask")
+      .mockImplementation((job) => {
+        flushes.push(job);
+      });
     deferred.get("0-0-0-0")!.resolve();
-    // One turn: the payload claims residency, but the batched flush that
-    // hands it to the renderer is still queued behind this continuation.
-    await Promise.resolve();
+    await settle();
+    microtasks.mockRestore();
     expect(controller.activeKeys().resident).toContain("0-0-0-0");
     expect(controller.activeKeys().submitted).toEqual([]);
     // What the renderer is not yet drawing must not answer a pick.
     expect(pickCenter(controller)).toEqual({ status: "miss" });
 
+    for (const flush of flushes) flush();
     await settle();
     expect(controller.activeKeys().submitted).toContain("0-0-0-0");
     expect(pickCenter(controller)?.status).toBe("hit");

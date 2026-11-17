@@ -66,6 +66,7 @@ describe("classic 3D Tiles decode worker", () => {
               `${origin}/dist/tiles3dDecodeWorker.classic.js`,
             );
             try {
+              const reservations: number[] = [];
               const message = await new Promise<unknown>((resolve, reject) => {
                 const timeout = setTimeout(
                   () => reject(new Error("decode worker timed out")),
@@ -76,6 +77,15 @@ describe("classic 3D Tiles decode worker", () => {
                   reject(new Error(event.message));
                 };
                 worker.onmessage = (event) => {
+                  if (event.data.kind === "memory-request") {
+                    reservations.push(event.data.bytes);
+                    worker.postMessage({
+                      kind: "memory-response",
+                      jobId: event.data.jobId,
+                      requestId: event.data.requestId,
+                    });
+                    return;
+                  }
                   clearTimeout(timeout);
                   resolve(event.data);
                 };
@@ -83,6 +93,7 @@ describe("classic 3D Tiles decode worker", () => {
                   {
                     kind: "decode",
                     jobId: 7,
+                    managedMemory: true,
                     request: {
                       content,
                       contentUrl: `${origin}/fixture/content/${file}`,
@@ -142,6 +153,7 @@ describe("classic 3D Tiles decode worker", () => {
                 decoded.result.primitives[0]?.material.baseColorTexture;
               return {
                 kind: decoded.kind,
+                reservationCount: reservations.length,
                 jobId: decoded.jobId,
                 primitiveCount: decoded.result.primitives.length,
                 positionsAreFloat32: decoded.result.primitives.every(
@@ -179,6 +191,7 @@ describe("classic 3D Tiles decode worker", () => {
           positionsAreFloat32: true,
           origin: [expect.any(Number), expect.any(Number), expect.any(Number)],
         });
+        expect(result.reservationCount).toBeGreaterThan(1);
         expect(result.geometryBytes).toBeGreaterThan(0);
         expect(result.textureBytes).toBeGreaterThan(0);
         expect(result.sharedTexture).toBe(true);

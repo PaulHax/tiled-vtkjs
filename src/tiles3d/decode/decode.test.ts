@@ -12,6 +12,8 @@ import {
   generateTiles3dFixture,
 } from "../../../scripts/generateTiles3dFixture.mjs";
 
+import { ResourcePolicyError } from "../../core/memoryResources";
+
 import {
   buildTransferList,
   capabilityTarget,
@@ -126,7 +128,7 @@ const authoredAlphaGlb = async (): Promise<ArrayBuffer> => {
   ) as ArrayBuffer;
 };
 
-const transformedPointGlb = async (): Promise<ArrayBuffer> => {
+const transformedPointGlb = async (instances = 1): Promise<ArrayBuffer> => {
   const document = new Document();
   const buffer = document.createBuffer("transform-buffer");
   const positions = document
@@ -138,11 +140,14 @@ const transformedPointGlb = async (): Promise<ArrayBuffer> => {
     .createPrimitive()
     .setAttribute("POSITION", positions);
   const mesh = document.createMesh("mesh").addPrimitive(primitive);
-  const node = document
-    .createNode("translated")
-    .setTranslation([10, 20, 30])
-    .setMesh(mesh);
-  document.createScene("scene").addChild(node);
+  const scene = document.createScene("scene");
+  for (let instance = 0; instance < instances; instance++)
+    scene.addChild(
+      document
+        .createNode("translated")
+        .setTranslation([10, 20, 30])
+        .setMesh(mesh),
+    );
   const bytes = await new NodeIO().writeBinary(document);
   return bytes.buffer.slice(
     bytes.byteOffset,
@@ -216,6 +221,66 @@ const embeddedGltf = ({
 };
 
 describe("decoded tile contract", () => {
+  it("reserves triangle geometry for every reachable mesh node before expansion", async () => {
+    const input = {
+      ...(await request("level-0-root.glb")),
+      content: await transformedPointGlb(100),
+    };
+    const decoded = await decodeTileContent(input);
+    expect(decoded.primitives).toHaveLength(100);
+    expect(decoded.byteEstimate.geometry).toBeGreaterThan(1_000);
+    await expect(
+      decodeTileContent(input, {
+        reserveMemory: async (bytes) => {
+          if (bytes > 1_000)
+            throw new ResourcePolicyError("work", bytes, 1_000);
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: "ResourcePolicyError",
+      domain: "work",
+      limitBytes: 1_000,
+    });
+  });
+
+  it("rejects cyclic and missing reachable nodes during memory preflight", async () => {
+    for (const children of [[0], [99]]) {
+      const json = JSON.parse(new TextDecoder().decode(embeddedGltf().content));
+      json.nodes[0].children = children;
+      const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
+      await expect(
+        decodeTileContent(
+          { ...(await request("level-0-root.glb")), content },
+          {
+            reserveMemory: async () => {},
+          },
+        ),
+      ).rejects.toThrow(
+        children[0] === 0
+          ? "node graph contains a cycle"
+          : "node 99 is missing",
+      );
+    }
+  });
+
+  it("bounds repeated subtree estimates without expanding their paths", async () => {
+    const json = JSON.parse(new TextDecoder().decode(embeddedGltf().content));
+    json.nodes = Array.from({ length: 60 }, (_, index) =>
+      index === 59 ? { mesh: 0 } : { children: [index + 1, index + 1] },
+    );
+    const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
+    await expect(
+      decodeTileContent(
+        { ...(await request("level-0-root.glb")), content },
+        {
+          reserveMemory: async () => {},
+        },
+      ),
+    ).rejects.toThrow(
+      "decoded geometry estimate exceeds the safe integer range",
+    );
+  });
+
   it("rejects an unimplemented required extension with a named tile/profile error", async () => {
     await expect(
       decodeTileContent(await checkedInRequest("unsupported-extension.gltf")),

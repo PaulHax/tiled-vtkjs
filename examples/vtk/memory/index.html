@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Memory measurements</title>
+    <link rel="icon" href="data:," />
+    <style>
+      body {
+        margin: 0;
+        background: #14171c;
+        color: #fff;
+        font: 14px monospace;
+      }
+      #viewer {
+        height: 90vh;
+      }
+      #status {
+        padding: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div>
+      <label>Asset <input id="asset" value="tiny" /></label
+      ><button id="add">Add</button><button id="remove">Remove last</button
+      ><label>Renderer bytes <input id="budget" type="number" /></label
+      ><button id="apply-budget">Apply budget</button>
+    </div>
+    <div id="viewer"></div>
+    <div id="status">Loading</div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

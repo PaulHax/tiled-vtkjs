@@ -17,7 +17,18 @@ export {
   type MemoryPool,
   type MemoryPoolMember,
   type MemoryPoolOptions,
+  type MemoryDemand,
 } from "./memoryPool";
+
+export {
+  ResourcePolicyError,
+  resourcePolicyError,
+  type MemoryDomain,
+  type MemoryOwner,
+  type MemoryLease,
+  type MemoryWork,
+  type MemoryResourceStats,
+} from "./memoryResources";
 
 export {
   createSubmissionScheduler,

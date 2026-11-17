@@ -56,6 +56,7 @@ export type NodeSelection = {
   readonly selected: ReadonlySet<string>;
   /** Sum of `pointCount` over the selection; never exceeds the budget. */
   readonly totalPoints: number;
+  readonly demandBytes: number;
   /** Candidates examined, including entries unavailable from the hierarchy. */
   readonly consideredNodes: number;
   /** Candidates for which `getNode` returned hierarchy data. */
@@ -129,6 +130,7 @@ export const selectNodes = (options: SelectNodesOptions): NodeSelection => {
   let consideredNodes = 0;
   let availableNodes = 0;
   let budgetSkippedPoints = 0;
+  let budgetSkippedBytes = 0;
   const seedCosts = seed
     ? seedCost(root, seed, resolve)
     : { points: 0, bytes: 0 };
@@ -192,6 +194,7 @@ export const selectNodes = (options: SelectNodesOptions): NodeSelection => {
         // candidate hits the boundary. Everything else stays a priority
         // prefix: a smaller, farther sibling must not exploit the remainder.
         budgetSkippedPoints += node.pointCount;
+        budgetSkippedBytes += memoryBytes;
         budgetSkipped.add(keyString);
         if (!required) optionalBoundaryReached = true;
         continue;
@@ -209,6 +212,7 @@ export const selectNodes = (options: SelectNodesOptions): NodeSelection => {
   return {
     selected,
     totalPoints,
+    demandBytes: totalBytes + budgetSkippedBytes,
     consideredNodes,
     availableNodes,
     budgetSkippedPoints,
