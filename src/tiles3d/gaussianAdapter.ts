@@ -38,6 +38,7 @@ import { collectContentBuffers } from "./decode/transfer";
 import {
   createGaussianSortController,
   createGaussianSortWorkerBackend,
+  GaussianSortWorkerError,
   type GaussianSortBackend,
   type GaussianSortPresentation,
   type GaussianSortRange,
@@ -75,6 +76,7 @@ export type GaussianContentAdapterFactory = TileContentAdapterFactory & {
 };
 
 export type GaussianContentAdapterFactoryOptions = {
+  /** Creates a fresh backend for first use and after worker failure. */
   createSortBackend?: () => GaussianSortBackend;
   maximumVisibleSplats?: number;
   resourceBudgetBytes?: number;
@@ -126,6 +128,7 @@ type Tile = {
   meshReady: boolean;
   submitted: boolean;
   retired: boolean;
+  retirementRevision: number;
   job?: Submission;
   group: Tile[];
   replacementTiles: readonly Tile[];
@@ -145,6 +148,7 @@ type Owner = {
   presentedBase: number[];
   placementRevision: number;
   visible: boolean;
+  visibilityRevision: number;
   ceiling: number;
   requiredBytes: number;
   policyBlocked: boolean;
@@ -158,12 +162,15 @@ type PackedPrimitive = {
   tile: Tile;
   primitive: DecodedGaussianPrimitive;
   matrix: number[];
+  allocationKey: string;
+  allocationRevision: number;
   offset: number;
   count: number;
 };
 
 type Storage = {
   arena: ReturnType<typeof createGaussianStorage>;
+  bufferRevision: number;
   signature: string;
   allocationKeys: Set<string>;
   tiles: Tile[];
@@ -175,6 +182,31 @@ type Storage = {
   colors: Float32Array;
   count: number;
   bytes: number;
+};
+
+/** Captured slot and buffer identities keep obsolete atlas arrays out of running jobs. */
+type SortSnapshot = {
+  revision: number;
+  atlas: symbol;
+  bufferRevision: number;
+  primitives: readonly PackedPrimitive[];
+  tiles: ReadonlyMap<Tile, number>;
+  owners: ReadonlyMap<
+    Owner,
+    {
+      placementRevision: number;
+      visibilityRevision: number;
+      base: number[];
+    }
+  >;
+  keepsAcceptedPlacement: boolean;
+  count: number;
+};
+
+type SortTarget = {
+  storage: Storage;
+  memory: MemoryLease | undefined;
+  snapshot: SortSnapshot;
 };
 
 const tileBuffers = (content: DecodedTileContent) => {
@@ -271,6 +303,8 @@ const makeStorage = (
         tile,
         primitive,
         matrix,
+        allocationKey: key,
+        allocationRevision: allocation.revision,
         offset,
         count: primitiveCount,
       });
@@ -316,6 +350,7 @@ const makeStorage = (
     }
   return {
     arena,
+    bufferRevision: arena.bufferRevision,
     signature,
     allocationKeys,
     tiles,
@@ -468,22 +503,25 @@ const createManager = (
   let camera: CameraView | null = null;
   let storage: Storage | null = null,
     candidate: Storage | null = null;
-  let presentationStorage: Storage | null = null;
-  let presentationMemory: MemoryLease | undefined;
+  let sortTarget: SortTarget | null = null;
+  let sortRanges: readonly GaussianSortRange[] | null = null;
+  let sorting: {
+    snapshot: SortSnapshot | undefined;
+    ranges: readonly GaussianSortRange[] | null;
+  } | null = null;
   let selectionStorage: Storage | null = null;
   let selectionMemory: MemoryLease | undefined;
-  let presentationTilesForSort = new Set<Tile>();
-  let presentationAcceptsPlacement = true;
   let displayed = new Set<Tile>();
-  let desiredPrimitives: PackedPrimitive[] = [];
-  let sortRanges: readonly GaussianSortRange[] | null = null;
   let cachedOrder: GaussianSortPresentation | null = null;
   let cachedOrderMemory: MemoryLease | undefined;
-  const forgetOrder = (): void => {
-    sortRanges = null;
+  const clearCachedOrder = (): void => {
     cachedOrder = null;
     cachedOrderMemory?.release();
     cachedOrderMemory = undefined;
+  };
+  const forgetOrder = (): void => {
+    sortRanges = null;
+    clearCachedOrder();
   };
   let attributeUploadBytes = 0,
     orderUploadBytes = 0,
@@ -491,10 +529,10 @@ const createManager = (
   let sortMs = 0,
     sortCount = 0,
     presentationRevision = 0,
+    acceptedSortRevision = 0,
+    sortTargetRevision = 0,
     sortStarted = 0;
   let latestColorCamera: readonly number[] | null = null;
-  let presentationAllowed = true;
-  let sortRequestSerial = 0;
   const polyData = vtkPolyData.newInstance();
   const scaleArray = vtkDataArray.newInstance({
     name: "GaussianScale",
@@ -741,22 +779,295 @@ const createManager = (
       for (const tile of group) safeCall(tile.onSubmitted);
     }
   };
-  const backend =
-    createBackend?.() ??
-    createGaussianSortWorkerBackend(
-      new Worker(
-        new URL(/* @vite-ignore */ "./gaussianSortWorker.js", import.meta.url),
-        { type: "module" },
-      ),
-    );
+  const makeBackend =
+    createBackend ??
+    (() =>
+      createGaussianSortWorkerBackend(
+        new Worker(
+          new URL(
+            /* @vite-ignore */ "./gaussianSortWorker.js",
+            import.meta.url,
+          ),
+          { type: "module" },
+        ),
+      ));
+  let backend: GaussianSortBackend | undefined;
+  let workerRestarted = false;
+  let sortUnavailable = false;
+  let sortAdmissionBlocked = false;
+  const retireBackend = (): void => {
+    backend?.dispose();
+    backend = undefined;
+    workerMemory?.release();
+    workerMemory = undefined;
+    workerSceneRevision = -1;
+  };
   const sortWorkBytes = (): number => {
-    const count = desiredPrimitives.reduce(
-      (sum, primitive) => sum + primitive.count,
+    const count = sortRanges?.reduce(
+      (sum, range) => sum + range.positions.length / 3,
       0,
     );
     return count ? count * 32 + 1024 : 0;
   };
-  const sortOptions = {
+  const compatible = (snapshot: SortSnapshot, target: SortTarget): boolean => {
+    const next = target.storage;
+    return (
+      snapshot.revision >= acceptedSortRevision &&
+      snapshot.atlas === next.arena.identity &&
+      snapshot.bufferRevision === next.bufferRevision &&
+      snapshot.bufferRevision === next.arena.bufferRevision &&
+      (!snapshot.keepsAcceptedPlacement ||
+        target.snapshot.keepsAcceptedPlacement) &&
+      [...snapshot.owners].every(
+        ([owner, placement]) =>
+          !owner.disposed &&
+          owner.placementRevision === placement.placementRevision &&
+          owner.visibilityRevision === placement.visibilityRevision,
+      ) &&
+      [...snapshot.tiles].every(
+        ([tile, revision]) =>
+          tile.retirementRevision === revision &&
+          (!tile.retired
+            ? tile.owner.tiles.get(tile.id) === tile
+            : snapshot.keepsAcceptedPlacement &&
+              (displayed.has(tile) || tile.owner.presented.has(tile))),
+      ) &&
+      snapshot.primitives.every(
+        (packed) =>
+          next.allocationKeys.has(packed.allocationKey) &&
+          next.arena.owns(packed.allocationKey, packed.allocationRevision),
+      )
+    );
+  };
+  const sortFailure = (error: unknown): void => {
+    const policy =
+      error instanceof GaussianSortWorkerError
+        ? null
+        : resourcePolicyError(error);
+    if (policy) {
+      sortAdmissionBlocked = true;
+      const unsubmitted = [...owners].flatMap((owner) =>
+        [...owner.tiles.values()].filter((tile) => !tile.submitted),
+      );
+      refuse(policy, unsubmitted);
+      for (const tile of unsubmitted) dropTile(tile.owner, tile.id);
+    } else {
+      // A worker failure leaves every prepared tile eligible for presentation.
+      completeAdmissions();
+    }
+    releaseRetiredSources();
+    report(error);
+    notify();
+  };
+  const publish = (
+    presentation: Pick<GaussianSortPresentation, "cameraPosition" | "order">,
+    snapshot: SortSnapshot,
+    target: SortTarget,
+    fromSort: boolean,
+  ): boolean => {
+    if (!compatible(snapshot, target)) return false;
+    const next = target.storage;
+    const nextMemory = target.memory;
+    try {
+      const drawToStorage = new Uint32Array(snapshot.count);
+      let drawnOffset = 0;
+      for (const packed of snapshot.primitives) {
+        for (let index = 0; index < packed.count; index++)
+          drawToStorage[drawnOffset + index] = packed.offset + index;
+        drawnOffset += packed.count;
+      }
+      if (presentation.order.length !== drawToStorage.length)
+        throw new Error("Gaussian sort returned an invalid order length");
+      const order = Uint32Array.from(presentation.order, (id) => {
+        const offset = drawToStorage[id];
+        if (offset === undefined || offset === 0xffffffff)
+          throw new Error("Gaussian sort returned an invalid draw index");
+        drawToStorage[id] = 0xffffffff;
+        return offset;
+      });
+      nextMemory?.setCpu(
+        [
+          next.positions.buffer,
+          next.scales.buffer,
+          next.rotations.buffer,
+          next.colors.buffer,
+          order.buffer,
+        ] as ArrayBuffer[],
+        Math.max(0, next.arena.capacity * 4 - order.byteLength),
+      );
+      const changedStorage = storage !== next;
+      const changedCamera =
+        latestColorCamera === null ||
+        latestColorCamera.some(
+          (value, index) => value !== presentation.cameraPosition[index],
+        );
+      const colorRanges: [number, number][] = [];
+      if (
+        changedStorage ||
+        changedCamera ||
+        snapshot.primitives.some((packed) => !displayed.has(packed.tile))
+      )
+        for (const packed of snapshot.primitives)
+          if (packed.primitive.harmonicDegree > 0) {
+            const modelCamera = gaussianModelCamera(
+              packed.matrix,
+              presentation.cameraPosition,
+            );
+            for (let index = 0; index < packed.count; index++)
+              writeGaussianColor(
+                packed.primitive,
+                index,
+                modelCamera,
+                next.colors,
+                (packed.offset + index) * 4,
+              );
+            colorRanges.push([packed.offset, packed.count]);
+          }
+      const updates = next.arena.updates();
+      const histories: Parameters<
+        typeof mapper.setPointAttributeUpdateRanges
+      >[0] = {};
+      const sources = [
+        {
+          name: "positions" as const,
+          source: polyData.getPoints(),
+          values: next.positions,
+          components: 3,
+          ranges: updates.ranges,
+        },
+        {
+          name: "radius" as const,
+          source: scaleArray,
+          values: next.scales,
+          components: 3,
+          ranges: updates.ranges,
+        },
+        {
+          name: "rotation" as const,
+          source: rotationArray,
+          values: next.rotations,
+          components: 4,
+          ranges: updates.ranges,
+        },
+        {
+          name: "colors" as const,
+          source: colorArray,
+          values: next.colors,
+          components: 4,
+          ranges: [...updates.ranges, ...colorRanges],
+        },
+      ];
+      for (const { name, source, values, components, ranges } of sources) {
+        if (source.getData() !== values) {
+          source.setData(values, components);
+          attributeUploadBytes += values.byteLength;
+        } else if (ranges.length) {
+          const fromMTime = source.getMTime();
+          source.modified();
+          histories[name] = {
+            source,
+            fromMTime,
+            toMTime: source.getMTime(),
+            ranges,
+          };
+          attributeUploadBytes += ranges.reduce(
+            (sum, range) => sum + range[1] * components * 4,
+            0,
+          );
+        }
+      }
+      if (Object.keys(histories).length)
+        mapper.setPointAttributeUpdateRanges(histories);
+      if (changedStorage) {
+        actor.setUserMatrix([
+          1,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          0,
+          0,
+          0,
+          1,
+          0,
+          ...next.origin,
+          1,
+        ]);
+        frontierRebuilds++;
+      }
+      if (next.count > 0 && !attached) {
+        firstOptions.renderer.addActor(actor);
+        attached = true;
+      }
+      if (next.count === 0 && attached) {
+        firstOptions.renderer.removeActor(actor);
+        attached = false;
+      }
+      orderArray.setData(order, 1);
+      orderUploadBytes += order.byteLength;
+      actor.setVisibility(order.length > 0);
+      storage = next;
+      if (displayedMemory !== nextMemory) {
+        if (
+          displayedMemory !== arenaMemory &&
+          displayedMemory !== realizedMemory
+        )
+          displayedMemory?.release();
+        if (selectionMemory === displayedMemory) {
+          selectionMemory = undefined;
+          selectionStorage = null;
+        }
+      }
+      displayedMemory = nextMemory;
+      releaseRetiredSources();
+      const presentedTiles = [...snapshot.tiles.keys()];
+      for (const [owner, { base }] of snapshot.owners) {
+        const tiles = presentedTiles.filter((tile) => tile.owner === owner);
+        owner.mesh.setBaseMatrix(base);
+        owner.presentedBase = [...base];
+        owner.mesh.setVisible(owner.visible);
+        owner.mesh.setDrawnTiles(tiles.map((tile) => tile.id));
+        owner.presented = new Set(tiles);
+      }
+      next.arena.retireExcept(
+        candidate?.arena === next.arena && candidate !== next
+          ? new Set([...next.allocationKeys, ...candidate.allocationKeys])
+          : next.allocationKeys,
+      );
+      displayed = new Set(snapshot.primitives.map((packed) => packed.tile));
+      releaseRetiredSources();
+      latestColorCamera = [...presentation.cameraPosition];
+      if (fromSort) {
+        sortMs = performance.now() - sortStarted;
+        sortCount++;
+      }
+      presentationRevision++;
+      acceptedSortRevision = snapshot.revision;
+      sortAdmissionBlocked = false;
+      completeAdmissions();
+      releaseRetiredSources();
+      for (const owner of owners) safeCall(owner.options.onPresentationChange);
+      notify();
+      const retained = sourceTiles();
+      if (
+        next === candidate &&
+        retained
+          .map(
+            (tile) =>
+              `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
+          )
+          .join("|") !== storage.signature
+      )
+        scheduleRefresh();
+    } catch (error) {
+      clearCachedOrder();
+      sortFailure(error);
+    }
+    return true;
+  };
+  const sorter = createGaussianSortController({
     async schedule(run) {
       let work = await memory.work(sortCancellation.signal, sortWorkBytes());
       try {
@@ -772,23 +1083,28 @@ const createManager = (
         }
         await run();
       } finally {
+        sorting = null;
         work.release();
       }
     },
     backend: {
       async sort(job) {
         sortStarted = performance.now();
-        pendingSort = true;
+        const snapshot = sortTarget?.snapshot;
+        sorting = { snapshot, ranges: sortRanges };
         const count = job.ranges.reduce(
           (sum, range) => sum + range.positions.length / 3,
           0,
         );
-        const sourceMemory = memory.retain(
-          job.ranges.flatMap((range) => [
+        const sourceMemory = memory.retain([
+          ...collectContentBuffers(
+            snapshot?.primitives.map((packed) => packed.primitive) ?? [],
+          ).geometry,
+          ...job.ranges.flatMap((range) => [
             range.positions.buffer as ArrayBuffer,
             (range.modelToScene as Float64Array).buffer as ArrayBuffer,
           ]),
-        );
+        ]);
         let nextWorkerMemory: MemoryLease | undefined;
         try {
           if (count && workerSceneRevision !== job.sceneRevision)
@@ -796,18 +1112,41 @@ const createManager = (
               [],
               count * 24 + job.ranges.length * 128 + 1024,
             );
-          const order = await backend.sort(job);
-          if (nextWorkerMemory) {
-            workerMemory?.release();
-            workerMemory = nextWorkerMemory;
-            workerSceneRevision = job.sceneRevision;
-            nextWorkerMemory = undefined;
+          try {
+            backend ??= makeBackend();
+          } catch (cause) {
+            throw new GaussianSortWorkerError(
+              "Could not start the Gaussian sort worker",
+              { cause },
+            );
           }
-          if (!count) {
-            workerMemory?.setCpu([], 1024);
-            workerSceneRevision = job.sceneRevision;
+          try {
+            let pending: Promise<Uint32Array>;
+            try {
+              pending = backend.sort(job);
+            } catch (cause) {
+              throw new GaussianSortWorkerError(
+                "Could not dispatch Gaussian sort work",
+                { cause },
+              );
+            }
+            const order = await pending;
+            workerRestarted = false;
+            return order;
+          } catch (error) {
+            if (error instanceof GaussianSortWorkerError) retireBackend();
+            throw error;
+          } finally {
+            if (backend && !disposed) {
+              if (nextWorkerMemory) {
+                workerMemory?.release();
+                workerMemory = nextWorkerMemory;
+                nextWorkerMemory = undefined;
+              }
+              if (!count) workerMemory?.setCpu([], 1024);
+              workerSceneRevision = job.sceneRevision;
+            }
           }
-          return order;
         } finally {
           nextWorkerMemory?.release();
           sourceMemory.release();
@@ -815,267 +1154,51 @@ const createManager = (
       },
       dispose() {
         sortCancellation.abort();
-        backend.dispose();
-        workerMemory?.release();
-        workerMemory = undefined;
+        retireBackend();
       },
     },
-    onOrder(presentation: GaussianSortPresentation, fromSort = true) {
-      if (disposed) return;
-      try {
-        if (fromSort) {
+    canPresent: () => Boolean(sorting?.snapshot?.count),
+    onOrder(presentation) {
+      const snapshot = sorting?.snapshot;
+      if (!snapshot || !sortTarget) return;
+      if (sorting?.ranges === sortRanges) {
+        try {
           const nextMemory = memory.retain([
             presentation.order.buffer as ArrayBuffer,
           ]);
-          cachedOrderMemory?.release();
+          clearCachedOrder();
           cachedOrderMemory = nextMemory;
           cachedOrder = presentation;
-        }
-        if (!presentationStorage || dirty || !presentationAllowed) {
-          if (!presentationAllowed) pendingSort = false;
+        } catch (error) {
+          sortFailure(error);
           return;
         }
-        const next = presentationStorage;
-        const nextMemory = presentationMemory;
-        const changedStorage = storage !== next;
-        const changedCamera =
-          latestColorCamera === null ||
-          latestColorCamera.some(
-            (value, index) => value !== presentation.cameraPosition[index],
-          );
-        const colorRanges: [number, number][] = [];
-        if (
-          changedStorage ||
-          changedCamera ||
-          desiredPrimitives.some((packed) => !displayed.has(packed.tile))
-        )
-          for (const packed of desiredPrimitives)
-            if (packed.primitive.harmonicDegree > 0) {
-              const modelCamera = gaussianModelCamera(
-                packed.matrix,
-                presentation.cameraPosition,
-              );
-              for (let index = 0; index < packed.count; index++)
-                writeGaussianColor(
-                  packed.primitive,
-                  index,
-                  modelCamera,
-                  next.colors,
-                  (packed.offset + index) * 4,
-                );
-              colorRanges.push([packed.offset, packed.count]);
-            }
-        const drawToStorage = new Uint32Array(
-          desiredPrimitives.reduce(
-            (sum, primitive) => sum + primitive.count,
-            0,
-          ),
-        );
-        let drawnOffset = 0;
-        for (const packed of desiredPrimitives) {
-          for (let index = 0; index < packed.count; index++)
-            drawToStorage[drawnOffset + index] = packed.offset + index;
-          drawnOffset += packed.count;
-        }
-        const order = Uint32Array.from(
-          presentation.order,
-          (id) => drawToStorage[id]!,
-        );
-        const updates = next.arena.updates();
-        const histories: Parameters<
-          typeof mapper.setPointAttributeUpdateRanges
-        >[0] = {};
-        const sources = [
-          {
-            name: "positions" as const,
-            source: polyData.getPoints(),
-            values: next.positions,
-            components: 3,
-            ranges: updates.ranges,
-          },
-          {
-            name: "radius" as const,
-            source: scaleArray,
-            values: next.scales,
-            components: 3,
-            ranges: updates.ranges,
-          },
-          {
-            name: "rotation" as const,
-            source: rotationArray,
-            values: next.rotations,
-            components: 4,
-            ranges: updates.ranges,
-          },
-          {
-            name: "colors" as const,
-            source: colorArray,
-            values: next.colors,
-            components: 4,
-            ranges: [...updates.ranges, ...colorRanges],
-          },
-        ];
-        for (const { name, source, values, components, ranges } of sources) {
-          if (source.getData() !== values) {
-            source.setData(values, components);
-            attributeUploadBytes += values.byteLength;
-          } else if (ranges.length) {
-            const fromMTime = source.getMTime();
-            source.modified();
-            histories[name] = {
-              source,
-              fromMTime,
-              toMTime: source.getMTime(),
-              ranges,
-            };
-            attributeUploadBytes += ranges.reduce(
-              (sum, range) => sum + range[1] * components * 4,
-              0,
-            );
-          }
-        }
-        if (Object.keys(histories).length)
-          mapper.setPointAttributeUpdateRanges(histories);
-        if (changedStorage) {
-          actor.setUserMatrix([
-            1,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            0,
-            0,
-            1,
-            0,
-            ...next.origin,
-            1,
-          ]);
-          frontierRebuilds++;
-        }
-        if (next.count > 0 && !attached) {
-          firstOptions.renderer.addActor(actor);
-          attached = true;
-        }
-        if (next.count === 0 && attached) {
-          firstOptions.renderer.removeActor(actor);
-          attached = false;
-        }
-        orderArray.setData(order, 1);
-        nextMemory?.setCpu(
-          [
-            next.positions.buffer,
-            next.scales.buffer,
-            next.rotations.buffer,
-            next.colors.buffer,
-            order.buffer,
-          ] as ArrayBuffer[],
-          Math.max(0, next.arena.capacity * 4 - order.byteLength),
-        );
-        orderUploadBytes += order.byteLength;
-        actor.setVisibility(order.length > 0);
-        storage = next;
-        if (displayedMemory !== nextMemory) {
-          if (
-            displayedMemory !== arenaMemory &&
-            displayedMemory !== realizedMemory
-          )
-            displayedMemory?.release();
-          if (selectionMemory === displayedMemory) {
-            selectionMemory = undefined;
-            selectionStorage = null;
-          }
-        }
-        displayedMemory = nextMemory;
-        releaseRetiredSources();
-        const presentedTiles = presentationTilesForSort;
-        for (const owner of owners) {
-          const ids = [...presentedTiles]
-            .filter((tile) => tile.owner === owner)
-            .map((tile) => tile.id);
-          if (presentationAcceptsPlacement) {
-            owner.mesh.setBaseMatrix(owner.base);
-            owner.presentedBase = [...owner.base];
-          }
-          owner.mesh.setVisible(owner.visible);
-          owner.mesh.setDrawnTiles(ids);
-          owner.presented = new Set(
-            [...presentedTiles].filter((tile) => tile.owner === owner),
-          );
-        }
-        next.arena.retireExcept(next.allocationKeys);
-        displayed = new Set(
-          desiredPrimitives.map((primitive) => primitive.tile),
-        );
-        releaseRetiredSources();
-        latestColorCamera = [...presentation.cameraPosition];
-        if (fromSort) {
-          sortMs = performance.now() - sortStarted;
-          sortCount++;
-        }
-        presentationRevision++;
-        pendingSort = false;
-        completeAdmissions();
-        releaseRetiredSources();
-        for (const owner of owners)
-          safeCall(owner.options.onPresentationChange);
-        notify();
-        const retained = sourceTiles();
-        if (
-          next === candidate &&
-          retained
-            .map(
-              (tile) =>
-                `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
-            )
-            .join("|") !== storage.signature
-        )
-          scheduleRefresh();
-      } catch (error) {
-        forgetOrder();
-        pendingSort = false;
-        const policy = resourcePolicyError(error);
-        if (policy)
-          refuse(
-            policy,
-            [...owners].flatMap((owner) =>
-              [...owner.tiles.values()].filter((tile) => !tile.submitted),
-            ),
-          );
-        for (const owner of owners)
-          for (const tile of owner.tiles.values())
-            if (!tile.submitted) {
-              if (!resourcePolicyError(error)) owner.failed.add(tile.id);
-              dropTile(owner, tile.id);
-            }
-        report(error);
-        notify();
+      }
+      if (
+        !publish(presentation, snapshot, sortTarget, true) &&
+        cachedOrder === presentation
+      ) {
+        // Sorting inputs can survive an atlas change. A refresh can reuse the
+        // order with its own current mapping, even if this dispatch cannot.
+        scheduleRefresh();
       }
     },
-    onError(error) {
-      forgetOrder();
+    onWorkerError(error) {
+      if (!workerRestarted) {
+        workerRestarted = true;
+        return "retry";
+      }
+      sortUnavailable = true;
+      sortFailure(error);
+      return "stop";
+    },
+    onError: sortFailure,
+    onIdle() {
+      if (!pendingSort) return;
       pendingSort = false;
-      const policy = resourcePolicyError(error);
-      if (policy)
-        refuse(
-          policy,
-          [...owners].flatMap((owner) =>
-            [...owner.tiles.values()].filter((tile) => !tile.submitted),
-          ),
-        );
-      for (const owner of owners)
-        for (const tile of owner.tiles.values())
-          if (!tile.submitted) {
-            if (!resourcePolicyError(error)) owner.failed.add(tile.id);
-            dropTile(owner, tile.id);
-          }
-      report(error);
       notify();
     },
-  } satisfies Parameters<typeof createGaussianSortController>[0];
-  const sorter = createGaussianSortController(sortOptions);
+  });
   const setSortScene = (ranges: readonly GaussianSortRange[]): void => {
     if (sameSortRanges(sortRanges, ranges)) return;
     forgetOrder();
@@ -1083,21 +1206,17 @@ const createManager = (
     sorter.setScene(ranges, { defer: true });
   };
 
-  const trackSortIdle = (): void => {
-    const serial = ++sortRequestSerial;
-    void sorter.whenIdle().then(() => {
-      if (!disposed && serial === sortRequestSerial) {
-        pendingSort = false;
-        notify();
-      }
-    });
+  const requestSort = (position: CameraView["position"]): void => {
+    if (sortUnavailable) return;
+    pendingSort = true;
+    sorter.request(position);
   };
 
   const refresh = (): void => {
     dirty = false;
     if (disposed || (!camera && chargedTiles().length > 0)) return;
     try {
-      presentationAllowed = false;
+      sortTarget = null;
       const nextTiles = sourceTiles();
       if (!nextTiles.length) {
         setSortScene([]);
@@ -1125,12 +1244,8 @@ const createManager = (
         arenaCapacity = 0;
         storage = empty;
         candidate = empty;
-        presentationStorage = empty;
-        presentationMemory = undefined;
         selectionStorage = null;
         selectionMemory = undefined;
-        presentationTilesForSort.clear();
-        desiredPrimitives = [];
         displayed.clear();
         releaseRetiredSources();
         for (const owner of owners) {
@@ -1151,11 +1266,8 @@ const createManager = (
         for (const owner of owners)
           safeCall(owner.options.onPresentationChange);
         presentationRevision++;
-        if (camera && (workerMemory || pendingSort)) {
-          pendingSort = true;
-          sorter.request(camera.position);
-          trackSortIdle();
-        }
+        if (camera && (workerMemory || pendingSort))
+          requestSort(camera.position);
         notify();
         return;
       }
@@ -1312,11 +1424,13 @@ const createManager = (
               (component, index) => component === current[index],
             );
           });
-      presentationTilesForSort = requestedPresentation;
-      presentationAcceptsPlacement = true;
+      let presentedTiles = requestedPresentation;
+      let keepsAcceptedPlacement = false;
+      let targetStorage: Storage | null;
+      let targetMemory: MemoryLease | undefined;
       if (covers(candidate)) {
-        presentationStorage = candidate;
-        presentationMemory = realizedMemory;
+        targetStorage = candidate;
+        targetMemory = realizedMemory;
         if (selectionMemory && selectionMemory !== displayedMemory) {
           selectionMemory.release();
           selectionMemory = undefined;
@@ -1328,8 +1442,8 @@ const createManager = (
           selectionMemory = undefined;
           selectionStorage = null;
         }
-        presentationStorage = storage;
-        presentationMemory = displayedMemory;
+        targetStorage = storage;
+        targetMemory = displayedMemory;
       } else {
         const selected = [...drawn].sort(
           (left, right) => left.generation - right.generation,
@@ -1411,18 +1525,18 @@ const createManager = (
               throw error;
             }
           }
-          presentationStorage = selectionStorage;
-          presentationMemory = selectionMemory;
+          targetStorage = selectionStorage;
+          targetMemory = selectionMemory;
         } catch (error) {
           if (!(error instanceof ResourcePolicyError)) throw error;
           report(error);
           // A failed transition preserves the complete accepted frontier,
           // including its mesh IDs and placement, until all requested tiles
           // can be published together.
-          presentationStorage = storage;
-          presentationMemory = displayedMemory;
-          presentationAcceptsPlacement = false;
-          presentationTilesForSort = new Set(
+          targetStorage = storage;
+          targetMemory = displayedMemory;
+          keepsAcceptedPlacement = true;
+          presentedTiles = new Set(
             [
               ...displayed,
               ...[...owners].flatMap((owner) => [...owner.presented]),
@@ -1430,11 +1544,11 @@ const createManager = (
           );
         }
       }
-      if (!presentationStorage) return;
-      desiredPrimitives = presentationStorage.primitives.filter((primitive) =>
-        presentationTilesForSort.has(primitive.tile),
+      if (!targetStorage) return;
+      const primitives = targetStorage.primitives.filter((primitive) =>
+        presentedTiles.has(primitive.tile),
       );
-      const visible = desiredPrimitives.reduce(
+      const visible = primitives.reduce(
         (sum, primitive) => sum + primitive.count,
         0,
       );
@@ -1442,31 +1556,63 @@ const createManager = (
         throw new GaussianResourceLimitError(
           `visible Gaussian representation contains ${visible} splats, exceeding the ${maximum}-splat limit; choose a coarser tileset representation`,
         );
-      const ranges: GaussianSortRange[] = desiredPrimitives.map((packed) => ({
+      const ranges: GaussianSortRange[] = primitives.map((packed) => ({
         id: packed.id,
         generation: packed.tile.generation,
         positions: packed.primitive.positions,
         modelToScene: packed.matrix,
       }));
-      pendingSort = true;
-      presentationAllowed = true;
+      const snapshot: SortSnapshot = {
+        revision: ++sortTargetRevision,
+        atlas: targetStorage.arena.identity,
+        bufferRevision: targetStorage.bufferRevision,
+        primitives,
+        tiles: new Map(
+          [...presentedTiles].map((tile) => [tile, tile.retirementRevision]),
+        ),
+        owners: new Map(
+          [...owners].map((owner) => [
+            owner,
+            {
+              placementRevision: owner.placementRevision,
+              visibilityRevision: owner.visibilityRevision,
+              base: [
+                ...(keepsAcceptedPlacement ? owner.presentedBase : owner.base),
+              ],
+            },
+          ]),
+        ),
+        keepsAcceptedPlacement,
+        count: visible,
+      };
+      sortTarget = { storage: targetStorage, memory: targetMemory, snapshot };
       setSortScene(ranges);
       const order = cachedOrder;
-      if (
+      if (!visible) {
+        publish(
+          {
+            cameraPosition: camera.position,
+            order: new Uint32Array(),
+          },
+          snapshot,
+          sortTarget,
+          false,
+        );
+        if (workerMemory || pendingSort) requestSort(camera.position);
+      } else if (
         order &&
         camera.position.every(
           (value, axis) => value === order.cameraPosition[axis],
         )
       ) {
-        sortOptions.onOrder(order, false);
-      } else {
-        sorter.request(camera.position);
-        trackSortIdle();
-      }
+        publish(order, snapshot, sortTarget, false);
+      } else if (sortUnavailable) {
+        completeAdmissions();
+      } else requestSort(camera.position);
       notify();
     } catch (error) {
-      forgetOrder();
-      pendingSort = false;
+      sortTarget = null;
+      setSortScene([]);
       const policy = resourcePolicyError(error);
       if (policy)
         refuse(
@@ -1502,6 +1648,7 @@ const createManager = (
       if (!grouped.submitted) {
         grouped.job?.cancel();
         grouped.retired = true;
+        grouped.retirementRevision++;
         retiredSources.add(grouped);
         grouped.owner.tiles.delete(grouped.id);
         grouped.owner.mesh.cancelTile(grouped.id);
@@ -1509,6 +1656,7 @@ const createManager = (
       }
     tile.job?.cancel();
     tile.retired = true;
+    tile.retirementRevision++;
     owner.tiles.delete(id);
     owner.drawn.delete(id);
     if (immediate || (!displayed.has(tile) && !owner.presented.has(tile)))
@@ -1557,13 +1705,10 @@ const createManager = (
     orderArray.delete();
     storage = null;
     candidate = null;
-    presentationStorage = null;
-    presentationMemory = undefined;
+    sortTarget = null;
     selectionStorage = null;
     selectionMemory = undefined;
-    presentationTilesForSort.clear();
     arena.clear();
-    desiredPrimitives = [];
     firstOptions.scheduleRender();
   };
   return {
@@ -1578,10 +1723,7 @@ const createManager = (
     stats(): GaussianRendererStats {
       const current = sourceTiles();
       const count = current.reduce((sum, tile) => sum + tile.count, 0);
-      const visible = desiredPrimitives.reduce(
-        (sum, packed) => sum + packed.count,
-        0,
-      );
+      const visible = sortTarget?.snapshot.count ?? 0;
       return {
         displayedSplats: displayed.size
           ? Number(orderArray.getNumberOfTuples())
@@ -1614,7 +1756,8 @@ const createManager = (
             : 0) +
           current.reduce((sum, tile) => sum + tile.sourceBytes, 0),
         gpuAttributeBytes: storage?.bytes ?? 0,
-        workerAttributeBytes: visible * 12 + desiredPrimitives.length * 128,
+        workerAttributeBytes:
+          visible * 12 + (sortTarget?.snapshot.primitives.length ?? 0) * 128,
         sortWorkspaceBytes: visible * 32 + 1024,
         replacementBytes: [...displayed]
           .filter((tile) => tile.retired)
@@ -1641,6 +1784,7 @@ const createManager = (
         presentedBase: [...IDENTITY],
         placementRevision: 0,
         visible: options.visible ?? true,
+        visibilityRevision: 0,
         ceiling: budget,
         requiredBytes: 0,
         policyBlocked: false,
@@ -1783,6 +1927,7 @@ const createManager = (
               meshReady: false,
               submitted: false,
               retired: false,
+              retirementRevision: 0,
               group,
               compactReplacement: false,
               replacementTiles: replacementIds.flatMap((id) =>
@@ -2024,6 +2169,11 @@ const createManager = (
           owner.mesh.clearRequiredBytes();
           if (owner.policyBlocked) {
             owner.policyBlocked = false;
+            if (sortAdmissionBlocked) {
+              sortAdmissionBlocked = false;
+              sortTarget = null;
+              setSortScene([]);
+            }
             scheduleRefresh();
           }
         },
@@ -2070,18 +2220,16 @@ const createManager = (
               (value, index) => value !== view.position[index],
             );
           camera = { ...view, position: [...view.position] };
-          if (!candidate) scheduleRefresh();
-          else if (!presentationAllowed) scheduleRefresh();
-          else if (moved) {
-            pendingSort = true;
-            sorter.request(view.position);
-            trackSortIdle();
+          if (!sortTarget) scheduleRefresh();
+          else if (moved && sortTarget.snapshot.count && !sortUnavailable) {
+            requestSort(view.position);
             notify();
           }
         },
         setVisible(visible) {
           if (owner.visible === visible) return;
           owner.visible = visible;
+          owner.visibilityRevision++;
           if (!visible)
             hideTiles(
               new Set([...displayed].filter((tile) => tile.owner === owner)),

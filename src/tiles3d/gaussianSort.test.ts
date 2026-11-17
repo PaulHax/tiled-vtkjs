@@ -4,6 +4,7 @@ import {
   createGaussianDistanceSorter,
   createGaussianSortController,
   createGaussianSortWorkerBackend,
+  GaussianSortWorkerError,
   type GaussianSortJob,
   type GaussianSortPresentation,
   type GaussianSortRange,
@@ -224,7 +225,7 @@ describe("Gaussian sort presentation controller", () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
-  it("coalesces camera updates and publishes only the latest requested order", async () => {
+  it("coalesces camera updates and publishes compatible orders during motion", async () => {
     const controlled = controlledBackend();
     const presentations: GaussianSortPresentation[] = [];
     const controller = createGaussianSortController({
@@ -245,11 +246,14 @@ describe("Gaussian sort presentation controller", () => {
     expect((await controlled.call(1).started.promise).cameraPosition).toEqual([
       3, 0, 0,
     ]);
-    expect(presentations).toEqual([]);
+    expect(presentations.map(({ cameraPosition }) => cameraPosition)).toEqual([
+      [0, 0, 0],
+    ]);
+    expect([...presentations[0]!.order]).toEqual([1, 0]);
     controlled.call(1).result.resolve(new Uint32Array([0, 1]));
     await controller.whenIdle();
-    expect(presentations).toHaveLength(1);
-    expect([...presentations[0]!.order]).toEqual([0, 1]);
+    expect(presentations).toHaveLength(2);
+    expect([...presentations[1]!.order]).toEqual([0, 1]);
     // Camera orientation is deliberately absent from the request contract.
     controller.request([3, 0, 0]);
     await controller.whenIdle();
@@ -353,11 +357,13 @@ describe("Gaussian sort presentation controller", () => {
     controller.request([0, 0, 0]);
     await controlled.call(0).started.promise;
     controller.request([1, 0, 0]);
-    const idle = controller.whenIdle();
+    const settled = vi.fn();
+    const idle = controller.whenIdle().then(settled);
     controller.dispose();
-    await idle;
+    await Promise.resolve();
+    expect(settled).not.toHaveBeenCalled();
     controlled.call(0).result.resolve(new Uint32Array());
-    await controlled.call(0).result.promise;
+    await idle;
     controller.request([2, 0, 0]);
     controller.dispose();
     expect(controlled.backend.dispose).toHaveBeenCalledTimes(1);
@@ -474,7 +480,7 @@ describe("Gaussian sort worker backend", () => {
     };
     const active = backend.sort(job);
     worker.onerror?.({ message: "worker crashed" } as ErrorEvent);
-    await expect(active).rejects.toThrow("worker crashed");
+    await expect(active).rejects.toBeInstanceOf(GaussianSortWorkerError);
     await expect(backend.sort(job)).rejects.toThrow("disposed");
     backend.dispose();
     expect(worker.terminate).toHaveBeenCalledOnce();
@@ -496,6 +502,30 @@ describe("Gaussian sort worker backend", () => {
       data: { kind: "order", jobId: 1, order: [0] },
     } as MessageEvent);
     await expect(active).rejects.toThrow("invalid response");
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    backend.dispose();
+  });
+
+  it("reports a job error and leaves the worker available for its next scene", async () => {
+    const { worker } = fakeWorker();
+    const backend = createGaussianSortWorkerBackend(worker);
+    const job: GaussianSortJob = {
+      sceneRevision: 1,
+      ranges: [],
+      cameraPosition: [0, 0, 0],
+    };
+    const failed = backend.sort(job);
+    worker.onmessage?.({
+      data: { kind: "error", jobId: 1, message: "invalid distance" },
+    } as MessageEvent);
+    await expect(failed).rejects.toThrow("invalid distance");
+    expect(worker.terminate).not.toHaveBeenCalled();
+
+    const next = backend.sort({ ...job, sceneRevision: 2 });
+    worker.onmessage?.({
+      data: { kind: "order", jobId: 2, order: new Uint32Array() },
+    } as MessageEvent);
+    await expect(next).resolves.toEqual(new Uint32Array());
     backend.dispose();
   });
 });

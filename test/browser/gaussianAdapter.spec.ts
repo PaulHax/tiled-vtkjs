@@ -371,6 +371,7 @@ describe("shared Gaussian realization", () => {
   it("settles A to B to A camera changes and bounds obsolete placement ranges", async () => {
     const page = await open("shared");
     try {
+      const before = await pixels(page);
       const initial = await page.evaluate(() =>
         (
           globalThis as unknown as { gaussianFixture: Fixture }
@@ -396,7 +397,7 @@ describe("shared Gaussian realization", () => {
         return api.settle();
       });
       expect(returned.pendingSort).toBe(false);
-      expect(returned.sortCount).toBe(initial.sortCount);
+      expect((await pixels(page)).data).toEqual(before.data);
       expect(returned.attributeUploadBytes).toBe(initial.attributeUploadBytes);
       await page.evaluate(() =>
         (

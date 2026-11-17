@@ -1,12 +1,17 @@
 /** Stable tuple ranges; retirement is committed only after a draw-order swap. */
 export const createGaussianStorage = () => {
+  let bufferRevision = 0;
+  let allocationRevision = 0;
   let capacity = 0;
   let positions: Float32Array = new Float32Array();
   let scales: Float32Array = new Float32Array();
   let rotations: Float32Array = new Float32Array();
   let colors: Float32Array = new Float32Array();
   let origin: [number, number, number] | null = null;
-  const allocations = new Map<string, { offset: number; count: number }>();
+  const allocations = new Map<
+    string,
+    { offset: number; count: number; revision: number }
+  >();
   let free: { offset: number; count: number }[] = [];
   let pending: [number, number][] = [];
   let grew = false;
@@ -24,6 +29,10 @@ export const createGaussianStorage = () => {
   };
 
   const api = {
+    identity: Symbol(),
+    get bufferRevision() {
+      return bufferRevision;
+    },
     get positions() {
       return positions;
     },
@@ -82,7 +91,7 @@ export const createGaussianStorage = () => {
     allocate(
       key: string,
       count: number,
-    ): { offset: number; count: number; fresh: boolean } {
+    ): { offset: number; count: number; revision: number; fresh: boolean } {
       const existing = allocations.get(key);
       if (existing) return { ...existing, fresh: false };
       let range = free.find((entry) => entry.count >= count);
@@ -100,18 +109,26 @@ export const createGaussianStorage = () => {
         scales = grow(scales, 3);
         rotations = grow(rotations, 4);
         colors = grow(colors, 4);
+        bufferRevision++;
         free.push({ offset: oldCapacity, count: capacity - oldCapacity });
         coalesce();
         grew = true;
         range = free.find((entry) => entry.count >= count)!;
       }
-      const allocation = { offset: range.offset, count };
+      const allocation = {
+        offset: range.offset,
+        count,
+        revision: ++allocationRevision,
+      };
       range.offset += count;
       range.count -= count;
       free = free.filter((entry) => entry.count > 0);
       allocations.set(key, allocation);
       pending.push([allocation.offset, count]);
       return { ...allocation, fresh: true };
+    },
+    owns(key: string, revision: number): boolean {
+      return allocations.get(key)?.revision === revision;
     },
     /** Obsolete sort results must already be invalidated before releasing ranges. */
     retireExcept(live: ReadonlySet<string>): void {
@@ -132,6 +149,7 @@ export const createGaussianStorage = () => {
       pending.push([offset, count]);
     },
     clear(): void {
+      bufferRevision++;
       capacity = 0;
       positions = new Float32Array();
       scales = new Float32Array();

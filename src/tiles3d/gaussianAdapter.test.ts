@@ -7,6 +7,7 @@ const vtk = vi.hoisted(() => {
     let data = initial.values ?? new Float32Array();
     let components = initial.numberOfComponents ?? 1;
     let mtime = 0;
+    let mapper: any, pointOrder: any, inputData: any, userMatrix: number[];
     const children = new Map();
     const target = {
       ...initial,
@@ -17,6 +18,22 @@ const vtk = vi.hoisted(() => {
       },
       getData: () => data,
       getNumberOfTuples: () => data.length / components,
+      setMapper(value: any) {
+        mapper = value;
+      },
+      getMapper: () => mapper,
+      setPointOrder(value: any) {
+        pointOrder = value;
+      },
+      getPointOrder: () => pointOrder,
+      setInputData(value: any) {
+        inputData = value;
+      },
+      getInputData: () => inputData,
+      setUserMatrix(value: number[]) {
+        userMatrix = value;
+      },
+      getUserMatrix: () => userMatrix,
       getMTime: () => mtime,
       modified() {
         mtime++;
@@ -53,7 +70,14 @@ import { createMemoryPool } from "../core/memoryPool";
 import { ResourcePolicyError } from "../core/memoryResources";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createGaussianContentAdapterFactory } from "./gaussianAdapter";
-import { createGaussianDistanceSorter } from "./gaussianSort";
+import {
+  createGaussianDistanceSorter,
+  createGaussianSortWorkerBackend,
+  type GaussianSortBackend,
+  type GaussianSortRange,
+  type GaussianSortWorkerLike,
+  type GaussianSortWorkerRequest,
+} from "./gaussianSort";
 import type { DecodedTileContent } from "./decode";
 
 const field = (count: number, mixed = false): DecodedTileContent => ({
@@ -103,8 +127,16 @@ const field = (count: number, mixed = false): DecodedTileContent => ({
   ],
 });
 
-const fixture = () => {
-  const renderer = { addActor() {}, removeActor() {} };
+const fixture = (createSortBackend?: () => GaussianSortBackend) => {
+  const actors = new Set<any>();
+  const renderer = {
+    addActor(actor: any) {
+      actors.add(actor);
+    },
+    removeActor(actor: any) {
+      actors.delete(actor);
+    },
+  };
   const pool = createMemoryPool({
     totalBytes: 1000000,
     cpuBytes: 1000000,
@@ -120,21 +152,26 @@ const fixture = () => {
   const errors: unknown[] = [],
     refusals: unknown[] = [];
   let held = false;
+  let onStarted: (() => void) | undefined;
   const pending: (() => void)[] = [];
   const factory = createGaussianContentAdapterFactory({
-    createSortBackend: () => ({
-      sort(job) {
-        const order = distance.sort(job.ranges, job.cameraPosition);
-        return held
-          ? new Promise<Uint32Array>((resolve) =>
-              pending.push(() => resolve(order)),
-            )
-          : Promise.resolve(order);
-      },
-      dispose() {
-        for (const release of pending.splice(0)) release();
-      },
-    }),
+    createSortBackend:
+      createSortBackend ??
+      (() => ({
+        sort(job) {
+          const order = distance.sort(job.ranges, job.cameraPosition);
+          return held
+            ? new Promise<Uint32Array>((resolve) => {
+                pending.push(() => resolve(order));
+                onStarted?.();
+                onStarted = undefined;
+              })
+            : Promise.resolve(order);
+        },
+        dispose() {
+          for (const release of pending.splice(0)) release();
+        },
+      })),
   });
   const adapter = factory({
     renderer,
@@ -145,14 +182,16 @@ const fixture = () => {
     onError: (error) => errors.push(error),
     onPolicyRefusal: (error) => refusals.push(error),
   });
-  adapter.setCamera({
-    projection: "perspective",
-    fovY: Math.PI / 3,
-    position: [0, 0, 10],
-    viewProj: IDENTITY,
-    viewportWidthCssPx: 100,
-    viewportHeightCssPx: 100,
-  });
+  const move = (x: number) =>
+    adapter.setCamera({
+      projection: "perspective",
+      fovY: Math.PI / 3,
+      position: [x, 0, 10],
+      viewProj: IDENTITY,
+      viewportWidthCssPx: 100,
+      viewportHeightCssPx: 100,
+    });
+  move(0);
   const settle = async () => {
     while (submissions.hasPending()) submissions.prepareFrame();
     await factory.whenIdle(renderer);
@@ -166,6 +205,23 @@ const fixture = () => {
     refusals,
     submissions,
     settle,
+    move,
+    drawnX() {
+      for (const actor of actors) {
+        const mapper = actor.getMapper();
+        const order = mapper?.getPointOrder();
+        if (!order) continue;
+        const positions: Float32Array = mapper
+          .getInputData()
+          .getPoints()
+          .getData();
+        return Array.from(
+          order.getData() as Uint32Array,
+          (id) => positions[id * 3]! + actor.getUserMatrix()[12],
+        );
+      }
+      return [];
+    },
     additionalAdapter() {
       const otherMemory = pool.createOwner();
       extraMemory.push(otherMemory);
@@ -190,8 +246,10 @@ const fixture = () => {
       for (const release of pending.splice(0)) release();
     },
     async started() {
-      for (let index = 0; index < 100 && pending.length === 0; index++)
-        await Promise.resolve();
+      if (!pending.length)
+        await new Promise<void>((resolve) => {
+          onStarted = resolve;
+        });
       expect(pending).toHaveLength(1);
     },
     async show(id: string, count: number, mixed = false) {
@@ -243,6 +301,313 @@ const showMeshParent = async (f: ReturnType<typeof fixture>) => {
   f.adapter.setDrawnTiles(["parent"]);
   await f.settle();
 };
+
+const locatedField = (xs: readonly number[], mixed = false) => {
+  const content = field(xs.length, mixed);
+  const primitive = content.primitives[0]!;
+  xs.forEach((x, index) => {
+    primitive.positions[index * 3] = x;
+  });
+  return content;
+};
+
+const controlledSortWorkers = () => {
+  type Dispatch = {
+    camera: readonly number[];
+    worker: GaussianSortWorkerLike;
+    finish(): void;
+    crash(): void;
+  };
+  let held = false;
+  let started: ((dispatch: Dispatch) => void) | undefined;
+  let pending: Dispatch | undefined;
+  const workers: GaussianSortWorkerLike[] = [];
+  const create = () => {
+    const sorter = createGaussianDistanceSorter();
+    let ranges: readonly GaussianSortRange[] = [];
+    const worker: GaussianSortWorkerLike = {
+      onmessage: null,
+      onerror: null,
+      terminate: vi.fn(),
+      postMessage(message) {
+        const request = message as GaussianSortWorkerRequest;
+        if (request.kind === "scene") {
+          ranges = request.ranges;
+          return;
+        }
+        const deliver = worker.onmessage!;
+        const order = sorter.sort(ranges, request.cameraPosition);
+        const dispatch: Dispatch = {
+          camera: request.cameraPosition,
+          worker,
+          finish() {
+            deliver({
+              data: { kind: "order", jobId: request.jobId, order },
+            } as MessageEvent);
+          },
+          crash() {
+            worker.onerror!({ message: "worker crashed" } as ErrorEvent);
+          },
+        };
+        if (!held) dispatch.finish();
+        else if (started) {
+          const resolve = started;
+          started = undefined;
+          resolve(dispatch);
+        } else pending = dispatch;
+      },
+    };
+    workers.push(worker);
+    return createGaussianSortWorkerBackend(worker);
+  };
+  return {
+    create,
+    workers,
+    hold() {
+      held = true;
+    },
+    next(): Promise<Dispatch> {
+      if (!pending)
+        return new Promise((resolve) => {
+          started = resolve;
+        });
+      const dispatch = pending;
+      pending = undefined;
+      return Promise.resolve(dispatch);
+    },
+  };
+};
+
+describe("Gaussian sort publication", () => {
+  it("publishes captured geometry, order, and meshes while camera and selection keep changing", async () => {
+    const f = fixture();
+    try {
+      f.adapter.submitTile("a", locatedField([0, 2], true));
+      f.adapter.submitTile("b", locatedField([5, 9, 11], true));
+      await f.settle();
+      f.adapter.setDrawnTiles(["a"]);
+      await f.settle();
+
+      f.hold();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      f.move(1);
+      await f.started();
+      f.adapter.setDrawnTiles(["b"]);
+      f.move(7);
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([11, 9, 5, 0, 2]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "a",
+        "b",
+      ]);
+      expect(f.factory.stats(f.renderer)?.pendingSort).toBe(true);
+
+      f.adapter.setDrawnTiles(["a"]);
+      f.move(10);
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([11, 5, 9]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual(["b"]);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.drawnX()).toEqual([0, 2]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual(["a"]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the accepted placement until its replacement sort completes", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1, true);
+      f.hold();
+      f.move(1);
+      await f.started();
+      const revision = f.factory.stats(f.renderer)?.presentationRevision;
+      const matrix = [...IDENTITY];
+      matrix[12] = 10;
+      f.adapter.setBaseMatrix(matrix);
+      f.releaseNext();
+      await f.started();
+      expect(f.factory.stats(f.renderer)?.presentationRevision).toBe(revision);
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.presentationMatrix()[12]).toBe(0);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.drawnX()).toEqual([10]);
+      expect(f.adapter.presentationMatrix()[12]).toBe(10);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the newer mesh selection when a cached order publishes before an in-flight sort", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      f.adapter.submitTile("previous", meshOnly());
+      f.adapter.submitTile("current", meshOnly());
+      await f.settle();
+      f.adapter.setDrawnTiles(["field", "previous"]);
+      await f.settle();
+
+      f.hold();
+      f.move(1);
+      await f.started();
+      f.adapter.setDrawnTiles(["field", "current"]);
+      f.move(0);
+      await Promise.resolve();
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+      f.releaseNext();
+      await f.started();
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps physical work charged and rejects a cleared generation before reusing its slots", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      f.hold();
+      f.move(1);
+      await f.started();
+      const bytes = f.pool.stats().workReservedBytes;
+      expect(bytes).toBeGreaterThan(0);
+      f.adapter.clearTiles();
+      await Promise.resolve();
+      expect(f.drawnX()).toEqual([]);
+      expect(f.pool.stats().workReservedBytes).toBe(bytes);
+      expect(f.adapter.submitTile("field", locatedField([10]))).toBe("queued");
+      f.submissions.prepareFrame();
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([]);
+
+      f.release();
+      await f.settle();
+      f.adapter.setDrawnTiles(["field"]);
+      await f.settle();
+      expect(f.drawnX()).toEqual([10]);
+      expect(f.pool.stats().workReservedBytes).toBe(0);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("restarts a crashed worker for the latest coverage and ignores late replies", async () => {
+    const workers = controlledSortWorkers();
+    const f = fixture(workers.create);
+    try {
+      await f.show("parent", 1, true);
+      f.adapter.submitTile("child", locatedField([5, 9], true), undefined, [
+        "parent",
+      ]);
+      await f.settle();
+      workers.hold();
+      f.move(1);
+      const crashed = await workers.next();
+
+      f.adapter.setDrawnTiles(["child"]);
+      f.move(7);
+      crashed.crash();
+      const retry = await workers.next();
+      expect(crashed.worker.terminate).toHaveBeenCalledOnce();
+      expect(retry.worker).not.toBe(crashed.worker);
+      expect(retry.camera).toEqual([7, 0, 10]);
+      expect(f.pool.stats().activeOperations).toBe(1);
+      crashed.finish();
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "parent",
+      ]);
+
+      retry.finish();
+      await f.settle();
+      expect(f.drawnX()).toEqual([5, 9]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "child",
+      ]);
+      expect(f.pool.stats().workReservedBytes).toBe(0);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("restarts a lazy backend when worker construction fails at dispatch", async () => {
+    const workers = controlledSortWorkers();
+    const unavailable = {
+      sort() {
+        throw new Error("worker construction failed");
+      },
+      dispose: vi.fn(),
+    };
+    const create = vi.fn(workers.create).mockReturnValueOnce(unavailable);
+    const f = fixture(create);
+    try {
+      await f.show("field", 1);
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(unavailable.dispose).toHaveBeenCalledOnce();
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the last coherent draw and preserves admissions when the restart also fails", async () => {
+    const workers = controlledSortWorkers();
+    const f = fixture(workers.create);
+    try {
+      await f.show("accepted", 1, true);
+      const other = f.additionalAdapter();
+      workers.hold();
+      f.move(1);
+      const crashed = await workers.next();
+      expect(other.submitTile("unrelated", locatedField([9], true))).toBe(
+        "queued",
+      );
+      f.submissions.prepareFrame();
+      crashed.crash();
+      const retry = await workers.next();
+      retry.crash();
+      await f.settle();
+      expect(other.tileState("unrelated")).toBe("submitted");
+      other.setDrawnTiles(["unrelated"]);
+      f.move(2);
+      await f.settle();
+      expect(workers.workers).toHaveLength(2);
+      expect(f.errors).toHaveLength(2);
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "accepted",
+      ]);
+      expect(f.pool.stats()).toMatchObject({
+        activeOperations: 0,
+        workReservedBytes: 0,
+      });
+    } finally {
+      f.dispose();
+    }
+  });
+});
 
 describe("Gaussian admission ownership", () => {
   it("admits another pure-mesh successor while a retained parent lease is already claimed", async () => {
