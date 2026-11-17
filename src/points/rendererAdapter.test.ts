@@ -2,10 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PerspectiveCameraView } from "../core/camera";
 import { createMemoryPool } from "../core/memoryPool";
-import type { MemoryOwner } from "../core/memoryResources";
+import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createLodController } from "./controller";
 import { keyToString, type VoxelKey } from "./octree";
-import { createRendererAdapter, type RendererAdapter } from "./rendererAdapter";
+import {
+  createRendererAdapter,
+  type RendererAdapter,
+  type RendererAdapterOptions,
+} from "./rendererAdapter";
 import type { NodeInfo, TileData, TileSource } from "./tileSource";
 import {
   actorInstances,
@@ -30,13 +34,9 @@ const tile = (
 const KEY_A = { level: 1, x: 0, y: 0, z: 0 };
 const KEY_B = { level: 1, x: 1, y: 0, z: 0 };
 
-const makeAdapter = (options?: {
-  diameterCssPx?: number;
-  devicePixelRatio?: number;
-  visible?: boolean;
-  densityFraction?: number;
-  memory?: MemoryOwner;
-}) => {
+const makeAdapter = (
+  options?: Omit<RendererAdapterOptions, "renderer" | "scheduleRender">,
+) => {
   // Attachment, not call counts: what costs a frame is what the renderer
   // holds, and the same actor legitimately leaves and rejoins the prop list as
   // its tile moves between the drawn set and the reuse pool.
@@ -79,6 +79,66 @@ beforeEach(resetStubs);
 afterEach(() => vi.useRealTimers());
 
 describe("createRendererAdapter", () => {
+  it("cancels only the withdrawn tile after its first span and keeps accepted coverage", () => {
+    const submissions = createSubmissionScheduler({
+      maxBytesPerFrame: 32,
+      schedulePreparation() {},
+      scheduleRender() {},
+      now: () => 0,
+    });
+    const release = vi.fn();
+    const upload = vi.fn(() => ({ bytes: 16, release }));
+    const { adapter } = makeAdapter({
+      submissions,
+      getOpenGLRenderWindow: () => ({
+        getContext: () =>
+          ({ isContextLost: () => false }) as WebGL2RenderingContext,
+        preparePolygonalGeometry: upload,
+      }),
+    });
+    const old = tile([0, 0, 0], 1);
+    const large = tile([0, 0, 1], 7);
+    const survivor = tile([0, 0, 2], 1);
+    const keyC = { level: 1, x: 0, y: 1, z: 0 };
+    try {
+      adapter.applyDrawPlan({ entries: [{ key: KEY_A, pointCount: 1 }] });
+      add(adapter, { key: KEY_A, tile: old });
+      submissions.prepareFrame(1, true);
+      expect(drawnPositions()).toEqual(new Set([old.positions]));
+
+      adapter.applyDrawPlan({
+        entries: [
+          { key: KEY_B, pointCount: large.pointCount },
+          { key: keyC, pointCount: 1 },
+        ],
+      });
+      adapter.applyBatch({
+        removed: [KEY_A],
+        added: [
+          { key: KEY_B, tile: large },
+          { key: keyC, tile: survivor },
+        ],
+      });
+      submissions.prepareFrame(2, false);
+      expect(upload).toHaveBeenCalledTimes(2);
+      expect(drawnPositions()).toEqual(new Set([old.positions]));
+      drop(adapter, KEY_B);
+      adapter.applyDrawPlan({ entries: [{ key: keyC, pointCount: 1 }] });
+      expect(release).toHaveBeenCalledOnce();
+
+      submissions.prepareFrame(3, false);
+      expect(upload).toHaveBeenCalledTimes(3);
+      expect(drawnPositions()).toEqual(new Set([old.positions]));
+      submissions.prepareFrame(3, true);
+      expect(drawnPositions()).toEqual(new Set([survivor.positions]));
+      expect(submissions.hasPending()).toBe(false);
+    } finally {
+      adapter.dispose();
+      submissions.dispose();
+    }
+    expect(release).toHaveBeenCalledTimes(3);
+  });
+
   it("creates one polydata/mapper/actor per added tile", () => {
     const { adapter, renderer, scheduleRender } = makeAdapter({
       diameterCssPx: 3,
@@ -96,6 +156,8 @@ describe("createRendererAdapter", () => {
       pooledPoints: 0,
       pooledBytes: 0,
       reusedTiles: 0,
+      pendingJobs: 0,
+      gpuGeometryUploadBytes: 0,
       builtTiles: 1,
       reuseDepths: Array.from({ length: 12 }, () => 0),
       gpuResidentTiles: 1,

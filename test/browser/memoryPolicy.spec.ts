@@ -232,6 +232,10 @@ it("borrows spare capacity across live assets and preserves coverage through bud
     const points = await call(page, "add", "points", 1);
     await waitDrawn(page, 2);
     expect((await colors(page, "#viewer-2")).blue).toBeGreaterThan(10);
+    const pointRenderer = (await state(page)).stats.find(
+      (entry: { kind: string }) => entry.kind === "pointCloud",
+    ).renderer;
+    expect(pointRenderer.gpuGeometryUploadBytes).toBeGreaterThan(0);
     await call(page, "remove", points);
     await call(page, "remove", "asset-0");
     await eventually(async () => (await state(page)).memory.owners).toBe(0);

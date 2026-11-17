@@ -103,40 +103,46 @@ const add = (asset: string, view = 0): string => {
   );
   const member =
     asset === "points" || asset === "delayed-points"
-      ? createPointCloudMember(context, {
-          source: {
-            metadata: () => ({ pointCount: 16 }),
-            nodes: async () => [
-              {
-                key: { level: 0, x: 0, y: 0, z: 0 },
-                pointCount: 16,
-                bounds: { min: [-1, -1, 0], max: [1, 1, 1] },
-                spacing: 1,
-                children: [],
-              },
-            ],
-            loadTile: async () => {
-              if (asset === "delayed-points")
-                await new Promise<void>((resolve) => delayed.push(resolve));
-              return {
-                origin: [0, 0, 1],
-                positions: new Float32Array(
-                  Array.from({ length: 48 }, (_, i) =>
-                    i % 3 === 2 ? 0 : (i % 12) / 12 - 0.5,
+      ? createPointCloudMember(
+          context,
+          {
+            source: {
+              metadata: () => ({ pointCount: 16 }),
+              nodes: async () => [
+                {
+                  key: { level: 0, x: 0, y: 0, z: 0 },
+                  pointCount: 16,
+                  bounds: { min: [-1, -1, 0], max: [1, 1, 1] },
+                  spacing: 1,
+                  children: [],
+                },
+              ],
+              loadTile: async () => {
+                if (asset === "delayed-points")
+                  await new Promise<void>((resolve) => delayed.push(resolve));
+                return {
+                  origin: [0, 0, 1],
+                  positions: new Float32Array(
+                    Array.from({ length: 48 }, (_, i) =>
+                      i % 3 === 2 ? 0 : (i % 12) / 12 - 0.5,
+                    ),
                   ),
-                ),
-                rgb: new Uint8Array(
-                  Array.from({ length: 48 }, (_, i) => (i % 3 === 2 ? 255 : 0)),
-                ),
-                pointCount: 16,
-              };
+                  rgb: new Uint8Array(
+                    Array.from({ length: 48 }, (_, i) =>
+                      i % 3 === 2 ? 255 : 0,
+                    ),
+                  ),
+                  pointCount: 16,
+                };
+              },
             },
+            adaptive: false,
+            pointBudget: 16,
+            selectionDelayMs: 0,
+            presentation: { mode: "fixed", diameterCssPx: 16 },
           },
-          adaptive: false,
-          pointBudget: 16,
-          selectionDelayMs: 0,
-          presentation: { mode: "fixed", diameterCssPx: 16 },
-        })
+          { getOpenGLRenderWindow: () => ownerHost.openGLRenderWindow },
+        )
       : createTiles3dMember(
           context,
           {

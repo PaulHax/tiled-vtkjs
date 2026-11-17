@@ -87,6 +87,12 @@ export type TileDrawPlan = {
   }[];
 };
 
+export type PresentedPointTile = {
+  readonly keyString: string;
+  readonly tile: TileData;
+  readonly pointCount: number;
+};
+
 /**
  * Every numeric option is a programmer error when it is not finite or falls
  * outside its documented range: construction throws naming the option and the
@@ -99,6 +105,8 @@ export type LodControllerOptions = {
   onTiles: (batch: TileBatch) => void;
   /** Receives per-tile progressive prefixes without changing tile residency. */
   onDrawPlan?: (plan: TileDrawPlan) => void;
+  /** For consumers that publish asynchronously, read their accepted draw prefixes. */
+  presentedTiles?: () => Iterable<PresentedPointTile>;
   /**
    * Coalescing render request — called once per applied batch, never once per
    * tile. Must not render synchronously more than once per event loop turn.
@@ -345,6 +353,8 @@ export type LodDrawPlanStats = {
  * Construction is where an invalid number is fatal.
  */
 export type LodController = {
+  /** Report a failed realization of the exact payload sent to the consumer. */
+  failRealization(key: VoxelKey, tile: TileData): void;
   /**
    * Update the camera; selection reruns debounced (leading edge immediate).
    * A view with any non-finite number is ignored. With a model matrix set,
@@ -660,6 +670,13 @@ export const createLodController = (
    */
   const drawnPointsOf = (keyString: string, tile: TileData): number =>
     Math.min(tile.pointCount, plan.prefixes.get(keyString) ?? 0);
+
+  const presentedTiles =
+    options.presentedTiles ??
+    function* () {
+      for (const [keyString, tile] of residency.submitted())
+        yield { keyString, tile, pointCount: drawnPointsOf(keyString, tile) };
+    };
 
   /** Hand the consumer the residency delta once per microtask burst. */
   let flushScheduled = false;
@@ -1020,6 +1037,12 @@ export const createLodController = (
   };
 
   return {
+    failRealization(key, tile) {
+      if (disposed || !residency.failRealization(keyToString(key), tile))
+        return;
+      scheduleFlush();
+      markWork();
+    },
     retryMemory() {
       residency.retryBlocked();
       tiles.retryBlocked();
@@ -1193,9 +1216,7 @@ export const createLodController = (
         }
       }
       let drawnPoints = 0;
-      for (const [keyString, tile] of residency.submitted()) {
-        drawnPoints += drawnPointsOf(keyString, tile);
-      }
+      for (const { pointCount } of presentedTiles()) drawnPoints += pointCount;
       return {
         active,
         residentTiles: totals.residentTiles,
@@ -1259,8 +1280,7 @@ export const createLodController = (
         ? viewInModelFrame(pickView, modelFrame)
         : pickView;
       const pickTiles: PickTile[] = [];
-      for (const [keyString, tile] of residency.submitted()) {
-        const pointCount = drawnPointsOf(keyString, tile);
+      for (const { keyString, tile, pointCount } of presentedTiles()) {
         if (pointCount === 0) continue;
         pickTiles.push({
           origin: tile.origin,

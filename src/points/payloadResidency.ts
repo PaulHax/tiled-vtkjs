@@ -43,6 +43,8 @@ export type PayloadResidency = {
   hold(key: string, tile: TileData): boolean;
   /** Move every resident payload the set does not name into the cache. */
   releaseExcept(keep: ReadonlySet<string>): void;
+  /** Release the renderer reservation after a failed realization of this payload. */
+  failRealization(key: string, tile: TileData): boolean;
   /** Cache a payload, unless residency already owns the key. */
   park(key: string, tile: TileData): void;
   /** Make a cached payload resident; false when the cache has none. */
@@ -156,6 +158,16 @@ export const createPayloadResidency = (options: {
     blocked.delete(key);
     return true;
   };
+  const moveToCache = (key: string, tile: TileData): void => {
+    resident.delete(key);
+    residentPoints -= tile.pointCount;
+    residentBytes -= tileBytes(tile);
+    rendererMemory.get(key)?.release();
+    rendererMemory.delete(key);
+    // Transfer the resident CPU reference into the reuse cache.
+    cache.delete(key);
+    cache.set(key, tile, tileBytes(tile));
+  };
 
   return {
     hold,
@@ -164,15 +176,15 @@ export const createPayloadResidency = (options: {
       // Deleting the key being visited is safe while iterating a Map.
       for (const [key, tile] of resident) {
         if (keep.has(key)) continue;
-        resident.delete(key);
-        residentPoints -= tile.pointCount;
-        residentBytes -= tileBytes(tile);
-        rendererMemory.get(key)?.release();
-        rendererMemory.delete(key);
-        // Transfer the resident CPU reference into the reuse cache.
-        cache.delete(key);
-        cache.set(key, tile, tileBytes(tile));
+        moveToCache(key, tile);
       }
+    },
+
+    failRealization(key, tile) {
+      if (resident.get(key) !== tile) return false;
+      blocked.add(key);
+      moveToCache(key, tile);
+      return true;
     },
 
     park(key, tile) {
@@ -186,6 +198,7 @@ export const createPayloadResidency = (options: {
     },
 
     promote(key) {
+      if (blocked.has(key)) return false;
       const cached = cache.get(key);
       if (cached === undefined) return false;
       return hold(key, cached);

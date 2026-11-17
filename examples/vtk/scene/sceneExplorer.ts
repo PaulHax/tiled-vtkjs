@@ -614,6 +614,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       const member = createPointCloudMember(
         host.coordinator.context(host.renderer),
         config,
+        { getOpenGLRenderWindow: () => host.openGLRenderWindow },
       );
       const registration = host.coordinator.register(member, {
         id,
