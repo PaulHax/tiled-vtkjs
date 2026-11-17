@@ -196,11 +196,27 @@ export const createTiles3dMember = (
     context.onWorkChange?.();
   };
   const noteResourceRecovery = (): void => {
+    const residentBytes = memoryConstrained
+      ? adapter.workState().residentBytes
+      : 0;
+    const exceedsGrant = residentBytes > allocation.memoryBudgetBytes;
+    // A covering tile already on screen may be too large for the new grant.
+    // It remains visible without needing a new adapter admission to report it.
+    if (exceedsGrant && resourceState.status === "ready") {
+      policyRefused(
+        new ResourcePolicyError(
+          "renderer",
+          residentBytes,
+          allocation.memoryBudgetBytes,
+        ),
+      );
+      return;
+    }
     if (
       resourceState.status === "blocked" &&
       !sourceRefusal &&
       !rendererRefusal &&
-      !memoryConstrained &&
+      !exceedsGrant &&
       !blockedGroupAncestors.size &&
       !unavailableRepresentations.size &&
       !queueSnapshot?.blocked &&
