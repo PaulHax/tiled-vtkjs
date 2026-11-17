@@ -250,7 +250,11 @@ export const createTiles3dMember = (
     realizationWakeQueued = true;
     queueMicrotask(() => {
       realizationWakeQueued = false;
-      if (!disposed && active && retryRealizations("presentation"))
+      if (
+        !disposed &&
+        active &&
+        (retryRealizations("presentation") || traversal?.recoveringCoverage)
+      )
         refreshSelection();
     });
   };
@@ -391,6 +395,8 @@ export const createTiles3dMember = (
     qualityFraction: number,
     honourBlockedGroups = true,
   ): TilesetTraversalResult => {
+    const presented = adapter.presentedTileIds?.();
+    const published = presented ? new Set(presented) : undefined;
     const result = traverseTileset({
       root: source!.root,
       camera: camera!,
@@ -399,6 +405,7 @@ export const createTiles3dMember = (
       modelMatrix: traversalModelMatrix(),
       geometricErrorScale: config.geometricErrorScale,
       readiness,
+      ...(published ? { presented: (id) => published.has(id) } : {}),
       unavailable: (id) => unavailableRepresentations.has(id),
       ...(honourBlockedGroups && blockedGroupAncestors.size > 0
         ? { refinable: (id: string) => !blockedGroupAncestors.has(id) }

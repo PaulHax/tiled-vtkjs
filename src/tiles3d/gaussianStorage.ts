@@ -18,6 +18,7 @@ export const createGaussianStorage = () => {
   let pending: [number, number][] = [];
   let grew = false;
   const packed = new Map<number, GaussianBounds>();
+  const progress = new Map<number, { count: number; bounds: GaussianBounds }>();
 
   const grow = (target: number): void => {
     if (target <= capacity) return;
@@ -30,6 +31,7 @@ export const createGaussianStorage = () => {
     capacity = target;
     coalesce();
     packed.clear();
+    progress.clear();
     grew = true;
   };
 
@@ -134,8 +136,13 @@ export const createGaussianStorage = () => {
     grow,
     isPacked: (revision: number): boolean => packed.has(revision),
     packedBounds: (revision: number) => packed.get(revision),
+    packingProgress: (revision: number) => progress.get(revision),
     markPacked(revision: number, bounds: GaussianBounds): void {
+      progress.delete(revision);
       packed.set(revision, bounds);
+    },
+    markPartial(revision: number, count: number, bounds: GaussianBounds): void {
+      progress.set(revision, { count, bounds });
     },
     owns(key: string, revision: number): boolean {
       return allocations.get(key)?.revision === revision;
@@ -146,6 +153,7 @@ export const createGaussianStorage = () => {
         if (!live.has(key)) {
           allocations.delete(key);
           packed.delete(allocation.revision);
+          progress.delete(allocation.revision);
           free.push(allocation);
         }
       coalesce();
@@ -169,6 +177,7 @@ export const createGaussianStorage = () => {
       origin = null;
       allocations.clear();
       packed.clear();
+      progress.clear();
       free = [];
       pending = [];
       grew = true;

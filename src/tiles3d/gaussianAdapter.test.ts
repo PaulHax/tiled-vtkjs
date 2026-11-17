@@ -130,6 +130,7 @@ const field = (count: number, mixed = false): DecodedTileContent => ({
 const fixture = (
   createSortBackend?: () => GaussianSortBackend,
   maximumVisibleSplats?: number,
+  maxBytesPerFrame?: number,
 ) => {
   const actors = new Set<any>();
   const renderer = {
@@ -149,6 +150,7 @@ const fixture = (
   const extraMemory: (typeof memory)[] = [];
   const submissions = createSubmissionScheduler({
     scheduleRender() {},
+    ...(maxBytesPerFrame === undefined ? {} : { maxBytesPerFrame }),
     now: () => 0,
   });
   const distance = createGaussianDistanceSorter();
@@ -1058,6 +1060,25 @@ describe("Gaussian admission ownership", () => {
       }
     },
   );
+
+  it("publishes a broad ready region while a larger unrelated field is still packing", async () => {
+    const f = fixture(undefined, undefined, 64);
+    try {
+      await f.show("root/0/0", 1);
+      expect(f.adapter.submitTile("root/2/0/0", field(200))).toBe("queued");
+      await f.drainUntil(() => f.submissions.hasPending());
+      f.submissions.prepareFrame();
+      expect(f.adapter.submitTile("root/1", locatedField([10]))).toBe("queued");
+      await f.drainUntil(() => f.adapter.tileState("root/1") === "submitted");
+      expect(f.adapter.tileState("root/2/0/0")).toBe("queued");
+      f.adapter.setDrawnTiles(["root/1"]);
+      await f.drainUntil(() => f.drawnX()[0] === 10);
+      expect(f.adapter.tileState("root/2/0/0")).toBe("queued");
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
 
   it("keeps a blocked region while unrelated complete replacements publish", async () => {
     const f = fixture();

@@ -542,6 +542,34 @@ describe("traverseTileset", () => {
     expect(result.drawnTileIds).toEqual(["root/0", "root/1"]);
   });
 
+  it("restores broad published coverage before refining an asynchronously admitted region", () => {
+    const root = makeTile("root", 16, [
+      makeTile("root/0", 0),
+      makeTile("root/1", 0),
+    ]);
+    const options: TilesetTraversalOptions = {
+      root,
+      camera: view([0, 0, -4]),
+      maximumScreenSpaceErrorPx: 2,
+      readiness: () => "submitted",
+    };
+    const rebuilding = traverseTileset({
+      ...options,
+      presented: (id) => id === "root/0",
+    });
+    expect(rebuilding.desiredTileIds).toEqual(["root/0", "root/1"]);
+    expect(rebuilding.requestedTileIds).toContain("root");
+    expect(rebuilding.drawnTileIds).toEqual(["root"]);
+    expect(rebuilding.recoveringCoverage).toBe(true);
+
+    const recovered = traverseTileset({
+      ...options,
+      presented: (id) => id === "root",
+    });
+    expect(recovered.drawnTileIds).toEqual(["root/0", "root/1"]);
+    expect(recovered.recoveringCoverage).toBe(false);
+  });
+
   it("keeps the nearest submitted fallback through nested failure and admission", () => {
     const root = tree();
     const waiting = select(

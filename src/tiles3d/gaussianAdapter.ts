@@ -416,14 +416,24 @@ const makeStorage = (
   };
 };
 
-function* packStorage(storage: Storage, tuplesPerStep: number) {
-  for (const packed of storage.primitives) {
+function* packStorage(
+  storage: Storage,
+  tuplesPerStep: number,
+  onPacked: () => void,
+) {
+  const priority = (packed: PackedPrimitive) =>
+    packed.tile.id.split("/").length;
+  const ordered = [...storage.primitives].sort(
+    (a, b) => priority(a) - priority(b),
+  );
+  for (const packed of ordered) {
     const { primitive, matrix, offset, count, allocationRevision } = packed;
     if (storage.arena.isPacked(allocationRevision)) continue;
     const { origin } = storage;
     const transformShape = createGaussianShapeTransform(matrix);
     const staticCamera = [0, 0, 0] as const;
-    const bounds: GaussianBounds = [
+    const partial = storage.arena.packingProgress(allocationRevision);
+    const bounds: GaussianBounds = partial?.bounds ?? [
       Infinity,
       -Infinity,
       Infinity,
@@ -431,7 +441,11 @@ function* packStorage(storage: Storage, tuplesPerStep: number) {
       Infinity,
       -Infinity,
     ];
-    for (let first = 0; first < count; first += tuplesPerStep) {
+    for (
+      let first = partial?.count ?? 0;
+      first < count;
+      first += tuplesPerStep
+    ) {
       const end = Math.min(count, first + tuplesPerStep);
       yield {
         bytes: (end - first) * 56,
@@ -478,8 +492,10 @@ function* packStorage(storage: Storage, tuplesPerStep: number) {
                 destination * 4,
               );
           }
-          if (end === count)
+          if (end === count) {
             storage.arena.markPacked(allocationRevision, bounds);
+            onPacked();
+          } else storage.arena.markPartial(allocationRevision, end, bounds);
         },
       };
     }
@@ -707,8 +723,15 @@ const createManager = (
   let idleCheckQueued = false;
   const waitingForPreparation = () => dirty || !!allocationJob || !!packing;
   const hasWork = () => waitingForPreparation() || pendingSort || !!publication;
+  const waitingForSortTarget = () =>
+    dirty ||
+    (waitingForPreparation() &&
+      (!sortTarget ||
+        [...sortTarget.snapshot.owners].some(([owner, { base }]) =>
+          base.some((value, index) => value !== owner.base[index]),
+        )));
   const wakeIdle = (): void => {
-    if (pendingSort && !waitingForPreparation()) memoryPool.admission.wake();
+    if (pendingSort && !waitingForSortTarget()) memoryPool.admission.wake();
     if ((!disposed && hasWork()) || !idleWaiters.size || idleCheckQueued)
       return;
     idleCheckQueued = true;
@@ -1271,6 +1294,31 @@ const createManager = (
     sortElapsedMs: number | null,
   ): boolean => {
     if (!compatible(snapshot, target)) return false;
+    if (
+      storage?.positions === target.storage.positions &&
+      (latestColorCamera?.every(
+        (value, axis) => value === presentation.cameraPosition[axis],
+      ) ||
+        [...snapshot.owners].some(([owner, { base }]) =>
+          base.some((value, axis) => value !== owner.base[axis]),
+        )) &&
+      (!getOpenGLRenderWindow ||
+        !snapshot.count ||
+        displayedGpu?.positions === storage.positions) &&
+      [...snapshot.owners].every(
+        ([owner, { base }]) =>
+          base.every((value, index) => value === owner.presentedBase[index]) &&
+          [...owner.presented].every((tile) => snapshot.tiles.has(tile)),
+      ) &&
+      snapshot.tiles.size ===
+        [...snapshot.owners.keys()].reduce(
+          (size, owner) => size + owner.presented.size,
+          0,
+        )
+    ) {
+      if (publication) newerPublication = true;
+      return true;
+    }
     if (publication) {
       if (compatible(publication.snapshot, publication.target)) {
         newerPublication = true;
@@ -1562,7 +1610,7 @@ const createManager = (
         stage: {
           lane: "sort",
           ready: () =>
-            !waitingForPreparation() &&
+            !waitingForSortTarget() &&
             (!!backend || memoryPool.admission.canAcquireWorker("sort")),
           async start(signal) {
             const work = memory.work(signal, sortWorkBytes());
@@ -1728,7 +1776,7 @@ const createManager = (
   };
 
   const ensurePacked = (value: Storage): boolean => {
-    if (packing && packing.storage.positions !== value.positions) {
+    if (packing && packing.storage !== value) {
       packing.job.cancel();
       packing = null;
     }
@@ -1740,7 +1788,7 @@ const createManager = (
       return true;
     if (packing) return false;
     function* steps() {
-      yield* packStorage(value, tuplesPerStep(56));
+      yield* packStorage(value, tuplesPerStep(56), scheduleRefresh);
       yield {
         bytes: 0,
         run() {
@@ -1879,7 +1927,9 @@ const createManager = (
       (!activePlan ||
         candidatePlan.covered > activePlan.covered ||
         (candidatePlan.covered === activePlan.covered &&
-          candidatePlan.samePlacement >= activePlan.samePlacement));
+          (candidatePlan.samePlacement > activePlan.samePlacement ||
+            (candidatePlan.samePlacement === activePlan.samePlacement &&
+              (!packing || candidate?.arena === storage?.arena)))));
     const planned = useCandidate ? candidatePlan : activePlan;
     const targetStorage = useCandidate ? candidate : storage;
     const targetMemory = useCandidate ? realizedMemory : displayedMemory;
@@ -2204,7 +2254,7 @@ const createManager = (
         previousRealizedMemory !== displayedMemory
       )
         previousRealizedMemory?.release();
-      if (!ensurePacked(candidate)) return;
+      ensurePacked(candidate);
       completeAdmissions();
       updatePresentation();
     } catch (error) {
@@ -2974,6 +3024,7 @@ const createManager = (
             .filter((tile) => tile.submitted)
             .map((tile) => tile.id),
         submissionRevision: () => owner.submissionRevision,
+        presentedTileIds: () => [...owner.presented].map((tile) => tile.id),
         pickableMeshTiles: () => owner.mesh.submittedTiles(),
         workState: () => ({
           workRevision: owner.workRevision + workRevision,

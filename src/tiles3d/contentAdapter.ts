@@ -69,6 +69,8 @@ export type TileContentAdapter = Omit<
     }[],
     replacementIds: readonly string[],
   ): TileSubmissionOutcome;
+  /** Published coverage when preparation and presentation are asynchronous. */
+  presentedTileIds?(): readonly string[];
   pickableMeshTiles(): readonly SubmittedMeshTile[];
 };
 
