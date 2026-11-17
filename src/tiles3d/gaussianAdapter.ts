@@ -134,6 +134,20 @@ const writeGaussianTexture = (
   return count * components * values.BYTES_PER_ELEMENT;
 };
 
+const contiguousTupleRanges = (
+  primitives: readonly Pick<PackedPrimitive, "offset" | "count">[],
+): [number, number][] => {
+  const ranges: [number, number][] = [];
+  for (const { offset, count } of [...primitives].sort(
+    (a, b) => a.offset - b.offset,
+  )) {
+    const previous = ranges.at(-1);
+    if (previous && previous[0] + previous[1] === offset) previous[1] += count;
+    else ranges.push([offset, count]);
+  }
+  return ranges;
+};
+
 export type GaussianRendererStats = {
   displayedSplats: number;
   visibleSplats: number;
@@ -1438,38 +1452,67 @@ const createManager = (
         latestColorCamera.some(
           (value, index) => value !== presentation.cameraPosition[index],
         );
+      function* writeAttribute(
+        bank: PointTextureBank,
+        name: string,
+        values: Float32Array,
+        components: number,
+        ranges: readonly [number, number][],
+      ) {
+        const bytesPerTuple = components * values.BYTES_PER_ELEMENT;
+        const step = uploadTuplesPerStep(bytesPerTuple);
+        for (const [offset, count] of ranges)
+          for (let first = 0; first < count; first += step) {
+            const size = Math.min(step, count - first);
+            yield {
+              bytes: size * bytesPerTuple,
+              run() {
+                attributeUploadBytes += writeGaussianTexture(
+                  bank,
+                  name,
+                  values,
+                  components,
+                  capacity,
+                  offset + first,
+                  size,
+                );
+              },
+            };
+          }
+      }
+      if (gpu) {
+        const dirtyGeometry = snapshot.primitives.filter(
+          ({ allocationRevision }) =>
+            !gpu.geometryRanges.has(allocationRevision),
+        );
+        const ranges = contiguousTupleRanges(dirtyGeometry);
+        yield* writeAttribute(
+          gpu.geometry,
+          "pointPositions",
+          next.positions,
+          3,
+          ranges,
+        );
+        yield* writeAttribute(
+          gpu.geometry,
+          "pointRadius",
+          next.scales,
+          3,
+          ranges,
+        );
+        yield* writeAttribute(
+          gpu.geometry,
+          "pointRotation",
+          next.rotations,
+          4,
+          ranges,
+        );
+        for (const { allocationRevision } of dirtyGeometry)
+          gpu.geometryRanges.add(allocationRevision);
+      }
+      const dirtyColors: PackedPrimitive[] = [];
       for (const packed of snapshot.primitives) {
         const { allocationRevision, offset, count, primitive } = packed;
-        if (gpu && !gpu.geometryRanges.has(allocationRevision)) {
-          const attributes = [
-            ["pointPositions", next.positions, 3],
-            ["pointRadius", next.scales, 3],
-            ["pointRotation", next.rotations, 4],
-          ] as const;
-          for (const [name, values, components] of attributes) {
-            const bytesPerTuple = components * values.BYTES_PER_ELEMENT;
-            const step = uploadTuplesPerStep(bytesPerTuple);
-            for (let first = 0; first < count; first += step) {
-              const size = Math.min(step, count - first);
-              yield {
-                bytes: size * bytesPerTuple,
-                run() {
-                  attributeUploadBytes += writeGaussianTexture(
-                    gpu.geometry,
-                    name,
-                    values,
-                    components,
-                    capacity,
-                    offset + first,
-                    size,
-                  );
-                },
-              };
-            }
-          }
-          gpu.geometryRanges.add(allocationRevision);
-        }
-
         const harmonic = primitive.harmonicDegree > 0;
         const colorChanged =
           harmonic &&
@@ -1504,31 +1547,20 @@ const createManager = (
             };
           }
         }
-        if (draw) {
-          const step = uploadTuplesPerStep(16);
-          for (let first = 0; first < count; first += step) {
-            const size = Math.min(step, count - first);
-            yield {
-              bytes: size * 16,
-              run() {
-                attributeUploadBytes += writeGaussianTexture(
-                  draw.textures,
-                  "pointColors",
-                  next.colors,
-                  4,
-                  capacity,
-                  offset + first,
-                  size,
-                );
-                if (!harmonic && first + size === count)
-                  draw.staticColors.add(allocationRevision);
-              },
-            };
-          }
-        }
+        if (draw) dirtyColors.push(packed);
         if (colorChanged) colorRanges.push([offset, count]);
       }
       if (draw) {
+        yield* writeAttribute(
+          draw.textures,
+          "pointColors",
+          next.colors,
+          4,
+          contiguousTupleRanges(dirtyColors),
+        );
+        for (const { primitive, allocationRevision } of dirtyColors)
+          if (primitive.harmonicDegree === 0)
+            draw.staticColors.add(allocationRevision);
         const step = uploadTuplesPerStep(4);
         for (let first = 0; first < order.length; first += step) {
           const count = Math.min(step, order.length - first);

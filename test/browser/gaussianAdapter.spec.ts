@@ -73,7 +73,7 @@ type MeshCacheState = {
 type Fixture = {
   stageMixedProbe(
     id: string,
-    count: number,
+    count: number | number[],
     triangles: number,
     replacement?: string[],
   ): string;
@@ -595,6 +595,33 @@ describe("coherent mixed presentations and ownership", () => {
           frame.uploads.some((upload) => (upload.x ?? 0) > 0),
         ),
       ).toBe(true);
+      expect(await api(page, "errors")).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("uploads adjacent dirty primitives together within the frame cap", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      expect(await api(page, "stageMixedProbe", "parent", [30, 30], 1)).toBe(
+        "queued",
+      );
+      const frames: ProbeFrame[] = [];
+      const accepted = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 60,
+        frames,
+      );
+      const attributes = frames.flatMap(({ uploads }) =>
+        uploads.filter(({ kind }) => kind === "attributes"),
+      );
+      expect(attributes.map(({ count }) => count)).toEqual([60, 60, 60, 60]);
+      expect(attributes.reduce((sum, { bytes }) => sum + bytes, 0)).toBe(
+        60 * 56,
+      );
+      expect(accepted.picks).toEqual(["parent"]);
+      expect(accepted.pixel[0]).toBeGreaterThan(150);
       expect(await api(page, "errors")).toEqual([]);
     } finally {
       await page.close();

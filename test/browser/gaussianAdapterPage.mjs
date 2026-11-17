@@ -361,10 +361,23 @@ let recoveryConfig;
 const recoveryFetches = [];
 globalThis.gaussianFixture = {
   stageMixedProbe(id, count, triangleCount, replacement = []) {
-    const content = field(
-      Array.from({ length: count }, () => (id === "parent" ? red : blue)),
-      id === "parent" ? 0 : 1,
+    const parts = (Array.isArray(count) ? count : [count]).map((length) =>
+      field(
+        Array.from({ length }, () => (id === "parent" ? red : blue)),
+        id === "parent" ? 0 : 1,
+      ),
     );
+    const content = {
+      ...parts[0],
+      primitives: parts.flatMap(({ primitives }) => primitives),
+      byteEstimate: {
+        geometry: parts.reduce(
+          (sum, part) => sum + part.byteEstimate.geometry,
+          0,
+        ),
+        textures: 0,
+      },
+    };
     const patch = triangle(-1, [0, 1, 0, 1], "OPAQUE");
     patch.positions = Float32Array.from(
       Array.from({ length: triangleCount }, () => [...patch.positions]).flat(),
