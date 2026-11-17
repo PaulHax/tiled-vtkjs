@@ -50,6 +50,7 @@ vi.mock("@kitware/vtk.js/Rendering/SceneGraph/RenderPass", () => vtk);
 
 import { IDENTITY } from "../core/mat4";
 import { createMemoryPool } from "../core/memoryPool";
+import { ResourcePolicyError } from "../core/memoryResources";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createGaussianContentAdapterFactory } from "./gaussianAdapter";
 import { createGaussianDistanceSorter } from "./gaussianSort";
@@ -181,6 +182,9 @@ const fixture = () => {
     hold() {
       held = true;
     },
+    releaseNext() {
+      pending.shift()!();
+    },
     release() {
       held = false;
       for (const release of pending.splice(0)) release();
@@ -229,9 +233,9 @@ describe("Gaussian admission ownership", () => {
       await f.started();
       expect(f.pool.stats().rendererBytes).toBe(540);
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
-      expect(f.adapter.tileState("parent")).toBe("queued");
+      expect(f.adapter.tileState("parent")).toBe("submitted");
       expect(f.adapter.setResourceCeilingBytes(240)).toEqual([]);
-      expect(f.adapter.tileState("parent")).toBe("queued");
+      expect(f.adapter.tileState("parent")).toBe("submitted");
       f.release();
       await f.settle();
       expect(f.pool.stats().rendererBytes).toBe(60);
@@ -240,6 +244,152 @@ describe("Gaussian admission ownership", () => {
       expect(f.errors).toEqual([]);
       expect(f.refusals).toEqual([]);
     } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the caller-selected mixed frontier while a replacement is only preadmitted", async () => {
+    const f = fixture();
+    try {
+      await f.show("parent", 1, true);
+      expect(
+        f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("child")).toBe("submitted");
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "parent",
+      ]);
+      f.hold();
+      f.adapter.setDrawnTiles(["child"]);
+      await f.started();
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "parent",
+      ]);
+      f.release();
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["child"]);
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "child",
+      ]);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("retains compact preadmission capacity against competing owners until explicit selection", async () => {
+    const f = fixture();
+    const competitor = f.pool.createOwner();
+    try {
+      f.pool.configure({ totalBytes: 540, transitionBytes: 0 });
+      await f.show("parent", 1);
+      expect(
+        f.adapter.submitTile("child", field(8), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("child")).toBe("submitted");
+      expect(f.pool.stats().rendererBytes).toBe(540);
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(() => competitor.reserveRenderer(480)).toThrow(
+        ResourcePolicyError,
+      );
+      f.adapter.setDrawnTiles(["child"]);
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["child"]);
+      expect(f.pool.stats().rendererBytes).toBe(480);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      competitor.close();
+      f.dispose();
+    }
+  });
+
+  it("retains tuples for multiple preadmitted groups against competing owners", async () => {
+    const f = fixture();
+    const competitor = f.pool.createOwner();
+    try {
+      f.pool.configure({ totalBytes: 4096, transitionBytes: 0 });
+      await f.show("a", 1);
+      expect(f.adapter.submitTile("b", field(1))).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      for (const parent of ["a", "b"]) {
+        expect(
+          f.adapter.submitTileGroup(
+            ["L", "R"].map((suffix) => ({
+              id: parent + suffix,
+              content: field(4),
+            })),
+            [parent],
+          ),
+        ).toBe("queued");
+        await f.settle();
+      }
+      const children = ["aL", "aR", "bL", "bR"];
+      for (const id of children)
+        expect(f.adapter.tileState(id)).toBe("submitted");
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+      expect(() => competitor.reserveRenderer(3137)).toThrow(
+        ResourcePolicyError,
+      );
+      f.adapter.setDrawnTiles(children);
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(16);
+      expect(f.adapter.stats().drawnTileIds).toEqual(children);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      competitor.close();
+      f.dispose();
+    }
+  });
+
+  it("coalesces a selected mixed frontier and placement while sort admission waits", async () => {
+    const f = fixture();
+    const blocker = f.pool.createOwner();
+    const work = [];
+    try {
+      await f.show("parent", 1, true);
+      expect(
+        f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      work.push(await blocker.work(), await blocker.work());
+      f.hold();
+      const matrix = [...IDENTITY];
+      matrix[12] = 0.6;
+      f.adapter.setBaseMatrix(matrix);
+      for (
+        let index = 0;
+        index < 100 && f.pool.stats().queuedOperations === 0;
+        index++
+      )
+        await Promise.resolve();
+      expect(f.pool.stats().queuedOperations).toBe(1);
+      matrix[12] = -0.6;
+      f.adapter.setBaseMatrix(matrix);
+      f.adapter.setDrawnTiles(["child"]);
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "parent",
+      ]);
+      for (const entry of work.splice(0)) entry.release();
+      await f.started();
+      f.releaseNext();
+      await f.settle();
+      expect(f.adapter.presentationMatrix()[12]).toBe(-0.6);
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "child",
+      ]);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      for (const entry of work) entry.release();
+      blocker.close();
       f.dispose();
     }
   });
@@ -272,7 +422,7 @@ describe("Gaussian admission ownership", () => {
       expect(f.pool.stats().rendererBytes).toBe(oldBytes + finalBytes);
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
       expect(f.adapter.setResourceCeilingBytes(finalBytes)).toEqual([]);
-      expect(f.adapter.tileState("parent")).toBe("queued");
+      expect(f.adapter.tileState("parent")).toBe("submitted");
       f.release();
       await f.settle();
       expect(f.pool.stats().rendererBytes).toBe(finalBytes);
@@ -358,12 +508,18 @@ describe("Gaussian admission ownership", () => {
       f.adapter.setResourceCeilingBytes(240);
       f.hold();
       expect(
-        f.adapter.submitTile("parent", field(1), undefined, ["detail"]),
+        f.adapter.submitTile(
+          "parent",
+          field(1),
+          () => f.adapter.setDrawnTiles(["parent"]),
+          ["detail"],
+        ),
       ).toBe("queued");
       f.submissions.prepareFrame();
       await f.started();
       expect(f.pool.stats().rendererBytes).toBe(540);
-      expect(f.adapter.cancelTile("parent")).toBe(true);
+      expect(f.adapter.retireTile("parent")).toBe(true);
+      f.adapter.setDrawnTiles(["detail"]);
       f.release();
       await f.settle();
       expect(f.adapter.tileState("parent")).toBe("absent");
@@ -371,6 +527,46 @@ describe("Gaussian admission ownership", () => {
       expect(f.pool.stats().rendererBytes).toBe(480);
       expect(f.errors).toEqual([]);
       expect(f.refusals).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("releases speculative growth before compacting after a sort workspace refusal", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      f.pool.configure({ workBytes: 0 });
+      f.adapter.setCamera({
+        projection: "perspective",
+        fovY: Math.PI / 3,
+        position: [0.1, 0, 10],
+        viewProj: IDENTITY,
+        viewportWidthCssPx: 100,
+        viewportHeightCssPx: 100,
+      });
+      expect(f.adapter.submitTile("growth", field(8))).toBe("queued");
+      await f.settle();
+      expect(f.adapter.submitTile("cancelled", field(32))).toBe("queued");
+      expect(f.adapter.cancelTile("cancelled")).toBe(true);
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(
+        f.factory.stats(f.renderer)?.residentBytes,
+      );
+      f.pool.configure({ workBytes: 1000000 });
+      f.adapter.clearRequiredBytes();
+      expect(f.adapter.submitTile("retry", field(32))).toBe("queued");
+      // Match separate host RPC turns: policy refresh runs before queued
+      // upload work is prepared, so speculative retry ownership must survive.
+      await Promise.resolve();
+      expect(f.adapter.tileState("retry")).toBe("queued");
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(
+        f.factory.stats(f.renderer)?.residentBytes,
+      );
+      expect(f.adapter.tileState("retry")).toBe("submitted");
+      expect(f.adapter.stats().drawnTileIds).toEqual(["field"]);
+      expect(f.errors).toEqual([]);
     } finally {
       f.dispose();
     }
