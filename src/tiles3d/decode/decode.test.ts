@@ -226,11 +226,11 @@ describe("decoded tile contract", () => {
       ...(await request("level-0-root.glb")),
       content: await transformedPointGlb(100),
     };
-    const decoded = await decodeMeshTileContent(input);
+    const decoded = await decodeTileContent(input);
     expect(decoded.primitives).toHaveLength(100);
     expect(decoded.byteEstimate.geometry).toBeGreaterThan(1_000);
     await expect(
-      decodeMeshTileContent(input, {
+      decodeTileContent(input, {
         reserveMemory: async (bytes) => {
           if (bytes > 1_000)
             throw new ResourcePolicyError("work", bytes, 1_000);
@@ -249,7 +249,7 @@ describe("decoded tile contract", () => {
       json.nodes[0].children = children;
       const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
       await expect(
-        decodeMeshTileContent(
+        decodeTileContent(
           { ...(await request("level-0-root.glb")), content },
           {
             reserveMemory: async () => {},
@@ -270,7 +270,7 @@ describe("decoded tile contract", () => {
     );
     const content = new TextEncoder().encode(JSON.stringify(json)).buffer;
     await expect(
-      decodeMeshTileContent(
+      decodeTileContent(
         { ...(await request("level-0-root.glb")), content },
         {
           reserveMemory: async () => {},
