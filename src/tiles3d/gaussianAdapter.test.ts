@@ -511,6 +511,82 @@ describe("Gaussian admission ownership", () => {
     },
   );
 
+  it.each([false, true])(
+    "keeps a promoted selected atlas charged while it remains the resident candidate (mixed=%s)",
+    async (mixed) => {
+      const f = fixture();
+      try {
+        await preparePartial(f, mixed);
+        f.adapter.setDrawnTiles(["newA", "b"]);
+        await f.settle();
+        expect(f.adapter.retireTile("newB")).toBe(true);
+        await f.settle();
+        const resident = f.pool.stats().rendererBytes;
+        expect(resident).toBe(f.factory.stats(f.renderer)?.residentBytes);
+        f.adapter.setDrawnTiles(["a", "b"]);
+        await f.settle();
+        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+        expect(f.pool.stats().rendererBytes).toBe(resident + 480);
+        expect(f.pool.stats().rendererBytes).toBe(
+          f.factory.stats(f.renderer)?.residentBytes,
+        );
+        expect(f.adapter.tileState("newA")).toBe("submitted");
+        expect(f.errors).toEqual([]);
+        expect(f.refusals).toEqual([]);
+        f.dispose();
+        expect(f.pool.stats()).toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          activeOperations: 0,
+          owners: 0,
+        });
+      } finally {
+        f.dispose();
+      }
+    },
+  );
+
+  it("refuses transition credit from a displayed atlas that remains the main candidate", async () => {
+    const f = fixture();
+    try {
+      await preparePartial(f);
+      f.adapter.setDrawnTiles(["newA", "b"]);
+      await f.settle();
+      f.adapter.retireTile("newB");
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(480);
+      f.pool.configure({ totalBytes: 720, transitionBytes: 240 });
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect(f.pool.stats().rendererBytes).toBe(480);
+      expect(f.refusals).toHaveLength(1);
+      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
+      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
+      f.adapter.clearRequiredBytes();
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+      expect(f.pool.stats().rendererBytes).toBe(960);
+      expect(f.pool.stats().rendererBytes).toBe(
+        f.factory.stats(f.renderer)?.residentBytes,
+      );
+      expect(f.errors).toEqual([]);
+      f.dispose();
+      expect(f.pool.stats()).toMatchObject({
+        rendererBytes: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        activeOperations: 0,
+        owners: 0,
+      });
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("releases an unpublished partial-selection atlas when the complete old frontier is reselected", async () => {
     const f = fixture();
     try {

@@ -978,7 +978,11 @@ const createManager = (
         actor.setVisibility(order.length > 0);
         storage = next;
         if (displayedMemory !== nextMemory) {
-          displayedMemory?.release();
+          if (
+            displayedMemory !== arenaMemory &&
+            displayedMemory !== realizedMemory
+          )
+            displayedMemory?.release();
           if (selectionMemory === displayedMemory) {
             selectionMemory = undefined;
             selectionStorage = null;
@@ -1368,7 +1372,12 @@ const createManager = (
             try {
               lease = memory.reserveRenderer(capacity * 60, {
                 cpuBytes: capacity * 60,
-                replacing: displayedMemory ? [displayedMemory] : [],
+                replacing:
+                  displayedMemory &&
+                  displayedMemory !== arenaMemory &&
+                  displayedMemory !== realizedMemory
+                    ? [displayedMemory]
+                    : [],
               });
             } catch (error) {
               // A composite mesh group can still own the displayed atlas's
