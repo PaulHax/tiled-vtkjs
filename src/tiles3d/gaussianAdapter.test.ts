@@ -228,7 +228,222 @@ const preparePartial = async (f: ReturnType<typeof fixture>, mixed = false) => {
   expect(f.adapter.tileState("newB")).toBe("submitted");
 };
 
+const meshOnly = (): DecodedTileContent => {
+  const content = field(0, true);
+  return {
+    ...content,
+    primitives: content.primitives.filter(
+      (primitive) => primitive.kind === "mesh",
+    ),
+  };
+};
+const showMeshParent = async (f: ReturnType<typeof fixture>) => {
+  expect(f.adapter.submitTile("parent", meshOnly())).toBe("queued");
+  await f.settle();
+  f.adapter.setDrawnTiles(["parent"]);
+  await f.settle();
+};
+
 describe("Gaussian admission ownership", () => {
+  it("admits another pure-mesh successor while a retained parent lease is already claimed", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(f.adapter.submitTile("a", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("a")).toBe("submitted");
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("b")).toBe("submitted");
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 3);
+      f.adapter.setDrawnTiles(["a", "b"]);
+      f.adapter.retireTile("parent");
+      await f.settle();
+      expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual([
+        "a",
+        "b",
+      ]);
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 2);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+      f.dispose();
+      expect(f.pool.stats()).toMatchObject({
+        rendererBytes: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        activeOperations: 0,
+        owners: 0,
+      });
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps retained mesh credit unavailable while a Gaussian atlas holder survives successor mesh retirement", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(
+        f.adapter.submitTile("mixed", field(1, true), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("mixed")).toBe("submitted");
+      expect(f.adapter.retireTile("mixed")).toBe(true);
+      // The mesh is gone synchronously, but its composite atlas still owns
+      // the old parent's credit until the queued refresh physically clears it.
+      expect(
+        f.adapter.submitTile("next", meshOnly(), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("next")).toBe("submitted");
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 2);
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+      f.dispose();
+      expect(f.pool.stats()).toMatchObject({
+        rendererBytes: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        activeOperations: 0,
+        owners: 0,
+      });
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps a retained parent's credit claimed until every successor-group lease releases", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(
+        f.adapter.submitTileGroup(
+          ["a", "b"].map((id) => ({ id, content: meshOnly() })),
+          ["parent"],
+        ),
+      ).toBe("queued");
+      await f.settle();
+      f.adapter.retireTile("b");
+      await f.settle();
+      expect(f.adapter.submitTile("c", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 3);
+      f.adapter.retireTile("a");
+      await f.settle();
+      f.pool.configure({ totalBytes: bytes * 2, transitionBytes: bytes });
+      expect(f.adapter.submitTile("d", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("d")).toBe("submitted");
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 3);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("refuses reusing retained-parent credit under a tight pool and recovers after the claimant releases", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(f.adapter.submitTile("a", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      f.pool.configure({ totalBytes: bytes * 2, transitionBytes: bytes });
+      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
+        "budget-blocked",
+      );
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.pool.stats().rendererBytes).toBe(bytes * 2);
+      expect(f.refusals).toHaveLength(1);
+      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
+      expect(f.errors).toEqual([]);
+      f.adapter.retireTile("a");
+      await f.settle();
+      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("b")).toBe("submitted");
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("releases the complete canceled mesh group's replacement eligibility", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(
+        f.adapter.submitTileGroup(
+          ["a", "b"].map((id) => ({ id, content: meshOnly() })),
+          ["parent"],
+        ),
+      ).toBe("queued");
+      expect(f.adapter.cancelTile("a")).toBe(true);
+      await f.settle();
+      expect(f.adapter.tileState("a")).toBe("absent");
+      expect(f.adapter.tileState("b")).toBe("absent");
+      expect(f.pool.stats().rendererBytes).toBe(bytes);
+      f.pool.configure({ totalBytes: bytes, transitionBytes: bytes });
+      expect(f.adapter.submitTile("d", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("d")).toBe("submitted");
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("does not attach a retired parent generation's credit claim to a newly admitted parent with the same ID", async () => {
+    const f = fixture();
+    try {
+      await showMeshParent(f);
+      const bytes = f.adapter.estimateTileBytes(meshOnly());
+      expect(f.adapter.submitTile("a", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      f.adapter.setDrawnTiles(["a"]);
+      f.adapter.retireTile("parent");
+      await f.settle();
+      expect(f.adapter.submitTile("parent", meshOnly())).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["parent"]);
+      await f.settle();
+      f.pool.configure({ totalBytes: bytes * 2, transitionBytes: bytes });
+      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
+        "queued",
+      );
+      await f.settle();
+      expect(f.adapter.tileState("b")).toBe("submitted");
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("coarsens under a smaller grant while retaining both atlases until the sort publishes", async () => {
     const f = fixture();
     try {
