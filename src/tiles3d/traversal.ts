@@ -67,6 +67,8 @@ export type TilesetTraversalOptions = {
    * of being refined past into content that will be requested forever.
    */
   readonly refinable?: (tileId: string) => boolean;
+  /** Skip this content representation and seek coverage below it. */
+  readonly unavailable?: (tileId: string) => boolean;
   /** Immutable hierarchy state sampled at the beginning of this pass. */
   readonly subtrees?: SubtreeHierarchyState | null;
 };
@@ -188,6 +190,8 @@ const screenSpaceError = (
 type VisitResult = {
   readonly visible: boolean;
   readonly coverageSubmitted: boolean;
+  /** False when complete coverage requires an excluded representation. */
+  readonly coveragePossible: boolean;
   readonly desired: string[];
   readonly requested: string[];
   readonly drawn: string[];
@@ -501,6 +505,7 @@ const traverseHierarchy = (
       return {
         visible: false,
         coverageSubmitted: true,
+        coveragePossible: true,
         desired: [],
         requested: [],
         drawn: [],
@@ -517,13 +522,18 @@ const traverseHierarchy = (
       return {
         visible: true,
         coverageSubmitted: submitted,
+        coveragePossible: true,
         desired: [],
         requested: submitted ? [tile.id] : [],
         drawn: submitted ? [tile.id] : [],
       };
     }
 
-    const contentful = hasContent(tile);
+    const authoredContent = hasContent(tile);
+    const available = !options.unavailable?.(tile.id);
+    const contentful =
+      authoredContent &&
+      (available || options.readiness(tile.id) === "submitted");
     // Contentless tiles are hierarchy nodes, not drawable levels of detail.
     // Their descendants remain reachable regardless of the node's own SSE, and
     // regardless of `refinable` — such a node has no content of its own to
@@ -539,13 +549,18 @@ const traverseHierarchy = (
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
 
-    if (!refine || visibleChildren.length === 0) {
+    if (
+      !refine ||
+      visibleChildren.length === 0 ||
+      (contentful && visibleChildren.some((child) => !child.coveragePossible))
+    ) {
       if (!contentful) {
         return {
           visible: true,
           // A contentless leaf (or a hierarchy branch whose descendants are
           // all culled) has no draw obligation of its own.
-          coverageSubmitted: true,
+          coverageSubmitted: !authoredContent,
+          coveragePossible: !authoredContent,
           desired: [],
           requested: [],
           drawn: [],
@@ -566,6 +581,7 @@ const traverseHierarchy = (
           submitted ||
           (visibleFallbacks.length > 0 &&
             visibleFallbacks.every((child) => child.coverageSubmitted)),
+        coveragePossible: true,
         desired: [tile.id],
         requested: [tile.id, ...fallbacks.flatMap((child) => child.requested)],
         drawn: submitted
@@ -579,6 +595,7 @@ const traverseHierarchy = (
       return {
         visible: true,
         coverageSubmitted: true,
+        coveragePossible: true,
         desired,
         requested: visibleChildren.flatMap((child) => child.requested),
         drawn: visibleChildren.flatMap((child) => child.drawn),
@@ -589,6 +606,8 @@ const traverseHierarchy = (
     return {
       visible: true,
       coverageSubmitted: submitted,
+      coveragePossible:
+        contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
       requested: [
         ...(contentful ? [tile.id] : []),

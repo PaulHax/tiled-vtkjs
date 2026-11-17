@@ -145,17 +145,11 @@ export const createTiles3dMember = (
   };
   let interactionDepth = 0;
   let memoryConstrained = false;
-  /**
-   * Submitted tiles whose complete replacement group did not fit.
-   *
-   * Distinct from `memoryConstrained`, which says the member's whole desired
-   * frontier is unaffordable and answers by falling back to the root. A
-   * blocked group is a fact about one branch: the rest of the tileset is still
-   * affordable at full quality, so refinement stops at this tile and nowhere
-   * else.
+  /** A fallback constrains its own subtree. An unaffordable representation
+   * can still have affordable descendants.
    */
   const blockedGroupAncestors = new Set<string>();
-  let irreducibleBudget = false;
+  const unavailableRepresentations = new Set<string>();
   let constrainedDesiredSignature: string | null = null;
   let configGeneration = 1;
   let loadGeneration = 0;
@@ -186,7 +180,6 @@ export const createTiles3dMember = (
   let refreshing = false;
   let refreshAgain = false;
   let drawSetDirty = true;
-  let rootMemoryBytes = 0;
   let sourceMemory: MemoryLease | undefined;
   let sourceRefusal: ResourcePolicyError | null = null;
   let lastPolicyRevision = context.memory.policyRevision();
@@ -209,6 +202,7 @@ export const createTiles3dMember = (
       !rendererRefusal &&
       !memoryConstrained &&
       !blockedGroupAncestors.size &&
+      !unavailableRepresentations.size &&
       !queueSnapshot?.blocked &&
       !subtreeSnapshot?.blocked &&
       ![...demand.values()].some((tile) => tile.blocked)
@@ -405,6 +399,7 @@ export const createTiles3dMember = (
       modelMatrix: traversalModelMatrix(),
       geometricErrorScale: config.geometricErrorScale,
       readiness,
+      unavailable: (id) => unavailableRepresentations.has(id),
       ...(honourBlockedGroups && blockedGroupAncestors.size > 0
         ? { refinable: (id: string) => !blockedGroupAncestors.has(id) }
         : {}),
@@ -593,27 +588,33 @@ export const createTiles3dMember = (
     }
     const outcome = adapter.submitTileGroup(entries, [ancestor]);
     recordSubmission(desired, replacement, outcome);
+    if (
+      outcome !== "queued" &&
+      outcome !== "failed" &&
+      !(
+        outcome.refusal instanceof ResourcePolicyError &&
+        outcome.refusal.retryable
+      )
+    ) {
+      const oversized = entries.filter(
+        ({ content }) =>
+          adapter.estimateTileBytes(content) > allocation.memoryBudgetBytes,
+      );
+      if (oversized.length) {
+        for (const { id } of oversized) omitRepresentation(id);
+      } else blockGroupUnder(id);
+    }
     return outcome;
   };
 
   const blockGroupUnder = (id: string): void => {
-    // Coarsen the nearest content-bearing region even when its fallback is
-    // no longer resident. Traversal can request it again without discarding
-    // affordable detail elsewhere in the view.
     const ancestor = ancestorIds(id).find(
       (candidate) =>
+        !unavailableRepresentations.has(candidate) &&
         materializedTileById.get(candidate)?.contentUrl !== undefined,
     );
-    if (ancestor === undefined || ancestor === source?.root.id) {
-      if (memoryConstrained) return;
-      // No smaller content region can cover this request: the member as a
-      // whole must fall back to its root.
-      memoryConstrained = true;
-      irreducibleBudget = false;
-    } else {
-      if (blockedGroupAncestors.has(ancestor)) return;
-      blockedGroupAncestors.add(ancestor);
-    }
+    if (ancestor === undefined || blockedGroupAncestors.has(ancestor)) return;
+    blockedGroupAncestors.add(ancestor);
     constrainedDesiredSignature = unconstrainedDesiredSignature();
     refreshSelection();
   };
@@ -634,7 +635,6 @@ export const createTiles3dMember = (
   const clearBudgetConstraint = (): void => {
     memoryConstrained = false;
     blockedGroupAncestors.clear();
-    irreducibleBudget = false;
     constrainedDesiredSignature = null;
     for (const tile of demand.values()) tile.blocked = undefined;
     rendererRefusal = undefined;
@@ -645,7 +645,7 @@ export const createTiles3dMember = (
 
   const clearAdmissionState = (): void => {
     demand.clear();
-    rootMemoryBytes = 0;
+    unavailableRepresentations.clear();
   };
 
   const retryIfDesiredSelectionChanged = (): void => {
@@ -658,13 +658,7 @@ export const createTiles3dMember = (
     const state = adapter.tileState(id);
     if (state === "submitted") return "submitted" as const;
     if (state === "failed" || demand.get(id)?.blocked) return "failed" as const;
-    // A root that will not fit the member's whole byte allowance is terminal
-    // for this budget, not still arriving, so it never holds `workPending`:
-    // the view governor stops sampling capacity for every member while any of
-    // them claims pending work. A larger allowance clears the latch and
-    // reopens the tile.
-    if (irreducibleBudget && source && id === source.root.id)
-      return "failed" as const;
+    if (unavailableRepresentations.has(id)) return "failed" as const;
     if (state === "queued") return "loading" as const;
     const entry = queue?.state(id);
     if (entry?.status === "ready") return "decoded" as const;
@@ -674,20 +668,11 @@ export const createTiles3dMember = (
     return "unloaded" as const;
   };
 
-  /**
-   * Give up on fitting this tileset in the current byte allowance.
-   *
-   * Surfaced through `stats().irreducibleBudget` rather than `onError`: the
-   * member recovers by itself as soon as it is given more memory, so this is a
-   * state worth seeing in diagnostics, not a failure worth counting. Without
-   * it the only evidence is an absence of geometry.
-   */
-  const latchIrreducibleBudget = (): void => {
-    if (irreducibleBudget) return;
-    irreducibleBudget = true;
-    if (adapter.workState().residentBytes > 0) return;
-    adapter.clearTiles();
-    pickSet.replaceDrawn([]);
+  const omitRepresentation = (id: string): void => {
+    if (unavailableRepresentations.has(id)) return;
+    unavailableRepresentations.add(id);
+    blockedGroupAncestors.delete(id);
+    refreshSelection();
   };
 
   const updateDrawSet = (selectionComplete = false): void => {
@@ -695,7 +680,6 @@ export const createTiles3dMember = (
     // Publish coverage once that batch has finished, not once per callback.
     if (!drawSetDirty || (refreshing && !selectionComplete)) return;
     drawSetDirty = false;
-    if (irreducibleBudget && adapter.workState().residentBytes > 0) return;
     if (!source || !camera || !active || disposed) {
       adapter.setDrawnTiles([]);
       pickSet.replaceDrawn([]);
@@ -757,7 +741,7 @@ export const createTiles3dMember = (
           return (
             state !== "submitted" &&
             state !== "failed" &&
-            !(irreducibleBudget && id === source?.root.id)
+            !unavailableRepresentations.has(id)
           );
         }),
       );
@@ -771,20 +755,12 @@ export const createTiles3dMember = (
       for (const id of admissionOrder) {
         if (adapter.tileState(id) !== "absent") continue;
         const content = queue.get(id);
-        if (!content || (irreducibleBudget && id === source.root.id)) continue;
-        if (id === source.root.id)
-          rootMemoryBytes = adapter.estimateTileBytes(content);
+        if (!content || unavailableRepresentations.has(id)) continue;
 
         const groupOutcome = trySubmitDesiredGroup(id);
-        if (groupOutcome === "queued") continue;
         if (groupOutcome && groupOutcome !== "failed") {
-          if (
-            groupOutcome.refusal instanceof ResourcePolicyError &&
-            groupOutcome.refusal.retryable
-          )
-            continue;
-          blockGroupUnder(id);
-          break;
+          if (refreshAgain) break;
+          continue;
         }
 
         let previous = demand.get(id)?.blocked;
@@ -815,17 +791,13 @@ export const createTiles3dMember = (
           waitingForSiblingBeforeReplacement(id)
         )
           continue;
-        if (id === source.root.id) {
-          if (!memoryConstrained) {
-            memoryConstrained = true;
-            constrainedDesiredSignature = unconstrainedDesiredSignature();
-          }
-          latchIrreducibleBudget();
-          refreshAgain = true;
-        } else {
-          blockGroupUnder(id);
-        }
-        break;
+        if (
+          id === source.root.id ||
+          adapter.estimateTileBytes(content) > allocation.memoryBudgetBytes
+        )
+          omitRepresentation(id);
+        else blockGroupUnder(id);
+        if (refreshAgain) break;
       }
       updateDrawSet(true);
       noteResourceRecovery();
@@ -903,8 +875,7 @@ export const createTiles3dMember = (
       onPolicyRefusal: (request, error) => {
         workProgressSerial += 1;
         policyRefused(error);
-        if (!error.retryable && request.id !== source?.root.id)
-          blockGroupUnder(request.id);
+        if (!error.retryable) omitRepresentation(request.id);
       },
       onStateChange: (snapshot) => {
         workProgressSerial += 1;
@@ -1163,6 +1134,7 @@ export const createTiles3dMember = (
         const availability = context.memory.availability();
         if (revision !== lastPolicyRevision) {
           lastPolicyRevision = revision;
+          unavailableRepresentations.clear();
           clearBudgetConstraint();
           if (sourceRefusal) beginLoad();
           queue?.retryBlocked();
@@ -1224,14 +1196,10 @@ export const createTiles3dMember = (
           : 0,
         residentBytes: renderer.residentBytes,
         memoryDemand: {
-          minimumBytes: rootMemoryBytes,
+          minimumBytes: 0,
           desiredBytes: queueSnapshot?.workPending
             ? Number.POSITIVE_INFINITY
-            : Math.max(
-                rootMemoryBytes,
-                renderer.residentBytes,
-                adapter.requiredBytes(),
-              ),
+            : Math.max(renderer.residentBytes, adapter.requiredBytes()),
         },
       };
     },
@@ -1250,23 +1218,13 @@ export const createTiles3dMember = (
       // fits everything drawn a memory constraint.
       adapter.setResourceCeilingBytes(allocation.memoryBudgetBytes);
       if (allocation.memoryBudgetBytes > previousMemoryBudgetBytes) {
+        unavailableRepresentations.clear();
         clearBudgetConstraint();
       } else if (
         adapter.workState().residentBytes > allocation.memoryBudgetBytes
       ) {
         memoryConstrained = true;
-        irreducibleBudget = false;
         constrainedDesiredSignature = unconstrainedDesiredSignature();
-        if (rootMemoryBytes > allocation.memoryBudgetBytes) {
-          policyRefused(
-            new ResourcePolicyError(
-              "renderer",
-              rootMemoryBytes,
-              allocation.memoryBudgetBytes,
-            ),
-          );
-          irreducibleBudget = true;
-        }
       } else {
         retryIfDesiredSelectionChanged();
       }
@@ -1289,7 +1247,10 @@ export const createTiles3dMember = (
         active,
         disposed,
         sourceState,
-        irreducibleBudget,
+        irreducibleBudget:
+          unavailableRepresentations.size > 0 &&
+          (traversal?.drawnTileIds.length ?? 0) === 0 &&
+          !queueSnapshot?.workPending,
         revision: config.revision,
         capabilityKey: services.textureCapabilities.capabilityKey,
         devicePixelRatio,

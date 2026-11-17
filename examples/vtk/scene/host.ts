@@ -17,6 +17,7 @@
 
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
+import { withPointTextureUploads } from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
 import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
 import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
 import type { vtkRenderPass } from "@kitware/vtk.js/Rendering/SceneGraph/RenderPass";
@@ -347,7 +348,9 @@ export const createSceneHost = (
       const view = cameraView();
       for (const listener of beforeFrameListeners)
         listener(view, currentDevicePixelRatio);
-      coordinator.prepareFrame(++frameSerial);
+      withPointTextureUploads(openGlRenderWindow, () =>
+        coordinator.prepareFrame(++frameSerial),
+      );
       for (const listener of beforePaintListeners) listener();
       refreshClippingRange();
       beginPaint();
@@ -479,7 +482,9 @@ export const createSceneHost = (
     const view = cameraView();
     for (const listener of beforeFrameListeners)
       listener(view, currentDevicePixelRatio);
-    coordinator.prepareFrame(++frameSerial);
+    withPointTextureUploads(openGlRenderWindow, () =>
+      coordinator.prepareFrame(++frameSerial),
+    );
     for (const listener of beforePaintListeners) listener();
     refreshClippingRange();
     beginPaint();

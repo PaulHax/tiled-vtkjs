@@ -292,12 +292,7 @@ const preparePartial = async (f: ReturnType<typeof fixture>, mixed = false) => {
     "queued",
   );
   await f.settle();
-  expect(f.adapter.submitTile("newB", field(1, mixed), undefined, ["b"])).toBe(
-    "queued",
-  );
-  await f.settle();
   expect(f.adapter.tileState("newA")).toBe("submitted");
-  expect(f.adapter.tileState("newB")).toBe("submitted");
 };
 
 const meshOnly = (): DecodedTileContent => {
@@ -1045,7 +1040,6 @@ describe("Gaussian admission ownership", () => {
             .sort(),
         ).toEqual(mixed ? ["b", "newA"] : []);
         expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
-        expect(f.adapter.tileState("newB")).toBe("submitted");
         expect(f.pool.stats().rendererBytes).toBe(
           f.factory.stats(f.renderer)?.residentBytes,
         );
@@ -1065,181 +1059,124 @@ describe("Gaussian admission ownership", () => {
     },
   );
 
-  it.each([false, true])(
-    "updates selected compact coverage placement coherently (mixed=%s)",
-    async (mixed) => {
-      const f = fixture();
-      try {
-        await preparePartial(f, mixed);
-        f.hold();
-        const matrix = [...IDENTITY];
-        matrix[12] = 0.6;
-        f.adapter.setBaseMatrix(matrix);
-        await f.started();
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
-          mixed ? ["a", "b"] : [],
-        );
-        expect(f.adapter.presentationMatrix()[12]).toBe(0);
-        f.release();
-        await f.settle();
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
-          mixed ? ["a", "b"] : [],
-        );
-        expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
-        expect(f.adapter.tileState("newA")).toBe("submitted");
-        expect(f.adapter.tileState("newB")).toBe("submitted");
-        expect(f.pool.stats().rendererBytes).toBe(
-          f.factory.stats(f.renderer)?.residentBytes,
-        );
-        expect(f.errors).toEqual([]);
-        expect(f.refusals).toEqual([]);
-        f.dispose();
-        expect(f.pool.stats()).toMatchObject({
-          rendererBytes: 0,
-          cpuRetainedBytes: 0,
-          cpuReservedBytes: 0,
-          activeOperations: 0,
-          owners: 0,
-        });
-      } finally {
-        f.dispose();
-      }
-    },
-  );
-
-  it.each([false, true])(
-    "keeps a promoted selected atlas charged while it remains the resident candidate (mixed=%s)",
-    async (mixed) => {
-      const f = fixture();
-      try {
-        await preparePartial(f, mixed);
-        f.adapter.setDrawnTiles(["newA", "b"]);
-        await f.settle();
-        expect(f.adapter.retireTile("newB")).toBe(true);
-        await f.settle();
-        const resident = f.pool.stats().rendererBytes;
-        expect(resident).toBe(f.factory.stats(f.renderer)?.residentBytes);
-        f.adapter.setDrawnTiles(["a", "b"]);
-        await f.settle();
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.pool.stats().rendererBytes).toBe(resident + 480);
-        expect(f.pool.stats().rendererBytes).toBe(
-          f.factory.stats(f.renderer)?.residentBytes,
-        );
-        expect(f.adapter.tileState("newA")).toBe("submitted");
-        expect(f.errors).toEqual([]);
-        expect(f.refusals).toEqual([]);
-        f.dispose();
-        expect(f.pool.stats()).toMatchObject({
-          rendererBytes: 0,
-          cpuRetainedBytes: 0,
-          cpuReservedBytes: 0,
-          activeOperations: 0,
-          owners: 0,
-        });
-      } finally {
-        f.dispose();
-      }
-    },
-  );
-
-  it("refuses transition credit from a displayed atlas that remains the main candidate", async () => {
+  it("keeps a blocked region while unrelated complete replacements publish", async () => {
     const f = fixture();
     try {
-      await preparePartial(f);
-      f.adapter.setDrawnTiles(["newA", "b"]);
+      expect(f.adapter.submitTile("left", locatedField([0, 1], true))).toBe(
+        "queued",
+      );
+      expect(
+        f.adapter.submitTile("right", locatedField([20, 21, 22], true)),
+      ).toBe("queued");
       await f.settle();
-      f.adapter.retireTile("newB");
+      f.adapter.setDrawnTiles(["left", "right"]);
       await f.settle();
-      expect(f.pool.stats().rendererBytes).toBe(480);
-      f.pool.configure({ totalBytes: 720, transitionBytes: 240 });
-      f.adapter.setDrawnTiles(["a", "b"]);
+      const accepted = f.pool.stats().rendererBytes;
+      // The right group fits after its predecessor is gone, but its atlas
+      // cannot coexist with current coverage under this hard peak.
+      f.pool.configure({ totalBytes: accepted + 2 * 52, transitionBytes: 0 });
+      const blocked = f.adapter.submitTile(
+        "right/0",
+        locatedField([30, 31, 32, 33, 34, 35], true),
+        undefined,
+        ["right"],
+      );
+      expect(blocked).toMatchObject({ status: "blocked" });
+      expect(
+        f.adapter.submitTileGroup(
+          [
+            { id: "left/0", content: locatedField([10], true) },
+            { id: "left/1", content: locatedField([11], true) },
+          ],
+          ["left"],
+        ),
+      ).toBe("queued");
       await f.settle();
-      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
-      expect(f.pool.stats().rendererBytes).toBe(480);
-      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
-      f.adapter.clearRequiredBytes();
+      f.hold();
+      f.adapter.setDrawnTiles(["left/0", "left/1", "right"]);
+      await f.started();
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["left", "right"]);
+      f.release();
       await f.settle();
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.pool.stats().rendererBytes).toBe(960);
-      expect(f.pool.stats().rendererBytes).toBe(
-        f.factory.stats(f.renderer)?.residentBytes,
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["left/0", "left/1", "right"]);
+      expect(f.drawnX().sort((a, b) => a - b)).toEqual([10, 11, 20, 21, 22]);
+      expect(f.pool.stats().rendererBytes).toBeLessThanOrEqual(
+        accepted + 2 * 52,
       );
       expect(f.errors).toEqual([]);
+    } finally {
       f.dispose();
-      expect(f.pool.stats()).toMatchObject({
-        rendererBytes: 0,
-        cpuRetainedBytes: 0,
-        cpuReservedBytes: 0,
-        activeOperations: 0,
-        owners: 0,
-      });
+    }
+    expect(f.pool.stats()).toMatchObject({
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+      owners: 0,
+    });
+  });
+
+  it("keeps Gaussian coverage until a staged mesh-only replacement is selected", async () => {
+    const f = fixture();
+    try {
+      await f.show("fine", 8, true);
+      const accepted = f.pool.stats().rendererBytes;
+      const meshBytes = f.adapter.estimateTileBytes(meshOnly());
+      f.pool.configure({ totalBytes: meshBytes, transitionBytes: accepted });
+      f.adapter.setResourceCeilingBytes(meshBytes);
+      expect(
+        f.adapter.submitTile("coarse", meshOnly(), undefined, ["fine"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("coarse")).toBe("submitted");
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "fine",
+      ]);
+      f.adapter.setDrawnTiles(["coarse"]);
+      f.adapter.retireTile("fine");
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(0);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "coarse",
+      ]);
+      expect(f.pool.stats().rendererBytes).toBe(meshBytes);
+      expect(f.errors).toEqual([]);
     } finally {
       f.dispose();
     }
   });
 
-  it("releases an unpublished partial-selection atlas when the complete old frontier is reselected", async () => {
+  it("releases canceled compact scratch while the old frontier remains pickable", async () => {
     const f = fixture();
     try {
-      await preparePartial(f);
-      const retained = f.pool.stats().rendererBytes;
+      await preparePartial(f, true);
       f.hold();
       f.adapter.setDrawnTiles(["newA", "b"]);
       await f.started();
-      expect(f.pool.stats().rendererBytes).toBe(retained + 480);
+      f.adapter.retireTile("newA");
       f.adapter.setDrawnTiles(["a", "b"]);
-      for (
-        let index = 0;
-        index < 100 && f.pool.stats().rendererBytes !== retained;
-        index++
-      )
-        await Promise.resolve();
-      expect(f.pool.stats().rendererBytes).toBe(retained);
       f.release();
       await f.settle();
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["a", "b"]);
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.errors).toEqual([]);
-      expect(f.refusals).toEqual([]);
-    } finally {
-      f.dispose();
-    }
-  });
-
-  it("retains complete compact coverage when partial-selection overlap is refused, then retries", async () => {
-    const f = fixture();
-    try {
-      await preparePartial(f);
-      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
-      f.adapter.setDrawnTiles(["newA", "b"]);
-      await f.settle();
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.pool.stats().rendererBytes).toBe(960);
-      f.pool.configure({ totalBytes: 1440 });
-      f.adapter.clearRequiredBytes();
-      await f.settle();
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
-      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
       expect(f.pool.stats().rendererBytes).toBe(
         f.factory.stats(f.renderer)?.residentBytes,
       );
       expect(f.errors).toEqual([]);
-      f.dispose();
-      expect(f.pool.stats()).toMatchObject({
-        rendererBytes: 0,
-        cpuRetainedBytes: 0,
-        cpuReservedBytes: 0,
-        activeOperations: 0,
-        owners: 0,
-      });
     } finally {
       f.dispose();
     }

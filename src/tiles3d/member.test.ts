@@ -900,7 +900,6 @@ describe("createTiles3dMember", () => {
       // whole view's adaptive quality freezes behind one over-budget tileset.
       expect(member.governorInputs().work.operations).toBe(0);
       expect(member.stats()).toMatchObject({
-        memoryConstrained: true,
         irreducibleBudget: true,
         resourceState: {
           status: "blocked",
@@ -1269,7 +1268,7 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
-  it("retries a memory-constrained member when the camera changes its desired frontier", async () => {
+  it("retries a refused replacement group when the camera changes its desired frontier", async () => {
     const h = harness(true, 128);
     const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
@@ -1284,7 +1283,6 @@ describe("createTiles3dMember", () => {
       await settle();
     }
     expect(member.stats()).toMatchObject({
-      memoryConstrained: true,
       renderer: { drawnTiles: 1, residentBytes: 52 },
     });
 
@@ -1647,6 +1645,60 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
+  it("serves visible descendants even when the coarsest representation is unaffordable", async () => {
+    const h = harness();
+    h.services.workers.decode = (request) => {
+      const content = decoded();
+      if (request.contentUrl.endsWith("/root.glb"))
+        content.primitives.push(
+          ...Array.from({ length: 9 }, () =>
+            structuredClone(content.primitives[0]!),
+          ),
+        );
+      return { promise: Promise.resolve(content), cancel: vi.fn() };
+    };
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maximumScreenSpaceErrorPx: Number.MAX_VALUE,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            ...document(),
+            root: tile("root.glb", 8, [
+              tile("left.glb", 0),
+              tile("right.glb", 0),
+            ]),
+          }),
+        }),
+      },
+      h.services,
+    );
+    try {
+      member.applyAllocation({
+        qualityFraction: 1,
+        memoryBudgetBytes: 104,
+        regime: "stationary",
+      });
+      member.setCamera(view);
+      for (let i = 0; i < 8; i++) {
+        await settle();
+        while (h.submissions.hasPending()) h.submissions.prepareFrame();
+      }
+      expect(member.governorInputs().memoryDemand?.minimumBytes).toBe(0);
+      expect(member.governorInputs().work.operations).toBe(0);
+      expect(member.stats()).toMatchObject({
+        renderer: { drawnTileIds: ["root/0", "root/1"], residentBytes: 104 },
+        irreducibleBudget: false,
+      });
+    } finally {
+      member.dispose();
+    }
+  });
+
   it("keeps affordable detail when an unresident branch must coarsen", async () => {
     const h = harness();
     const releases = new Map<string, () => void>();
@@ -1715,6 +1767,7 @@ describe("createTiles3dMember", () => {
       "root/0/0",
       "root/1",
     ]);
+    expect(member.governorInputs().memoryDemand?.minimumBytes).toBe(0);
     expect(stats.memoryConstrained).toBe(false);
     member.dispose();
   });
@@ -2058,11 +2111,7 @@ describe("createTiles3dMember", () => {
 
     const stats = member.stats() as Tiles3dMemberStats;
     expect(stats).toMatchObject({
-      // The unaffordable pair is a fact about one branch, not about the
-      // member: falling back to the root here would throw away the right
-      // branch's detail, which is affordable and already drawn.
       memoryConstrained: false,
-      blockedGroups: 1,
     });
     // The left branch holds at its own content; the right branch is refined
     // to its leaves, which a collapse to the root would have thrown away.

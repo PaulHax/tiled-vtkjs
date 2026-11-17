@@ -41,7 +41,6 @@ type Snapshot = {
   splats: number;
   grant: number;
   gpuBytes: number;
-  attributeCapacity: number;
   picks: string[];
   hits: (string | null)[];
   translation: number;
@@ -67,7 +66,8 @@ type Fixture = {
   setup(mixed: boolean): Promise<{
     old: Snapshot;
     first: Snapshot & { state: string };
-    second: Snapshot & { state: string };
+    second: { status: string; reason?: string };
+    waiting: Snapshot;
   }>;
   selectPartial(): Promise<Snapshot>;
   release(): Promise<Snapshot & { errors: string[]; ledgers: Ledger[] }>;
@@ -91,23 +91,19 @@ it.each([false, true])(
           (window as unknown as { fixture: Fixture }).fixture.setup(mixed),
         mixed,
       );
-      for (const stage of [initial.old, initial.first, initial.second]) {
+      for (const stage of [initial.old, initial.first, initial.waiting]) {
         expect(sorted(stage.drawn)).toEqual(["oldA", "oldB"]);
         expect(stage.splats).toBe(5);
         expect(stage.grant).toBe(mixed ? 636 : 480);
         expect(stage.gpuBytes).toBeLessThanOrEqual(480);
-        expect(stage.attributeCapacity).toBe(8);
         expect(stage.a[0]).toBeGreaterThan(150);
         expect(stage.b[1]).toBeGreaterThan(220);
       }
       expect(initial.first.state).toBe("submitted");
-      expect(initial.second.state).toBe("submitted");
-      expect(sorted(initial.second.submitted)).toEqual([
-        "newA",
-        "newB",
-        "oldA",
-        "oldB",
-      ]);
+      expect(initial.second).toMatchObject({
+        status: "blocked",
+        reason: "transition-unavailable",
+      });
       const held = await page.evaluate(() =>
         (window as unknown as { fixture: Fixture }).fixture.selectPartial(),
       );
@@ -141,7 +137,6 @@ it.each([false, true])(
       ).toBeGreaterThan(220);
       expect(sorted(final.drawn)).toEqual(["newA", "oldB"]);
       expect(final.splats).toBe(8);
-      expect(final.attributeCapacity).toBe(8);
       expect(final.gpuBytes).toBeLessThanOrEqual(480);
       expect(final.translation).toBe(0.3);
       expect(final.a[0]).toBe(0);

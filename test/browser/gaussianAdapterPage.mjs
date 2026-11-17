@@ -1,6 +1,7 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkGenericRenderWindow from "@kitware/vtk.js/Rendering/Misc/GenericRenderWindow";
 import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
+import { withPointTextureUploads } from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
 import vtkPolyData from "@kitware/vtk.js/Common/DataModel/PolyData";
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
@@ -20,8 +21,16 @@ const mode = new URLSearchParams(location.search).get("mode") ?? "shared";
 const measureUploads = mode === "budgeted-uploads";
 let uploads = [];
 let phase = "prepare";
+let uploadStateReads = 0;
+let externalTexture;
 if (measureUploads) {
   const prototype = WebGL2RenderingContext.prototype;
+  const getParameter = prototype.getParameter;
+  prototype.getParameter = function (parameter) {
+    if (phase === "prepare" && parameter === this.PIXEL_UNPACK_BUFFER_BINDING)
+      uploadStateReads++;
+    return getParameter.call(this, parameter);
+  };
   const texSubImage = prototype.texSubImage2D;
   prototype.texSubImage2D = function (...args) {
     if (ArrayBuffer.isView(args[8]))
@@ -371,19 +380,39 @@ globalThis.gaussianFixture = {
       replacement,
     );
   },
+  addInvisibleProbe(id) {
+    return adapters[0].submitTile(id, field([blue]));
+  },
   stepMixedProbe() {
     uploads = [];
+    uploadStateReads = 0;
+    const gl = openGL.getContext();
     phase = "prepare";
+    const active = gl.getParameter(gl.ACTIVE_TEXTURE);
+    const bound = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+    if (!externalTexture || !gl.isTexture(externalTexture)) {
+      externalTexture = gl.createTexture();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, externalTexture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 8);
     factory.noteContext(renderer);
-    scheduler.prepareFrame();
+    withPointTextureUploads(openGL, () => scheduler.prepareFrame());
+    const stateRestored =
+      gl.getParameter(gl.UNPACK_ALIGNMENT) === 8 &&
+      gl.getParameter(gl.ACTIVE_TEXTURE) === active &&
+      gl.getParameter(gl.TEXTURE_BINDING_2D) === externalTexture;
+    gl.bindTexture(gl.TEXTURE_2D, bound && gl.isTexture(bound) ? bound : null);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
     phase = "draw";
     renderWindow.render();
-    const gl = openGL.getContext();
     const pixel = new Uint8Array(4);
     gl.readPixels(128, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
     return {
       pixel: [...pixel],
       uploads,
+      uploadStateReads,
+      stateRestored,
       stats: factory.stats(renderer),
       picks: adapters[0].pickableMeshTiles().map(({ id }) => id),
       queued: scheduler.hasPending(),

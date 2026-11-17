@@ -206,13 +206,6 @@ const snapshot = (offset) => {
     splats: factory.stats(renderer).displayedSplats,
     grant: adapter.stats().resourceCeilingBytes,
     gpuBytes: factory.stats(renderer).gpuAttributeBytes,
-    attributeCapacity: renderer
-      .getActors()
-      .find((actor) => actor.getMapper().isA("vtkPointGaussianMapper"))
-      .getMapper()
-      .getInputData()
-      .getPoints()
-      .getNumberOfPoints(),
     picks: picks.map((tile) => tile.id),
     hits,
     translation: matrix[12],
@@ -241,11 +234,20 @@ window.fixture = {
     const old = snapshot(0);
     await submit("newA", field(4, xA, [0, 0, 1], mixed), ["oldA"]);
     const first = { state: adapter.tileState("newA"), ...snapshot(0) };
-    await submit("newB", field(1, xB, [1, 1, 0], mixed), ["oldB"]);
+    const second = adapter.submitTile(
+      "newB",
+      field(1, xB, [1, 1, 0], mixed),
+      undefined,
+      ["oldB"],
+    );
     return {
       old,
       first,
-      second: { state: adapter.tileState("newB"), ...snapshot(0) },
+      waiting: snapshot(0),
+      second:
+        typeof second === "string"
+          ? { status: second }
+          : { status: second.status, reason: second.refusal.estimate?.reason },
     };
   },
   async selectPartial() {

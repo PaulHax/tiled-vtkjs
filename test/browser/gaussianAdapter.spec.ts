@@ -78,6 +78,7 @@ type Fixture = {
     replacement?: string[],
   ): string;
   stepMixedProbe(): ProbeFrame;
+  addInvisibleProbe(id: string): string;
   cancelMixedProbe(id: string): void;
   restoreMixedProbeContext(): Promise<{ before: number; after: number }>;
   showCachedMeshParent(): Promise<string>;
@@ -171,6 +172,8 @@ type Fixture = {
 
 type ProbeFrame = {
   pixel: number[];
+  uploadStateReads: number;
+  stateRestored: boolean;
   uploads: Array<{
     phase: "prepare" | "draw";
     kind: "mesh" | "order" | "attributes";
@@ -590,6 +593,57 @@ describe("coherent mixed presentations and ownership", () => {
       expect(
         frames.some((frame) =>
           frame.uploads.some((upload) => (upload.x ?? 0) > 0),
+        ),
+      ).toBe(true);
+      expect(await api(page, "errors")).toEqual([]);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("finishes a compatible upload through new content arrivals", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      expect(await api(page, "stageMixedProbe", "parent", 1, 1)).toBe("queued");
+      const parent = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 1,
+      );
+      expect(
+        await api(page, "stageMixedProbe", "child", 80, 30, ["parent"]),
+      ).toBe("queued");
+      const frames: ProbeFrame[] = [];
+      await stepUntil(
+        page,
+        (frame) => frame.uploads.some(({ kind }) => kind === "attributes"),
+        frames,
+      );
+      for (let index = 0; index < 8; index++) {
+        expect(await api(page, "addInvisibleProbe", `arrival-${index}`)).toBe(
+          "queued",
+        );
+        frames.push(await api(page, "stepMixedProbe"));
+      }
+      const child = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 80,
+        frames,
+      );
+      const attrs = frames.flatMap((frame) =>
+        frame.uploads.filter(({ kind }) => kind === "attributes"),
+      );
+      expect(attrs.reduce((sum, { bytes }) => sum + bytes, 0)).toBe(80 * 56);
+      expect(child.picks).toEqual(["child"]);
+      expect(child.pixel[2]).toBeGreaterThan(150);
+      expect(child.stats.orderUploadBytes - parent.stats.orderUploadBytes).toBe(
+        80 * 4,
+      );
+      expect(frames.every((frame) => frame.stateRestored)).toBe(true);
+      expect(
+        frames.some(
+          (frame) =>
+            frame.uploads.filter(({ kind }) => kind !== "mesh").length > 1 &&
+            frame.uploadStateReads === 1,
         ),
       ).toBe(true);
       expect(await api(page, "errors")).toEqual([]);
