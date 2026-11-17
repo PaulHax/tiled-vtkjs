@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   DecodeWorkerPool,
@@ -47,16 +47,30 @@ const decodeRequest = (): DecodeTileRequest => ({
   textureCapabilities: { capabilityKey: "rgba", compressedFormats: [] },
 });
 
+const pools = new Set<DecodeWorkerPool>();
+const createPool = (
+  options: ConstructorParameters<typeof DecodeWorkerPool>[0],
+) => {
+  const pool = new DecodeWorkerPool(options);
+  pools.add(pool);
+  return pool;
+};
+afterEach(() => {
+  for (const pool of pools) pool.dispose();
+  pools.clear();
+});
+
 describe("DecodeWorkerPool", () => {
   it("uses an injectable worker count and dispatches deterministically", async () => {
     const workers = [new FakeWorker(), new FakeWorker()];
-    const pool = new DecodeWorkerPool({
+    const pool = createPool({
       size: 2,
       workerFactory: (index) => workers[index]!,
     });
     const first = pool.decode(decodeRequest());
     const second = pool.decode(decodeRequest());
-    const third = pool.decode(decodeRequest());
+    expect(pool.hasCapacity()).toBe(false);
+    expect(() => pool.decode(decodeRequest())).toThrow(/busy/);
     expect(workers.map((worker) => worker.messages.length)).toEqual([1, 1]);
 
     workers[0]!.complete(0, {
@@ -65,6 +79,8 @@ describe("DecodeWorkerPool", () => {
       byteEstimate: { geometry: 0, textures: 0 },
     });
     await first.promise;
+    expect(pool.hasCapacity()).toBe(true);
+    const third = pool.decode(decodeRequest());
     expect(workers.map((worker) => worker.messages.length)).toEqual([2, 1]);
     workers[1]!.complete(0, {
       primitives: [],
@@ -79,7 +95,6 @@ describe("DecodeWorkerPool", () => {
     await Promise.all([second.promise, third.promise]);
     expect(pool.stats()).toMatchObject({
       size: 2,
-      queuedJobs: 0,
       activeJobs: 0,
       completedJobs: 3,
       failedJobs: 0,
@@ -87,10 +102,10 @@ describe("DecodeWorkerPool", () => {
     });
   });
 
-  it("discards completion after cancellation and continues queued work", async () => {
+  it("terminates canceled physical work before admitting replacement work", async () => {
     const worker = new FakeWorker();
     const replacement = new FakeWorker();
-    const pool = new DecodeWorkerPool({
+    const pool = createPool({
       size: 1,
       workerFactory: vi
         .fn()
@@ -98,13 +113,13 @@ describe("DecodeWorkerPool", () => {
         .mockReturnValueOnce(replacement),
     });
     const cancelled = pool.decode(decodeRequest());
-    const next = pool.decode(decodeRequest());
     cancelled.cancel();
     await expect(cancelled.promise).rejects.toMatchObject({
       name: "AbortError",
     });
     worker.complete(0, { stale: true });
     expect(worker.terminated).toBe(true);
+    const next = pool.decode(decodeRequest());
     expect(replacement.messages).toHaveLength(1);
     replacement.complete(0, {
       primitives: [],
@@ -122,26 +137,26 @@ describe("DecodeWorkerPool", () => {
       .fn()
       .mockReturnValueOnce(firstWorker)
       .mockReturnValueOnce(secondWorker);
-    const pool = new DecodeWorkerPool({ size: 1, workerFactory: factory });
+    const pool = createPool({ size: 1, workerFactory: factory });
     const failed = pool.decode(decodeRequest());
-    const queued = pool.decode(decodeRequest());
     firstWorker.onerror?.({ message: "worker crashed" } as ErrorEvent);
     await expect(failed.promise).rejects.toThrow("worker crashed");
     expect(firstWorker.terminated).toBe(true);
     firstWorker.complete(0, { stale: true });
+    const next = pool.decode(decodeRequest());
     expect(secondWorker.messages).toHaveLength(1);
     secondWorker.complete(0, {
       primitives: [],
       origin: [0, 0, 0],
       byteEstimate: { geometry: 0, textures: 0 },
     });
-    await expect(queued.promise).resolves.toMatchObject({ primitives: [] });
+    await expect(next.promise).resolves.toMatchObject({ primitives: [] });
     expect(pool.stats().failedJobs).toBe(1);
   });
 
   it("rejects all work and discards late completions after disposal", async () => {
     const worker = new FakeWorker();
-    const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });
+    const pool = createPool({ size: 1, workerFactory: () => worker });
     const active = pool.decode(decodeRequest());
     pool.dispose();
     await expect(active.promise).rejects.toBeInstanceOf(
@@ -157,7 +172,7 @@ describe("DecodeWorkerPool", () => {
   it("contains a malformed response by replacing the worker", async () => {
     const worker = new FakeWorker();
     const replacement = new FakeWorker();
-    const pool = new DecodeWorkerPool({
+    const pool = createPool({
       size: 1,
       workerFactory: vi
         .fn()
@@ -179,7 +194,7 @@ describe("DecodeWorkerPool", () => {
 
   it("rehydrates named tile/profile failures from the worker protocol", async () => {
     const worker = new FakeWorker();
-    const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });
+    const pool = createPool({ size: 1, workerFactory: () => worker });
     const active = pool.decode(decodeRequest());
     worker.fail(0, {
       name: "TileUnsupportedExtensionError",
@@ -200,7 +215,7 @@ describe("DecodeWorkerPool", () => {
 
   it("preserves the unsupported Gaussian profile property across the worker boundary", async () => {
     const worker = new FakeWorker();
-    const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });
+    const pool = createPool({ size: 1, workerFactory: () => worker });
     const active = pool.decode(decodeRequest());
     worker.fail(0, {
       name: "TileUnsupportedGaussianProfileError",
@@ -221,7 +236,7 @@ describe("DecodeWorkerPool", () => {
 
   it("aggregates runtime cost and retains bounded per-target transcode samples", async () => {
     const worker = new FakeWorker();
-    const pool = new DecodeWorkerPool({ size: 1, workerFactory: () => worker });
+    const pool = createPool({ size: 1, workerFactory: () => worker });
     const active = pool.decode(decodeRequest());
     worker.complete(0, {
       primitives: [],

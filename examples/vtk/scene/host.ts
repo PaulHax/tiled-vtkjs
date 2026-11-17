@@ -356,7 +356,7 @@ export const createSceneHost = (
   };
 
   const tiles3dServices: Tiles3dMemberServices = {
-    workers: createDecodeWorkers(),
+    workers: createDecodeWorkers(memory.admission),
     textureCapabilities: capabilities,
   };
 

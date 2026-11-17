@@ -109,8 +109,8 @@ export const createPointCloudMember = (
     safeCall(() => config.onResourceState?.(next));
     context.onWorkChange?.();
   };
-  let lastAvailability = context.memory.stats().availabilityRevision;
-  let lastPolicy = context.memory.stats().revision;
+  let lastAvailability = context.memory.availability();
+  let lastPolicy = context.memory.policyRevision();
   let retryOnAvailability = false;
   const onPolicyRefusal = (error: ResourcePolicyError): void => {
     retryOnAvailability = error.retryable;
@@ -121,9 +121,9 @@ export const createPointCloudMember = (
       limitBytes: error.limitBytes,
       retryable: error.retryable,
     });
-    lastAvailability = context.memory.stats().availabilityRevision;
+    lastAvailability = context.memory.availability();
     queueMicrotask(() => {
-      lastAvailability = context.memory.stats().availabilityRevision;
+      lastAvailability = context.memory.availability();
     });
     context.onWorkChange?.();
   };
@@ -277,8 +277,8 @@ export const createPointCloudMember = (
     beginInteraction: controller.beginInteraction,
     endInteraction: controller.endInteraction,
     prepareFrame() {
-      const next = context.memory.stats().availabilityRevision;
-      const policy = context.memory.stats().revision;
+      const next = context.memory.availability();
+      const policy = context.memory.policyRevision();
       const policyChanged = policy !== lastPolicy;
       lastPolicy = policy;
       if (
@@ -290,7 +290,7 @@ export const createPointCloudMember = (
         lastAvailability = next;
         setResourceState({ status: "ready" });
         controller.retryMemory();
-        lastAvailability = context.memory.stats().availabilityRevision;
+        lastAvailability = context.memory.availability();
       }
     },
 

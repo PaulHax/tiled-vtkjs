@@ -1,3 +1,7 @@
+import {
+  getPageRequestAdmission,
+  type RequestAdmission,
+} from "../../core/requestAdmission";
 import type {
   DecodeJob,
   DecodeTileRequest,
@@ -38,6 +42,7 @@ export type DecodeMemoryResponseMessage = {
     requestedBytes: number;
     limitBytes: number;
     retryable: boolean;
+    operationBytes?: number;
   };
 };
 
@@ -61,6 +66,7 @@ type DecodeWorkerErrorMessage = {
     readonly requestedBytes?: number;
     readonly limitBytes?: number;
     readonly retryable?: boolean;
+    readonly operationBytes?: number;
     readonly property?: string;
     readonly value?: unknown;
   };
@@ -84,13 +90,14 @@ export type DecodeWorkerPoolOptions = {
   size?: number;
   workerFactory?: (index: number) => DecodeWorkerLike;
   workerUrl?: string | URL;
+  admission?: RequestAdmission;
 };
 
 type JobRecord = {
   jobId: number;
   request: DecodeTileRequest;
-  state: "queued" | "active" | "settled";
-  startedAt: number | null;
+  state: "active" | "settled";
+  startedAt: number;
   resolve(value: DecodedTileContent): void;
   reject(reason: unknown): void;
   memory?: MemoryWork;
@@ -98,6 +105,7 @@ type JobRecord = {
 
 type WorkerSlot = {
   worker: DecodeWorkerLike;
+  readonly release: () => void;
   active: JobRecord | null;
 };
 
@@ -143,8 +151,8 @@ export class DecodeWorkerError extends Error {
 export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
   readonly #size: number;
   readonly #factory: (index: number) => DecodeWorkerLike;
-  #slots: WorkerSlot[];
-  #queued: JobRecord[] = [];
+  readonly #admission: RequestAdmission;
+  #slots: (WorkerSlot | undefined)[];
   #nextJobId = 1;
   #disposed = false;
   #completedJobs = 0;
@@ -169,8 +177,16 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
         import.meta.url,
       );
     this.#factory = options.workerFactory ?? defaultWorkerFactory(workerUrl);
-    this.#slots = Array.from({ length: this.#size }, (_value, index) =>
-      this.#makeSlot(index),
+    this.#admission = options.admission ?? getPageRequestAdmission();
+    this.#slots = Array.from({ length: this.#size });
+  }
+
+  hasCapacity(): boolean {
+    if (this.#disposed) return false;
+    return (
+      this.#slots.some((slot) => slot?.active === null) ||
+      (this.#slots.includes(undefined) &&
+        this.#admission.canAcquireWorker("decode"))
     );
   }
 
@@ -179,6 +195,13 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
     options: { readonly memory?: MemoryWork } = {},
   ): DecodeJob {
     if (this.#disposed) throw new DecodeWorkerPoolDisposedError();
+    let slot = this.#slots.find((candidate) => candidate?.active === null);
+    if (!slot) {
+      const index = this.#slots.indexOf(undefined);
+      if (index < 0) throw new DecodeWorkerError("All decode workers are busy");
+      slot = this.#makeSlot(index);
+      this.#slots[index] = slot;
+    }
     let resolve!: (value: DecodedTileContent) => void;
     let reject!: (reason: unknown) => void;
     const promise = new Promise<DecodedTileContent>(
@@ -190,15 +213,32 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
     const record: JobRecord = {
       jobId: this.#nextJobId,
       request,
-      state: "queued",
-      startedAt: null,
+      state: "active",
+      startedAt: globalThis.performance?.now?.() ?? Date.now(),
       resolve,
       reject,
       memory: options.memory,
     };
     this.#nextJobId += 1;
-    this.#queued.push(record);
-    this.#dispatch();
+    slot.active = record;
+    try {
+      slot.worker.postMessage(
+        {
+          kind: "decode",
+          jobId: record.jobId,
+          request: record.request,
+          managedMemory: record.memory !== undefined,
+        },
+        [record.request.content],
+      );
+    } catch (cause) {
+      this.#onWorkerFailure(
+        slot,
+        new DecodeWorkerError(
+          cause instanceof Error ? cause.message : "Could not send decode work",
+        ),
+      );
+    }
     return {
       promise,
       cancel: () => this.#cancel(record),
@@ -208,8 +248,7 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
   stats() {
     return {
       size: this.#size,
-      queuedJobs: this.#queued.length,
-      activeJobs: this.#slots.filter((slot) => slot.active !== null).length,
+      activeJobs: this.#slots.filter((slot) => slot?.active).length,
       completedJobs: this.#completedJobs,
       failedJobs: this.#failedJobs,
       cancelledJobs: this.#cancelledJobs,
@@ -231,48 +270,47 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
     if (this.#disposed) return;
     this.#disposed = true;
     const error = new DecodeWorkerPoolDisposedError();
-    for (const record of this.#queued.splice(0)) this.#reject(record, error);
     for (const slot of this.#slots) {
+      if (!slot) continue;
+      this.#retire(slot);
       if (slot.active) this.#reject(slot.active, error);
-      slot.active = null;
-      slot.worker.onmessage = null;
-      slot.worker.onerror = null;
-      slot.worker.terminate();
     }
     this.#slots = [];
   }
 
   #makeSlot(index: number): WorkerSlot {
-    const slot: WorkerSlot = {
-      worker: this.#factory(index),
-      active: null,
-    };
-    slot.worker.onmessage = (event) => this.#onMessage(slot, event.data);
-    slot.worker.onerror = (event) =>
-      this.#onWorkerFailure(
-        slot,
-        new DecodeWorkerError(event.message || "decode worker failed"),
-      );
-    return slot;
+    let slot: WorkerSlot | undefined;
+    const release = this.#admission.acquireWorker("decode", {
+      idle: () => slot?.active === null,
+      retire: () => {
+        if (slot) this.#retire(slot);
+      },
+    });
+    if (!release)
+      throw new DecodeWorkerError("Page decode worker capacity is occupied");
+    try {
+      slot = { worker: this.#factory(index), release, active: null };
+      const next = slot;
+      next.worker.onmessage = (event) => this.#onMessage(next, event.data);
+      next.worker.onerror = (event) =>
+        this.#onWorkerFailure(
+          next,
+          new DecodeWorkerError(event.message || "decode worker failed"),
+        );
+      return next;
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
-  #dispatch(): void {
-    if (this.#disposed) return;
-    for (const slot of this.#slots) {
-      if (slot.active) continue;
-      const record = this.#queued.shift();
-      if (!record) break;
-      record.state = "active";
-      record.startedAt = globalThis.performance?.now?.() ?? Date.now();
-      slot.active = record;
-      const message: DecodeWorkerRequestMessage = {
-        kind: "decode",
-        jobId: record.jobId,
-        request: record.request,
-        managedMemory: record.memory !== undefined,
-      };
-      slot.worker.postMessage(message, [record.request.content]);
-    }
+  #retire(slot: WorkerSlot): void {
+    const index = this.#slots.indexOf(slot);
+    if (index >= 0) this.#slots[index] = undefined;
+    slot.worker.onmessage = null;
+    slot.worker.onerror = null;
+    slot.worker.terminate();
+    slot.release();
   }
 
   #onMessage(slot: WorkerSlot, value: unknown): void {
@@ -305,6 +343,7 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
           requestedBytes: error.requestedBytes,
           limitBytes: error.limitBytes,
           retryable: error.retryable,
+          operationBytes: error.operationBytes,
         };
       }
       slot.worker.postMessage(response);
@@ -382,6 +421,7 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
                 payload.requestedBytes,
                 payload.limitBytes,
                 payload.retryable,
+                payload.operationBytes,
               )
             : payload?.name === "TileUnsupportedExtensionError" &&
                 typeof payload.tileUri === "string" &&
@@ -416,45 +456,24 @@ export class DecodeWorkerPool implements DecodeWorkerPoolHandle {
         this.#reject(active, decodeError);
       }
     }
-    this.#dispatch();
+    this.#admission.wake();
   }
 
   #onWorkerFailure(slot: WorkerSlot, error: DecodeWorkerError): void {
     const active = slot.active;
+    this.#retire(slot);
     if (active) {
       this.#failedJobs += 1;
       this.#reject(active, error);
     }
-    const index = this.#slots.indexOf(slot);
-    slot.worker.onmessage = null;
-    slot.worker.onerror = null;
-    slot.worker.terminate();
-    if (index >= 0 && !this.#disposed)
-      this.#slots[index] = this.#makeSlot(index);
-    this.#dispatch();
   }
 
   #cancel(record: JobRecord): void {
-    if (record.state === "queued") {
-      this.#cancelledJobs += 1;
-      const index = this.#queued.indexOf(record);
-      if (index >= 0) this.#queued.splice(index, 1);
-      this.#reject(record, abortError());
-      return;
-    }
-    if (record.state === "active") {
-      this.#cancelledJobs += 1;
-      const slotIndex = this.#slots.findIndex((slot) => slot.active === record);
-      this.#reject(record, abortError());
-      if (slotIndex >= 0) {
-        const slot = this.#slots[slotIndex]!;
-        slot.worker.onmessage = null;
-        slot.worker.onerror = null;
-        slot.worker.terminate();
-        this.#slots[slotIndex] = this.#makeSlot(slotIndex);
-        this.#dispatch();
-      }
-    }
+    if (record.state !== "active") return;
+    const slot = this.#slots.find((candidate) => candidate?.active === record);
+    if (slot) this.#retire(slot);
+    this.#cancelledJobs += 1;
+    this.#reject(record, abortError());
   }
 
   #reject(record: JobRecord, reason: unknown): void {

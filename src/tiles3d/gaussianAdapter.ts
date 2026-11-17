@@ -162,7 +162,9 @@ export type GaussianContentAdapterFactory = TileContentAdapterFactory & {
 
 export type GaussianContentAdapterFactoryOptions = {
   /** Creates a fresh backend for first use and after worker failure. */
-  createSortBackend?: () => GaussianSortBackend;
+  createSortBackend?: (
+    onIdleFailure: (error: GaussianSortWorkerError) => void,
+  ) => GaussianSortBackend;
   maximumVisibleSplats?: number;
   resourceBudgetBytes?: number;
   getOpenGLRenderWindow?: () => vtkOpenGLRenderWindow | null | undefined;
@@ -607,7 +609,7 @@ const createManager = (
   firstOptions: TileContentAdapterOptions,
   maximum: number,
   budget: number,
-  createBackend?: () => GaussianSortBackend,
+  createBackend?: GaussianContentAdapterFactoryOptions["createSortBackend"],
   getOpenGLRenderWindow?: () => vtkOpenGLRenderWindow | null | undefined,
 ) => {
   const owners = new Set<Owner>();
@@ -702,15 +704,12 @@ const createManager = (
   } | null = null;
   let newerPublication = false;
   const idleWaiters = new Set<() => void>();
-  const preparationWaiters = new Set<() => void>();
+  let sortAvailability = 0;
   let idleCheckQueued = false;
   const waitingForPreparation = () => dirty || !!allocationJob || !!packing;
   const hasWork = () => waitingForPreparation() || pendingSort || !!publication;
   const wakeIdle = (): void => {
-    if (disposed || !waitingForPreparation()) {
-      for (const resolve of preparationWaiters) resolve();
-      preparationWaiters.clear();
-    }
+    if (pendingSort && !waitingForPreparation()) memoryPool.admission.wake();
     if ((!disposed && hasWork()) || !idleWaiters.size || idleCheckQueued)
       return;
     idleCheckQueued = true;
@@ -1008,7 +1007,7 @@ const createManager = (
   };
   const makeBackend =
     createBackend ??
-    (() =>
+    ((onIdleFailure: (error: GaussianSortWorkerError) => void) =>
       createGaussianSortWorkerBackend(
         new Worker(
           new URL(
@@ -1017,14 +1016,18 @@ const createManager = (
           ),
           { type: "module" },
         ),
+        onIdleFailure,
       ));
   let backend: GaussianSortBackend | undefined;
+  let releaseWorker: (() => void) | undefined;
   let workerRestarted = false;
   let sortUnavailable = false;
   let sortAdmissionBlocked = false;
   const retireBackend = (): void => {
     backend?.dispose();
     backend = undefined;
+    releaseWorker?.();
+    releaseWorker = undefined;
     workerMemory?.release();
     workerMemory = undefined;
     workerSceneRevision = -1;
@@ -1570,32 +1573,33 @@ const createManager = (
   };
 
   const sorter = createGaussianSortController({
-    async schedule(run) {
-      // A worker retry or a delayed grant can arrive while placement is
-      // being packed. Wait for the new target without occupying a work slot.
-      while (!disposed) {
-        if (waitingForPreparation()) {
-          await new Promise<void>((resolve) => preparationWaiters.add(resolve));
-          continue;
-        }
-        const work = await memory.work(
-          sortCancellation.signal,
-          sortWorkBytes(),
-        );
-        try {
-          if (disposed || waitingForPreparation()) continue;
-          const bytes = sortWorkBytes();
-          const { workReservedBytes, workBytes } = memoryPool.stats();
-          if (workReservedBytes - work.bytes() + bytes > workBytes) continue;
-          work.resize(bytes);
-          await run();
-          return;
-        } finally {
-          sorting = null;
-          work.release();
-        }
-      }
-    },
+    schedule: (run) =>
+      memoryPool.admission.run({
+        group: firstOptions.renderer,
+        signal: sortCancellation.signal,
+        availability: () => memory.availability() + sortAvailability,
+        canRetry: (error) =>
+          error.domain === "work"
+            ? memory.canReserveWork(sortWorkBytes())
+            : memory.canRetry(error),
+        stage: {
+          lane: "sort",
+          ready: () =>
+            !waitingForPreparation() &&
+            (!!backend || memoryPool.admission.canAcquireWorker("sort")),
+          async start(signal) {
+            const work = memory.work(signal, sortWorkBytes());
+            try {
+              await run();
+              return { value: undefined };
+            } finally {
+              sorting = null;
+              work.release();
+              releaseRetiredSources();
+            }
+          },
+        },
+      }),
     backend: {
       async sort(job) {
         const snapshot = sortTarget?.snapshot;
@@ -1621,8 +1625,20 @@ const createManager = (
               count * 24 + job.ranges.length * 128 + 1024,
             );
           try {
-            backend ??= makeBackend();
+            if (!backend) {
+              releaseWorker = memoryPool.admission.acquireWorker("sort", {
+                idle: () => sorting === null,
+                retire: retireBackend,
+              });
+              if (!releaseWorker)
+                throw new Error("Page sort worker capacity is occupied");
+              backend = makeBackend((error) => {
+                retireBackend();
+                if (!disposed) sortFailure(error);
+              });
+            }
           } catch (cause) {
+            retireBackend();
             throw new GaussianSortWorkerError(
               "Could not start the Gaussian sort worker",
               { cause },
@@ -1710,6 +1726,7 @@ const createManager = (
     onIdle() {
       if (!pendingSort) return;
       pendingSort = false;
+      wakeIdle();
       notify();
     },
   });
@@ -1717,6 +1734,8 @@ const createManager = (
     if (sameSortRanges(sortRanges, ranges)) return;
     forgetOrder();
     sortRanges = ranges;
+    sortAvailability += 1;
+    memoryPool.admission.wake();
     sorter.setScene(ranges, { defer: true });
   };
 

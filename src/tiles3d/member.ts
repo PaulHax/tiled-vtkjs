@@ -176,8 +176,8 @@ export const createTiles3dMember = (
   let drawSetDirty = true;
   let rootMemoryBytes = 0;
   let sourceMemory: MemoryLease | undefined;
-  let lastPolicyRevision = context.memory.stats().revision;
-  let lastAvailability = context.memory.stats().availabilityRevision;
+  let lastPolicyRevision = context.memory.policyRevision();
+  let lastAvailability = context.memory.availability();
   let retryOnAvailability = false;
   let resourceState: Tiles3dMemberStats["resourceState"] = { status: "ready" };
   const setResourceState = (
@@ -189,9 +189,9 @@ export const createTiles3dMember = (
   };
   const policyRefused = (error: ResourcePolicyError): void => {
     retryOnAvailability = error.retryable;
-    lastAvailability = context.memory.stats().availabilityRevision;
+    lastAvailability = context.memory.availability();
     queueMicrotask(() => {
-      lastAvailability = context.memory.stats().availabilityRevision;
+      lastAvailability = context.memory.availability();
     });
     setResourceState({
       status: "blocked",
@@ -794,6 +794,8 @@ export const createTiles3dMember = (
       decodedBuffers: buildTransferList,
       fetch: config.fetchContent,
       maxAttempts: config.maxAttempts,
+      decodeReady: () => services.workers.hasCapacity?.() ?? true,
+      priority: 1,
       decode: async (bytes, request, decodeContext) => {
         const tile = materializedTileById.get(request.id);
         if (!tile) throw new Error(`unknown 3D tile ${request.id}`);
@@ -950,54 +952,70 @@ export const createTiles3dMember = (
     traversal = null;
     setQueueSnapshot(null);
     context.onWorkChange?.();
-    const load = async () => {
-      const work = await memory.work(controller.signal);
-      try {
-        const loaded = await loadTileset({
-          endpoint: config.endpoint,
-          fetch: config.fetchTileset,
-          signal: controller.signal,
-          memory: work,
-        });
-        return { loaded, lease: work.commit([], loaded.tileById.size * 1024) };
-      } finally {
-        work.release();
-      }
-    };
-    void load().then(
-      ({ loaded, lease }) => {
-        if (
-          disposed ||
-          generation !== loadGeneration ||
-          controller.signal.aborted
-        ) {
-          lease.release();
-          return;
-        }
-        sourceMemory = lease;
-        source = loaded;
-        materializedTileById = new Map(loaded.tileById);
-        workProgressSerial += 1;
-        sourceState = "ready";
-        createQueue(loaded);
-        createHierarchyQueue(loaded);
-        refreshSelection();
-        context.scheduleRender();
-      },
-      (error) => {
-        if (
-          disposed ||
-          generation !== loadGeneration ||
-          controller.signal.aborted
-        )
-          return;
-        sourceState = "failed";
-        workProgressSerial += 1;
-        const refusal = resourcePolicyError(error);
-        if (refusal) policyRefused(refusal);
-        else report(error);
-      },
-    );
+    void memory.admission
+      .run<{ loaded: TilesetSource; lease: MemoryLease }>({
+        group: memory,
+        availability: memory.availability,
+        canRetry: memory.canRetry,
+        signal: controller.signal,
+        onDiscarded: ({ lease }) => lease.release(),
+        stage: {
+          lane: "network",
+          async start(signal) {
+            const work = memory.work(signal);
+            try {
+              const loaded = await loadTileset({
+                endpoint: config.endpoint,
+                fetch: config.fetchTileset,
+                signal,
+                memory: work,
+              });
+              return {
+                value: {
+                  loaded,
+                  lease: work.commit([], loaded.tileById.size * 1024),
+                },
+              };
+            } finally {
+              work.release();
+            }
+          },
+        },
+      })
+      .then(
+        ({ loaded, lease }) => {
+          if (
+            disposed ||
+            generation !== loadGeneration ||
+            controller.signal.aborted
+          ) {
+            lease.release();
+            return;
+          }
+          sourceMemory = lease;
+          source = loaded;
+          materializedTileById = new Map(loaded.tileById);
+          workProgressSerial += 1;
+          sourceState = "ready";
+          createQueue(loaded);
+          createHierarchyQueue(loaded);
+          refreshSelection();
+          context.scheduleRender();
+        },
+        (error) => {
+          if (
+            disposed ||
+            generation !== loadGeneration ||
+            controller.signal.aborted
+          )
+            return;
+          sourceState = "failed";
+          workProgressSerial += 1;
+          const refusal = resourcePolicyError(error);
+          if (refusal) policyRefused(refusal);
+          else report(error);
+        },
+      );
   };
 
   applyPlacement();
@@ -1120,8 +1138,8 @@ export const createTiles3dMember = (
       if (!disposed && interactionDepth > 0) interactionDepth -= 1;
     },
     prepareFrame() {
-      const revision = context.memory.stats().revision;
-      const availability = context.memory.stats().availabilityRevision;
+      const revision = context.memory.policyRevision();
+      const availability = context.memory.availability();
       const policyChanged = revision !== lastPolicyRevision;
       if (
         !disposed &&

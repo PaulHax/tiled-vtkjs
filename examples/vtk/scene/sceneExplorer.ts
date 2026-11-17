@@ -310,13 +310,12 @@ const datasetActivity = (
       detail: `${failed} 3D Tiles content request${failed === 1 ? "" : "s"} gave up after ${failed === 1 ? "its" : "their"} retries${stats.lastError === null || stats.lastError === undefined ? "" : `: ${stats.lastError}`}`,
     };
   }
-  const decodeJobs =
-    (stats.decode?.activeJobs ?? 0) + (stats.decode?.queuedJobs ?? 0);
+  const decodeJobs = stats.decode?.activeJobs ?? 0;
   if (decodeJobs > 0) {
     return {
       state: "processing",
       label: "Processing data",
-      detail: `${decodeJobs} 3D Tiles decode job${decodeJobs === 1 ? "" : "s"} active or queued`,
+      detail: `${decodeJobs} 3D Tiles decode job${decodeJobs === 1 ? "" : "s"} active`,
     };
   }
   if ((stats.queue?.active ?? 0) > 0) {
@@ -416,14 +415,12 @@ const pointPresentation = (
 export const startSceneExplorer = (preset: ExplorerPreset): void => {
   renderExplorerShell(preset);
   const resourceBudgetBytes = defaultMemoryBudgetBytes();
-  const host = createSceneHost(
-    element<HTMLElement>("#viewer"),
-    createMemoryPool({ totalBytes: resourceBudgetBytes }),
-  );
+  const memory = createMemoryPool({ totalBytes: resourceBudgetBytes });
+  const host = createSceneHost(element<HTMLElement>("#viewer"), memory);
   const gaussian = createGaussianContentAdapterFactory({
     resourceBudgetBytes,
     getOpenGLRenderWindow: () => host.openGLRenderWindow,
-    createSortBackend: () =>
+    createSortBackend: (onIdleFailure) =>
       createGaussianSortWorkerBackend(
         new Worker(
           new URL(
@@ -432,6 +429,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
           ),
           { type: "module" },
         ),
+        onIdleFailure,
       ),
   });
   const gaussianPass = createGaussianAlphaPass(() => {
@@ -543,6 +541,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       operation.check();
       const source = await createCopcWorkerTileSource({
         signal: operation.signal,
+        admission: memory.admission,
         source: input.source,
         createWorker: () =>
           new Worker(new URL("../copc.worker.ts", import.meta.url), {

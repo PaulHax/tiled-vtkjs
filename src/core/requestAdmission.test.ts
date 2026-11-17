@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createLoader } from "./loader";
-import type { RetryPolicy } from "../core/retryPolicy";
+import { createRequestAdmission } from "./requestAdmission";
+import type { RetryPolicy } from "./retryPolicy";
 
 const POLICY: RetryPolicy = {
   attempts: 3,
@@ -33,14 +33,24 @@ const makeLoader = (
   const loads: Load[] = [];
   const loaded: string[] = [];
   const failed: string[] = [];
-  const loader = createLoader<string>({
-    load: (key, signal) =>
-      new Promise<string>((resolve, reject) => {
-        loads.push({ key, signal, resolve, reject });
-        if (options.honoursAbort) {
-          signal.addEventListener("abort", () => reject(abortError()));
-        }
-      }),
+  const loader = createRequestAdmission().createOwner<string>({
+    adoptCancelled: true,
+    keepUnwantedResults: true,
+    operation: (key) => ({
+      lane: "network",
+      start: (signal) =>
+        new Promise<{ value: string }>((resolve, reject) => {
+          loads.push({
+            key,
+            signal,
+            resolve: (value) => resolve({ value }),
+            reject,
+          });
+          if (options.honoursAbort) {
+            signal.addEventListener("abort", () => reject(abortError()));
+          }
+        }),
+    }),
     concurrency: options.concurrency ?? 2,
     retry: POLICY,
     cancelGraceMs: options.cancelGraceMs ?? 0,
@@ -257,5 +267,106 @@ describe("createLoader", () => {
     await settle();
     expect(failed).toEqual(["a", "a"]);
     expect(loader.resting("a")).toBe(false);
+  });
+});
+
+describe("page request admission", () => {
+  it("honors live key priorities and rotates between owners at settlement", async () => {
+    const admission = createRequestAdmission(1);
+    const starts: string[] = [];
+    const finish = new Map<string, () => void>();
+    const owner = (name: string) =>
+      admission.createOwner<void>({
+        concurrency: 1,
+        operation: (key) => ({
+          lane: "network",
+          start: () =>
+            new Promise((resolve) => {
+              const id = `${name}:${key}`;
+              starts.push(id);
+              finish.set(id, () => resolve({ value: undefined }));
+            }),
+        }),
+        onLoaded() {},
+        onFailed: (key) => {
+          throw new Error(`Unexpected failure: ${key}`);
+        },
+      });
+    const points = owner("COPC");
+    const tiles = owner("3D Tiles");
+
+    points.want(["root", "near", "far"]);
+    tiles.want(["other", "visible"]);
+    tiles.want(["visible", "other"]);
+    points.want(["root", "far", "near"]);
+    expect(starts).toEqual(["COPC:root"]);
+    finish.get("COPC:root")!();
+    await settle();
+    expect(starts).toEqual(["COPC:root", "3D Tiles:visible"]);
+    finish.get("3D Tiles:visible")!();
+    await settle();
+    expect(starts).toEqual(["COPC:root", "3D Tiles:visible", "COPC:far"]);
+    finish.get("COPC:far")!();
+    await settle();
+    expect(starts.at(-1)).toBe("3D Tiles:other");
+    points.dispose();
+    tiles.dispose();
+    finish.get("3D Tiles:other")!();
+    await settle();
+    expect(admission.queuedOperations()).toBe(0);
+  });
+
+  it("admits sort while network and compute slots are occupied", async () => {
+    const admission = createRequestAdmission(1);
+    const controller = new AbortController();
+    const releases: (() => void)[] = [];
+    const hold = (lane: "compute" | "network") =>
+      admission.run({
+        signal: controller.signal,
+        stage: {
+          lane,
+          start: () =>
+            new Promise<{ value: void }>((resolve) => {
+              releases.push(() => resolve({ value: undefined }));
+            }),
+        },
+      });
+
+    const network = hold("network");
+    const compute = hold("compute");
+    expect(releases).toHaveLength(2);
+    await expect(
+      admission.run({
+        signal: controller.signal,
+        stage: { lane: "sort", start: () => ({ value: "sorted" }) },
+      }),
+    ).resolves.toBe("sorted");
+    for (const release of releases) release();
+    await Promise.all([network, compute]);
+  });
+
+  it("reclaims idle persistent workers while keeping separate sort headroom", () => {
+    const admission = createRequestAdmission(1);
+    let retired = false;
+    const idle = admission.acquireWorker("decode", {
+      idle: () => true,
+      retire: () => {
+        idle?.();
+        retired = true;
+      },
+    });
+    const active = Array.from({ length: 3 }, () =>
+      admission.acquireWorker("decode"),
+    );
+    expect(active.every(Boolean)).toBe(true);
+    expect(admission.canAcquireWorker("decode", false)).toBe(false);
+    expect(admission.canAcquireWorker("decode")).toBe(true);
+    const replacement = admission.acquireWorker("decode");
+    expect(retired).toBe(true);
+    expect(replacement).toBeTypeOf("function");
+    expect(admission.canAcquireWorker("decode")).toBe(false);
+    const sort = admission.acquireWorker("sort");
+    expect(sort).toBeTypeOf("function");
+    for (const release of [...active, replacement, sort]) release?.();
   });
 });

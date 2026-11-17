@@ -970,7 +970,7 @@ describe("Gaussian admission ownership", () => {
         f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
       ).toBe("queued");
       await f.settle();
-      work.push(await blocker.work(), await blocker.work());
+      work.push(blocker.work(undefined, f.pool.stats().workBytes));
       f.hold();
       const matrix = [...IDENTITY];
       matrix[12] = 0.6;

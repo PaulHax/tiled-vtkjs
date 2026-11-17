@@ -486,6 +486,19 @@ describe("Gaussian sort worker backend", () => {
     expect(worker.terminate).toHaveBeenCalledOnce();
   });
 
+  it("reports a worker crash while idle so its owner can release retained state", () => {
+    const { worker } = fakeWorker();
+    const onIdleFailure = vi.fn();
+    const backend = createGaussianSortWorkerBackend(worker, onIdleFailure);
+    worker.onerror?.({ message: "idle worker crashed" } as ErrorEvent);
+    expect(onIdleFailure).toHaveBeenCalledWith(
+      expect.any(GaussianSortWorkerError),
+    );
+    expect(worker.terminate).toHaveBeenCalledOnce();
+    backend.dispose();
+    expect(onIdleFailure).toHaveBeenCalledOnce();
+  });
+
   it("contains malformed worker messages and rejects invalid matching replies", async () => {
     const { worker } = fakeWorker();
     const backend = createGaussianSortWorkerBackend(worker);

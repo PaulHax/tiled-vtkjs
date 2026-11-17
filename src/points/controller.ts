@@ -34,7 +34,10 @@ import {
   samePrefixes,
   type DrawPlan,
 } from "./drawPlan";
-import { createLoader, type LoaderCounts } from "./loader";
+import {
+  createRequestAdmission,
+  type LoaderCounts,
+} from "../core/requestAdmission";
 import { sameMatrix, transformPoint, type Mat16 } from "../core/mat4";
 import { scenePoint } from "../core/frames";
 import {
@@ -509,6 +512,19 @@ export const createLodController = (
     0,
   );
   let source = options.source;
+  const admission =
+    options.memory?.admission ??
+    source.admission ??
+    createRequestAdmission(fetchConcurrency + hierarchyConcurrency);
+  const ownerGroup = options.memory ?? {};
+  const admissionOptions = {
+    group: ownerGroup,
+    availability: options.memory?.availability,
+    canRetry: options.memory?.canRetry,
+    retry: POINT_RETRY_POLICY,
+    adoptCancelled: true,
+    keepUnwantedResults: true,
+  };
   let pointBudget = wholeAtLeast(
     "pointBudget",
     options.pointBudget ?? 2_000_000,
@@ -661,28 +677,33 @@ export const createLodController = (
     });
   };
 
-  const pages = createLoader<{
+  const pages = admission.createOwner<{
     infos: readonly NodeInfo[];
     memory?: MemoryLease;
   }>({
-    load: async (keyString, signal) => {
-      const work = options.memory
-        ? await options.memory.work(signal, 0)
-        : undefined;
-      try {
-        signal.throwIfAborted();
-        const infos = await source.nodes(keyFromString(keyString), {
-          signal,
-          memory: work,
-        });
-        work?.resize(Math.max(work.bytes(), infos.length * 320));
-        return { infos, memory: work?.commit([], infos.length * 160) };
-      } finally {
-        work?.release();
-      }
-    },
+    ...admissionOptions,
+    operation: (keyString) => ({
+      lane: source.hierarchyLane ?? "network",
+      ready: () =>
+        source.canRead?.("hierarchy", keyFromString(keyString)) ?? true,
+      async start(signal) {
+        const work = options.memory?.work(signal);
+        try {
+          signal.throwIfAborted();
+          const infos = await source.nodes(keyFromString(keyString), {
+            signal,
+            memory: work,
+          });
+          work?.resize(Math.max(work.bytes(), infos.length * 320));
+          return {
+            value: { infos, memory: work?.commit([], infos.length * 160) },
+          };
+        } finally {
+          work?.release();
+        }
+      },
+    }),
     concurrency: hierarchyConcurrency,
-    retry: POINT_RETRY_POLICY,
     // A page survives deactivation in the hierarchy, so cancelling one would
     // only buy a refetch of the same bytes.
     cancelGraceMs: Number.POSITIVE_INFINITY,
@@ -717,75 +738,84 @@ export const createLodController = (
     onChange: markWork,
   });
 
-  const tiles = createLoader<{ tile: TileData; memory?: MemoryLease }>({
-    load: async (keyString, signal) => {
-      const work = options.memory
-        ? await options.memory.work(signal, 0)
-        : undefined;
-      try {
-        signal.throwIfAborted();
-        const estimate = nodes.get(keyString);
-        if (estimate) work?.resize(nodePayloadBytes(estimate) * 3);
-        const tile = await source.loadTile(keyFromString(keyString), {
-          signal,
-          memory: work,
-        });
-        work?.resize(Math.max(work.bytes(), tileBytes(tile) * 3));
-        return {
-          tile,
-          memory: work?.commit([
-            tile.positions.buffer as ArrayBuffer,
-            ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
-          ]),
-        };
-      } finally {
-        work?.release();
-      }
-    },
-    concurrency: fetchConcurrency,
-    retry: POINT_RETRY_POLICY,
-    // One selection interval, in which an orbit or pan crossing back over a
-    // recent tile adopts its read instead of cancelling and refetching it.
-    cancelGraceMs: selectionDelayMs,
-    onLoaded: (keyString, { tile, memory }) => {
-      try {
-        const entry = nodes.get(keyString);
-        const bytes = tileBytes(tile);
-        const exceedsEstimate =
-          entry !== undefined && bytes > nodePayloadBytes(entry);
-        if (entry !== undefined)
-          nodes.set(keyString, { ...entry, tileBytes: bytes });
-        // A source may decode more points than its hierarchy advertised. Learn
-        // that cost before admitting the payload, and keep it after cache
-        // eviction so another selection cannot refetch the same oversized tile.
-        if (exceedsEstimate && selection.target.has(keyString)) {
-          runSelection(undefined, { keyString, tile });
-          return;
+  const tiles = admission.createOwner<{ tile: TileData; memory?: MemoryLease }>(
+    {
+      ...admissionOptions,
+      priority: 1,
+      operation: (keyString) => ({
+        lane: source.tileLane ?? "network",
+        ready: () => source.canRead?.("tile", keyFromString(keyString)) ?? true,
+        async start(signal) {
+          const estimate = nodes.get(keyString);
+          const work = options.memory?.work(
+            signal,
+            estimate ? nodePayloadBytes(estimate) * 3 : 0,
+          );
+          try {
+            signal.throwIfAborted();
+            const tile = await source.loadTile(keyFromString(keyString), {
+              signal,
+              memory: work,
+            });
+            work?.resize(Math.max(work.bytes(), tileBytes(tile) * 3));
+            return {
+              value: {
+                tile,
+                memory: work?.commit([
+                  tile.positions.buffer as ArrayBuffer,
+                  ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+                ]),
+              },
+            };
+          } finally {
+            work?.release();
+          }
+        },
+      }),
+      concurrency: fetchConcurrency,
+      // One selection interval, in which an orbit or pan crossing back over a
+      // recent tile adopts its read instead of cancelling and refetching it.
+      cancelGraceMs: selectionDelayMs,
+      onLoaded: (keyString, { tile, memory }) => {
+        try {
+          const entry = nodes.get(keyString);
+          const bytes = tileBytes(tile);
+          const exceedsEstimate =
+            entry !== undefined && bytes > nodePayloadBytes(entry);
+          if (entry !== undefined)
+            nodes.set(keyString, { ...entry, tileBytes: bytes });
+          // A source may decode more points than its hierarchy advertised. Learn
+          // that cost before admitting the payload, and keep it after cache
+          // eviction so another selection cannot refetch the same oversized tile.
+          if (exceedsEstimate && selection.target.has(keyString)) {
+            runSelection(undefined, { keyString, tile });
+            return;
+          }
+          // Cancellation is advisory, so a cancelled read can still deliver. If
+          // the key was reselected while it ran, this payload is exactly what the
+          // selection is waiting for.
+          if (
+            selection.target.has(keyString) &&
+            !residency.isResident(keyString)
+          ) {
+            residency.hold(keyString, tile);
+            scheduleFlush();
+          } else {
+            residency.park(keyString, tile);
+          }
+        } finally {
+          memory?.release();
         }
-        // Cancellation is advisory, so a cancelled read can still deliver. If
-        // the key was reselected while it ran, this payload is exactly what the
-        // selection is waiting for.
-        if (
-          selection.target.has(keyString) &&
-          !residency.isResident(keyString)
-        ) {
-          residency.hold(keyString, tile);
-          scheduleFlush();
-        } else {
-          residency.park(keyString, tile);
-        }
-      } finally {
-        memory?.release();
-      }
+      },
+      onDiscarded: ({ memory }) => memory?.release(),
+      onFailed: (_keyString, error) => {
+        const refusal = resourcePolicyError(error);
+        if (refusal) options.onPolicyRefusal?.(refusal);
+        else onError(error);
+      },
+      onChange: markWork,
     },
-    onDiscarded: ({ memory }) => memory?.release(),
-    onFailed: (_keyString, error) => {
-      const refusal = resourcePolicyError(error);
-      if (refusal) options.onPolicyRefusal?.(refusal);
-      else onError(error);
-    },
-    onChange: markWork,
-  });
+  );
 
   /** Ask for the pages selection needs, highest priority first. */
   const queuePages = (keyStrings: readonly string[]): void =>

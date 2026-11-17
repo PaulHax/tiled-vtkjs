@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createMemoryPool } from "../core/memoryPool";
 
 import {
   createContentQueue,
@@ -24,11 +25,7 @@ const deferred = <T>() => {
   return { promise, resolve, reject };
 };
 
-const flush = async () => {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-};
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const ok = (bytes = new Uint8Array([1])) => ({
   ok: true,
@@ -95,6 +92,54 @@ describe("content queue", () => {
       "b",
       "c",
     ]);
+  });
+
+  it("releases the network lane before decode while charging retained input until it is discarded", async () => {
+    const pool = createMemoryPool({
+      totalBytes: 100,
+      maxConcurrentOperations: 1,
+    });
+    const memory = pool.createOwner();
+    const lateNetwork = deferred<ReturnType<typeof ok>>();
+    const decode = vi.fn((_bytes, item: TileContentRequest) => ({
+      id: item.id,
+      bytes: 10,
+    }));
+    const starts: string[] = [];
+    const { queue, decoded } = makeQueue({
+      memory,
+      fetch: (url) => {
+        starts.push(url);
+        return url.endsWith("a.glb")
+          ? Promise.resolve(ok(new Uint8Array(14)))
+          : lateNetwork.promise;
+      },
+      decode,
+      decodeReady: () => decoderReady,
+    });
+    let decoderReady = false;
+    queue.setSelection([request("a"), request("b")]);
+    await flush();
+
+    expect(starts).toEqual(["/tiles/a.glb", "/tiles/b.glb"]);
+    expect(decode).not.toHaveBeenCalled();
+    expect(pool.stats().workReservedBytes).toBe(14);
+    queue.setSelection([request("b")]);
+    expect(pool.stats().workReservedBytes).toBe(0);
+    lateNetwork.resolve(ok(new Uint8Array(20)));
+    await flush();
+    expect(pool.stats().workReservedBytes).toBe(20);
+    decoderReady = true;
+    pool.admission.wake();
+    await flush();
+
+    expect(decoded).toEqual(["b"]);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 0,
+      activeOperations: 0,
+    });
+    queue.dispose();
+    memory.close();
   });
 
   it("aborts active deselected work and never reports it to the consumer", async () => {

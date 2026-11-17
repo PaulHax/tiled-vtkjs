@@ -349,6 +349,7 @@ export type GaussianSortWorkerResponse =
 /** Owns and terminates one worker. Scene attributes are cloned once per revision. */
 export const createGaussianSortWorkerBackend = (
   worker: GaussianSortWorkerLike,
+  onIdleFailure?: (error: GaussianSortWorkerError) => void,
 ): GaussianSortBackend => {
   let disposed = false;
   let revision: number | null = null;
@@ -365,14 +366,18 @@ export const createGaussianSortWorkerBackend = (
     pending = null;
     active?.reject(error);
   };
-  const terminate = (error: Error): void => {
+  const terminate = (
+    error: GaussianSortWorkerError,
+    reportIdle = true,
+  ): void => {
     if (disposed) return;
     disposed = true;
     worker.onmessage = null;
     worker.onerror = null;
     worker.onmessageerror = null;
     worker.terminate();
-    fail(error);
+    if (pending) fail(error);
+    else if (reportIdle) safeCall(() => onIdleFailure?.(error));
   };
   worker.onmessage = ({ data }: MessageEvent<unknown>) => {
     if (disposed || !pending || !data || typeof data !== "object") return;
@@ -460,6 +465,7 @@ export const createGaussianSortWorkerBackend = (
     dispose() {
       terminate(
         new GaussianSortWorkerError("Gaussian sort worker is disposed"),
+        false,
       );
     },
   };

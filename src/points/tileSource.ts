@@ -9,6 +9,7 @@
 
 import type { VoxelKey } from "./octree";
 import type { Bounds, Vec3 } from "../core/geometry";
+import type { RequestAdmission, RequestLane } from "../core/requestAdmission";
 import type { MemoryWork } from "../core/memoryResources";
 
 export type TileSourceMetadata = {
@@ -86,6 +87,11 @@ export type LoadOptions = {
 
 /** A source of octree point-cloud tiles. */
 export type TileSource = {
+  readonly admission?: RequestAdmission;
+  readonly hierarchyLane?: RequestLane;
+  readonly tileLane?: RequestLane;
+  canRead?(kind: "hierarchy" | "tile", key: VoxelKey): boolean;
+
   /** Dataset metadata, resolved when the source was created. */
   metadata(): TileSourceMetadata;
   /**

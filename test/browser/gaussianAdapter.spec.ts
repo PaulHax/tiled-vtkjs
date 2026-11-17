@@ -157,7 +157,7 @@ type Fixture = {
   dispose(): void;
   errors(): string[];
   pending(): number;
-  blockWork(kind?: "slots" | "bytes" | "growth"): Promise<void>;
+  blockWork(kind?: "slots" | "bytes" | "growth"): void;
   releaseWork(): void;
   releaseWorkSlot(): void;
   releaseNext(): void;
@@ -937,7 +937,7 @@ describe("coherent mixed presentations and ownership", () => {
           .poll(async () => (await api(page, "ledger")).queuedOperations)
           .toBe(1);
         const waiting = await api(page, "ledger");
-        expect(waiting.activeOperations).toBe(kind === "bytes" ? 1 : 2);
+        expect(waiting.activeOperations).toBe(kind === "growth" ? 2 : 1);
         expect(waiting.workReservedBytes).toBe(
           kind === "bytes" ? 1584 : kind === "growth" ? 1056 : 0,
         );

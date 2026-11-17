@@ -234,13 +234,13 @@ export type DecodeJob = {
 
 /** Minimal pool surface supplied to renderer-neutral members. */
 export type DecodeWorkerPoolHandle = {
+  hasCapacity?(): boolean;
   decode(
     request: DecodeTileRequest,
     options?: { readonly memory?: MemoryWork },
   ): DecodeJob;
   stats?(): {
     readonly size: number;
-    readonly queuedJobs: number;
     readonly activeJobs: number;
     readonly completedJobs: number;
     readonly failedJobs: number;

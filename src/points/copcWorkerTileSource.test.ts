@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { CopcDecodeState, CopcNodeEntry } from "./copcTileSource";
-import { createCopcWorkerTileSource } from "./copcWorkerTileSource";
+import {
+  CopcWorkerCapacityError,
+  createCopcWorkerTileSource,
+} from "./copcWorkerTileSource";
 import type {
   CopcWorkerRequest,
   CopcWorkerResponse,
@@ -172,6 +175,27 @@ describe("COPC worker tile source", () => {
 
     source.dispose?.();
     expect(worker.terminated).toBe(true);
+  });
+
+  it("reports occupied hierarchy slots and opens another source after one closes", async () => {
+    const held: Awaited<ReturnType<typeof openSource>>[] = [];
+    try {
+      for (let index = 0; index < 4; index++)
+        held.push(await openSource(new FakeWorker()));
+      const createWorker = vi.fn();
+      await expect(
+        createCopcWorkerTileSource({
+          source: "another.copc.laz",
+          workers: 1,
+          createWorker,
+        }),
+      ).rejects.toBeInstanceOf(CopcWorkerCapacityError);
+      expect(createWorker).not.toHaveBeenCalled();
+      held.pop()?.dispose?.();
+      held.push(await openSource(new FakeWorker()));
+    } finally {
+      for (const source of held) source.dispose?.();
+    }
   });
 
   it("keeps an aborted request pending until physical worker work ends", async () => {

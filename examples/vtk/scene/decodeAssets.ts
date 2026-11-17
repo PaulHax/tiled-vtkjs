@@ -11,6 +11,7 @@
  * from the loaders.gl codec libraries.
  */
 
+import type { RequestAdmission } from "../../../src/core";
 import { DecodeWorkerPool } from "../../../src/tiles3d";
 import type { DecodeWasmUrls } from "../../../src/tiles3d/decode/types";
 
@@ -30,5 +31,7 @@ export const decodeWasmUrls = (): DecodeWasmUrls => ({
   },
 });
 
-export const createDecodeWorkers = (): DecodeWorkerPool =>
-  new DecodeWorkerPool({ workerUrl: absolute(DECODE_WORKER_URL) });
+export const createDecodeWorkers = (
+  admission: RequestAdmission,
+): DecodeWorkerPool =>
+  new DecodeWorkerPool({ admission, workerUrl: absolute(DECODE_WORKER_URL) });

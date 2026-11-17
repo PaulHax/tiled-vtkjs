@@ -1,7 +1,13 @@
-/** Bounded, revision-safe fetch/decode queue for renderer-neutral tile content. */
+/** Renderer-neutral tile content selection and decoded retention. */
 
 import { finiteAtLeast, integerAtLeast } from "../core/numeric";
 import { safeCall } from "../core/observers";
+import { TileDecodeError } from "./decode/types";
+import {
+  createRequestAdmission,
+  type RequestClock,
+  type RequestStage,
+} from "../core/requestAdmission";
 import {
   resourcePolicyError,
   type MemoryOwner,
@@ -40,11 +46,7 @@ export type ContentDecodeContext = {
   readonly work?: MemoryWork;
 };
 
-export type ContentQueueClock = {
-  now(): number;
-  setTimeout(callback: () => void, delayMs: number): unknown;
-  clearTimeout(handle: unknown): void;
-};
+export type ContentQueueClock = RequestClock;
 
 export type ContentQueueEntryStatus =
   | "queued"
@@ -89,6 +91,8 @@ export type ContentQueueOptions<T> = {
   readonly maxDecodedBytes: number;
   readonly fetch?: ContentQueueFetch;
   readonly memory?: MemoryOwner;
+  readonly decodeReady?: () => boolean;
+  readonly priority?: number;
   readonly decodedBuffers?: (content: T) => Iterable<ArrayBuffer>;
   readonly decode: (
     bytes: ArrayBuffer,
@@ -184,18 +188,7 @@ export class ContentQueueRetryError extends ContentQueueError {
 
 type SelectedEntry = {
   readonly request: TileContentRequest;
-  status: ContentQueueEntryStatus;
-  refusal?: ResourcePolicyError;
-  attempt: number;
-};
-
-type ActiveEntry = {
-  readonly controller: AbortController;
-};
-
-type RetryEntry = {
-  handle?: unknown;
-  handleAssigned: boolean;
+  readyAttempt?: number;
 };
 
 type CacheEntry<T> = {
@@ -203,13 +196,6 @@ type CacheEntry<T> = {
   readonly content: T;
   readonly bytes: number;
   readonly memory?: MemoryLease;
-};
-
-const systemClock: ContentQueueClock = {
-  now: () => Date.now(),
-  setTimeout: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
-  clearTimeout: (handle) =>
-    globalThis.clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
 const normalizeRequest = (request: TileContentRequest): TileContentRequest => {
@@ -250,7 +236,6 @@ export const createContentQueue = <T>(
   );
   const retryBackoffMs =
     options.retryBackoffMs ?? ((attempt) => 250 * 2 ** (attempt - 1));
-  const clock = options.clock ?? systemClock;
   const fetcher =
     options.fetch ?? (globalThis.fetch as unknown as ContentQueueFetch);
   if (typeof revision !== "string" || revision.length === 0) {
@@ -260,11 +245,8 @@ export const createContentQueue = <T>(
     throw new TypeError("fetch is unavailable");
   }
 
-  let epoch = 0;
   let disposed = false;
   let selected = new Map<string, SelectedEntry>();
-  const active = new Map<string, ActiveEntry>();
-  const retries = new Map<string, RetryEntry>();
   const cache = new Map<string, CacheEntry<T>>();
   let decodedBytes = 0;
   let cacheHits = 0;
@@ -283,7 +265,17 @@ export const createContentQueue = <T>(
       failed: 0,
       blocked: 0,
     };
-    for (const { request, status, attempt } of selected.values()) {
+    for (const { request, readyAttempt } of selected.values()) {
+      const state = owner.state(request.id);
+      const status =
+        readyAttempt !== undefined
+          ? "ready"
+          : state?.status === "active"
+            ? "fetching"
+            : state?.status === "resting"
+              ? "retrying"
+              : (state?.status ?? "queued");
+      const attempt = readyAttempt ?? state?.attempt ?? 0;
       entries.push(Object.freeze({ ...request, status, attempt }));
       counts[status] += 1;
     }
@@ -294,7 +286,7 @@ export const createContentQueue = <T>(
       maxConcurrency,
       maxDecodedBytes,
       selected: selected.size,
-      active: active.size,
+      active: owner.physicalCount(),
       queued,
       retrying,
       ready,
@@ -363,196 +355,167 @@ export const createContentQueue = <T>(
     for (const id of cache.keys()) evict(id);
   };
 
-  const cancelActive = (id: string): void => {
-    active.get(id)?.controller.abort();
+  type Output = {
+    readonly content: T;
+    readonly bytes: number;
+    readonly memory?: MemoryLease;
   };
-
-  const cancelRetry = (id: string): void => {
-    const retry = retries.get(id);
-    if (!retry) return;
-    retries.delete(id);
-    if (retry.handleAssigned) {
-      try {
-        clock.clearTimeout(retry.handle);
-      } catch {
-        // Removing the identity makes even an unsuccessfully canceled timer a
-        // no-op. A hostile clock must not leave queue state half-mutated.
-      }
-    }
-  };
-
-  const isCurrent = (
-    id: string,
-    entry: SelectedEntry,
-    operationEpoch: number,
-  ): boolean =>
-    !disposed && operationEpoch === epoch && selected.get(id) === entry;
-
-  let pump: () => void;
-
-  const start = (entry: SelectedEntry): void => {
-    const { request } = entry;
-    const operationEpoch = epoch;
-    const operationRevision = revision;
-    const operationGeneration = configGeneration;
-    const controller = new AbortController();
-    const operation: ActiveEntry = { controller };
-    entry.status = "fetching";
-    entry.attempt += 1;
-    active.set(request.id, operation);
-    emit();
-
-    void (async () => {
-      let failure: Error | undefined;
-      let work: MemoryWork | undefined;
-      let outputMemory: MemoryLease | undefined;
-      try {
-        if (options.memory) work = await options.memory.work(controller.signal);
-        controller.signal.throwIfAborted();
-        let response: ContentQueueFetchResponse;
-        try {
-          response = await fetcher(request.url, { signal: controller.signal });
-        } catch (error) {
-          throw new ContentQueueFetchError(
-            request,
-            "network request failed",
-            undefined,
-            { cause: error },
-          );
-        }
-        if (!response.ok) {
-          if (response.body) await response.body.cancel().catch(() => {});
-          throw new ContentQueueFetchError(
-            request,
-            `HTTP ${response.status} ${response.statusText}`.trim(),
-            response.status,
-          );
-        }
-        let bytes: ArrayBuffer;
-        try {
-          bytes = work
-            ? await readMemoryResponse(response, work, controller.signal)
-            : await response.arrayBuffer();
-        } catch (error) {
-          throw new ContentQueueFetchError(
-            request,
-            "response body read failed",
-            response.status,
-            { cause: error },
-          );
-        }
-        let content: T;
-        try {
-          content = await options.decode(bytes, request, {
-            signal: controller.signal,
-            revision: operationRevision,
-            configGeneration: operationGeneration,
-            work,
-          });
-        } catch (error) {
-          throw new ContentQueueDecodeError(request, { cause: error });
-        }
-        if (isCurrent(request.id, entry, operationEpoch)) {
-          let byteLength: number;
+  const admission =
+    options.memory?.admission ?? createRequestAdmission(maxConcurrency);
+  const owner = admission.createOwner<Output>({
+    group: options.memory,
+    priority: options.priority,
+    availability: options.memory?.availability,
+    canRetry: options.memory?.canRetry,
+    concurrency: maxConcurrency,
+    retryLimit: maxAttempts,
+    retryBackoffMs,
+    clock: options.clock,
+    shouldRetry: (error) =>
+      !(
+        error instanceof ContentQueueFetchError &&
+        error.status !== undefined &&
+        error.status >= 400 &&
+        error.status < 500 &&
+        ![408, 429].includes(error.status)
+      ) &&
+      !(
+        error instanceof ContentQueueDecodeError &&
+        error.cause instanceof TileDecodeError &&
+        error.cause.stage === "profile"
+      ),
+    onRetryError: (id, cause) =>
+      new ContentQueueRetryError(
+        selected.get(id)!.request,
+        "retry policy or timer scheduling failed",
+        { cause },
+      ),
+    operation(id): RequestStage<Output> {
+      const { request } = selected.get(id)!;
+      const operationRevision = revision;
+      const operationGeneration = configGeneration;
+      return {
+        lane: "network",
+        async start(signal) {
+          const work = options.memory?.work(signal);
+          let handedOff = false;
           try {
-            byteLength = options.decodedByteLength(content, request);
-            finiteAtLeast(`decoded bytes for ${request.id}`, byteLength, 0);
-          } catch (error) {
-            throw new ContentQueueDecodeError(request, { cause: error });
+            let response: ContentQueueFetchResponse;
+            try {
+              response = await fetcher(request.url, { signal });
+            } catch (cause) {
+              throw new ContentQueueFetchError(
+                request,
+                "network request failed",
+                undefined,
+                { cause },
+              );
+            }
+            if (!response.ok) {
+              if (response.body) await response.body.cancel().catch(() => {});
+              throw new ContentQueueFetchError(
+                request,
+                `HTTP ${response.status} ${response.statusText}`.trim(),
+                response.status,
+              );
+            }
+            let bytes: ArrayBuffer;
+            try {
+              bytes = work
+                ? await readMemoryResponse(response, work, signal)
+                : await response.arrayBuffer();
+              signal.throwIfAborted();
+              work?.resize(bytes.byteLength);
+            } catch (cause) {
+              throw new ContentQueueFetchError(
+                request,
+                "response body read failed",
+                response.status,
+                { cause },
+              );
+            }
+            handedOff = true;
+            return {
+              next: {
+                lane: "compute",
+                ready: options.decodeReady,
+                release: () => work?.release(),
+                async start(signal) {
+                  try {
+                    const content = await options.decode(bytes, request, {
+                      signal,
+                      revision: operationRevision,
+                      configGeneration: operationGeneration,
+                      work,
+                    });
+                    const byteLength = options.decodedByteLength(
+                      content,
+                      request,
+                    );
+                    finiteAtLeast(
+                      `decoded bytes for ${request.id}`,
+                      byteLength,
+                      0,
+                    );
+                    const buffers = options.decodedBuffers?.(content) ?? [];
+                    return {
+                      value: {
+                        content,
+                        bytes: byteLength,
+                        memory: work?.commit(
+                          buffers,
+                          options.decodedBuffers ? 0 : byteLength,
+                        ),
+                      },
+                    };
+                  } catch (cause) {
+                    throw new ContentQueueDecodeError(request, { cause });
+                  }
+                },
+              },
+            };
+          } finally {
+            if (!handedOff) work?.release();
           }
-          const buffers = options.decodedBuffers?.(content) ?? [];
-          outputMemory = work?.commit(
-            buffers,
-            options.decodedBuffers ? 0 : byteLength,
-          );
-          putCache(request, content, byteLength, outputMemory);
-          entry.status = "ready";
-          safeCall(() => options.onContent?.(request, content));
-          if (cache.get(request.id)?.memory === outputMemory)
-            outputMemory = undefined;
-        }
-      } catch (error) {
-        failure =
+        },
+      };
+    },
+    onLoaded(id, output, attempt) {
+      const entry = selected.get(id)!;
+      try {
+        putCache(entry.request, output.content, output.bytes, output.memory);
+        entry.readyAttempt = attempt;
+        safeCall(() => options.onContent?.(entry.request, output.content));
+      } finally {
+        if (cache.get(id)?.memory !== output.memory) output.memory?.release();
+      }
+    },
+    onDiscarded: (output) => output.memory?.release(),
+    onFailed(id, error) {
+      const item = selected.get(id)!.request;
+      const refusal = resourcePolicyError(error);
+      if (refusal) options.onPolicyRefusal?.(item, refusal);
+      else
+        options.onError?.(
+          item,
           error instanceof Error
             ? error
             : new ContentQueueError(
                 "ContentQueueError",
-                request,
+                item,
                 "operation failed with a non-Error value",
-              );
-      } finally {
-        outputMemory?.release();
-        work?.release();
-        if (active.get(request.id) === operation) active.delete(request.id);
-      }
+              ),
+        );
+    },
+    onChange: emit,
+  });
 
-      if (!isCurrent(request.id, entry, operationEpoch)) {
-        pump();
-        emit();
-        return;
-      }
-      if (failure) {
-        const refusal = resourcePolicyError(failure);
-        if (refusal) {
-          entry.status = "blocked";
-          entry.refusal = refusal;
-          safeCall(() => options.onPolicyRefusal?.(request, refusal));
-        } else if (entry.attempt < maxAttempts) {
-          const retry: RetryEntry = {
-            handleAssigned: false,
-          };
-          try {
-            const delay = retryBackoffMs(entry.attempt);
-            finiteAtLeast("retry backoff", delay, 0);
-            entry.status = "retrying";
-            retries.set(request.id, retry);
-            const handle = clock.setTimeout(() => {
-              if (
-                retries.get(request.id) !== retry ||
-                !isCurrent(request.id, entry, operationEpoch)
-              ) {
-                return;
-              }
-              retries.delete(request.id);
-              entry.status = "queued";
-              pump();
-              emit();
-            }, delay);
-            if (retries.get(request.id) === retry) {
-              retry.handle = handle;
-              retry.handleAssigned = true;
-            }
-          } catch (error) {
-            if (retries.get(request.id) === retry) {
-              retries.delete(request.id);
-            }
-            entry.status = "failed";
-            const retryError = new ContentQueueRetryError(
-              request,
-              "retry policy or timer scheduling failed",
-              { cause: error },
-            );
-            safeCall(() => options.onError?.(request, retryError));
-          }
-        } else {
-          entry.status = "failed";
-          safeCall(() => options.onError?.(request, failure!));
-        }
-      }
-      pump();
-      emit();
-    })();
-  };
-
-  pump = (): void => {
-    if (disposed) return;
-    for (const entry of selected.values()) {
-      if (active.size >= maxConcurrency) break;
-      if (entry.status === "queued" && !active.has(entry.request.id)) {
-        start(entry);
-      }
-    }
-  };
+  const requestMissing = (): void =>
+    owner.want(
+      [...selected.values()]
+        .filter((entry) => entry.readyAttempt === undefined)
+        .map(({ request }) => request.id),
+    );
 
   return {
     trimCache(bytes) {
@@ -564,16 +527,7 @@ export const createContentQueue = <T>(
     },
     retryBlocked(availabilityOnly = false) {
       if (disposed) return;
-      for (const entry of selected.values())
-        if (
-          entry.status === "blocked" &&
-          (!availabilityOnly || entry.refusal?.retryable)
-        ) {
-          entry.status = "queued";
-          entry.refusal = undefined;
-          entry.attempt = 0;
-        }
-      pump();
+      owner.retryBlocked(availabilityOnly);
       emit();
     },
     setSelection(requests, selectionOptions) {
@@ -596,15 +550,8 @@ export const createContentQueue = <T>(
           throw new Error(`conflicting content request URL for ${id}`);
         }
       }
-      for (const [id] of selected) {
-        const next = normalized.get(id);
-        if (!next) {
-          cancelActive(id);
-          cancelRetry(id);
-        }
-      }
-
       const nextSelection = new Map<string, SelectedEntry>();
+      const hits: CacheEntry<T>[] = [];
       for (const item of normalized.values()) {
         const retained = selected.get(item.id);
         // Delivery is distinct from cache residency. A consumer that needs
@@ -613,7 +560,7 @@ export const createContentQueue = <T>(
         if (
           retained &&
           !(
-            retained.status === "ready" &&
+            retained.readyAttempt !== undefined &&
             !cache.has(item.id) &&
             selectionOptions?.requeueUncached?.has(item.id)
           )
@@ -628,22 +575,24 @@ export const createContentQueue = <T>(
         }
         const entry: SelectedEntry = {
           request: item,
-          status: cached ? "ready" : "queued",
-          attempt: 0,
+          readyAttempt: cached ? 0 : undefined,
         };
         nextSelection.set(item.id, entry);
         if (cached) {
           cacheHits += 1;
           cache.delete(item.id);
           cache.set(item.id, cached);
-          safeCall(() => options.onContent?.(item, cached.content));
+          hits.push(cached);
         } else {
           cacheMisses += 1;
           if (previouslyEvicted.delete(item.id)) cacheRevisits += 1;
         }
       }
       selected = nextSelection;
-      pump();
+      requestMissing();
+      for (const hit of hits)
+        if (selected.has(hit.request.id) && cache.get(hit.request.id) === hit)
+          safeCall(() => options.onContent?.(hit.request, hit.content));
       emit();
     },
 
@@ -676,22 +625,21 @@ export const createContentQueue = <T>(
         );
       }
 
-      if (nextRevision !== revision || nextGeneration !== configGeneration) {
-        epoch += 1;
-        for (const id of active.keys()) cancelActive(id);
-        for (const id of retries.keys()) cancelRetry(id);
+      const changedGeneration =
+        nextRevision !== revision || nextGeneration !== configGeneration;
+      if (changedGeneration) {
+        owner.reset();
         clearCache();
         previouslyEvicted.clear();
         revision = nextRevision;
         configGeneration = nextGeneration;
-        for (const entry of selected.values()) {
-          entry.status = "queued";
-          entry.attempt = 0;
-        }
+        for (const entry of selected.values()) entry.readyAttempt = undefined;
       } else {
         enforceCacheBudget();
       }
-      pump();
+      if (!options.memory) admission.configure(maxConcurrency);
+      owner.setConcurrency(maxConcurrency);
+      if (changedGeneration) requestMissing();
       emit();
     },
 
@@ -711,9 +659,7 @@ export const createContentQueue = <T>(
     dispose() {
       if (disposed) return;
       disposed = true;
-      epoch += 1;
-      for (const id of active.keys()) cancelActive(id);
-      for (const id of retries.keys()) cancelRetry(id);
+      owner.dispose();
       selected.clear();
       clearCache();
       previouslyEvicted.clear();

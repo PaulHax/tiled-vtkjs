@@ -1022,9 +1022,7 @@ describe("createLodController", () => {
     expect(batches).toHaveLength(1);
     expect(batches[0]!.added).toHaveLength(3);
     expect(scheduleRender).toHaveBeenCalledTimes(1);
-    // One coalesced notification for all completed reads, then one for the
-    // applied renderer batch. Neither turns into a per-tile render request.
-    expect(onWorkChange).toHaveBeenCalledTimes(2);
+    expect(onWorkChange).toHaveBeenCalledOnce();
     controller.dispose();
   });
 
@@ -1388,7 +1386,10 @@ describe("createLodController — terminal spacing and presentation", () => {
 });
 
 describe("createLodController — failing sources", () => {
+  afterEach(() => vi.useRealTimers());
   it("stops re-requesting a tile whose fetch keeps failing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     const errors: unknown[] = [];
     const { controller, loadCalls, deferred } = makeController(SMALL_TREE, {
       onError: (error) => errors.push(error),
@@ -1404,11 +1405,9 @@ describe("createLodController — failing sources", () => {
     };
     await failEveryFetch();
 
-    // Retries are bounded: after the allowance runs out the keys are dropped,
-    // so any number of further selections issues nothing.
     for (let round = 0; round < 10; round += 1) {
       controller.refresh();
-      await settle();
+      await vi.advanceTimersByTimeAsync(1_000);
       await failEveryFetch();
     }
     expect(loadCalls).toHaveLength(9); // 3 tiles x 3 attempts
@@ -1427,20 +1426,14 @@ describe("createLodController — failing sources", () => {
     await settle();
 
     // A brief outage burns the whole allowance for every tile.
-    for (let round = 0; round < 4; round += 1) {
+    for (let round = 0; round < 3; round += 1) {
       for (const d of deferred.values()) d.reject(new Error("500"));
       await settle();
-      controller.refresh();
-      await settle();
+      await vi.advanceTimersByTimeAsync(1_000);
     }
     expect(loadCalls).toHaveLength(9);
 
-    // The server recovers. Resting is a backoff, not an eviction: once the
-    // keys have been quiet long enough they are fetchable again, and this
-    // time they load.
-    vi.setSystemTime(31_000);
-    controller.refresh();
-    await settle();
+    await vi.advanceTimersByTimeAsync(29_000);
     expect(loadCalls).toHaveLength(12);
 
     for (const d of deferred.values()) d.resolve();
@@ -1452,6 +1445,8 @@ describe("createLodController — failing sources", () => {
   });
 
   it("stops re-requesting a hierarchy page that keeps failing", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     const errors: unknown[] = [];
     const bounds = {
       min: [-0.5, -0.5, -0.5] as [number, number, number],
@@ -1496,7 +1491,7 @@ describe("createLodController — failing sources", () => {
 
     for (let round = 0; round < 10; round += 1) {
       controller.refresh();
-      await settle();
+      await vi.advanceTimersByTimeAsync(1_000);
     }
     expect(pageCalls).toBe(4); // the root page, then 3 attempts at the child
     expect(errors).toHaveLength(3);
@@ -1531,20 +1526,12 @@ describe("createLodController — failing sources", () => {
     controller.setCamera(VIEW);
     await settle();
 
-    // The bootstrap request burns its allowance while the server is down.
-    for (let round = 0; round < 6; round += 1) {
-      controller.refresh();
-      await settle();
-    }
+    await vi.advanceTimersByTimeAsync(2_000);
     expect(pageCalls).toBe(3);
     expect(controller.stats().residentTiles).toBe(0);
 
-    // Nothing else can ask for the root page, so selection has to. Once the
-    // backoff lapses and the server is back, the controller bootstraps.
     offline = false;
-    vi.setSystemTime(31_000);
-    controller.refresh();
-    await settle();
+    await vi.advanceTimersByTimeAsync(30_000);
     for (const d of fake.deferred.values()) d.resolve();
     await settle();
     expect(controller.stats().residentTiles).toBe(3);
@@ -1914,6 +1901,8 @@ describe("createLodController — failing sources", () => {
   });
 
   it("a new source clears the failure memory", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
     const errors: unknown[] = [];
     const { controller, loadCalls, deferred } = makeController(SMALL_TREE, {
       onError: (error) => errors.push(error),
@@ -1921,11 +1910,10 @@ describe("createLodController — failing sources", () => {
     await settle();
     controller.setCamera(VIEW);
     await settle();
-    for (let round = 0; round < 4; round += 1) {
+    for (let round = 0; round < 3; round += 1) {
       for (const d of deferred.values()) d.reject(new Error("500"));
       await settle();
-      controller.refresh();
-      await settle();
+      await vi.advanceTimersByTimeAsync(1_000);
     }
     expect(loadCalls).toHaveLength(9);
 

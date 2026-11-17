@@ -32,6 +32,7 @@ const errorMessage = (
           requestedBytes: error.requestedBytes,
           limitBytes: error.limitBytes,
           retryable: error.retryable,
+          operationBytes: error.operationBytes,
         }
       : error instanceof TileDecodeError
         ? {
@@ -77,6 +78,7 @@ export const installDecodeWorker = (scope: ClassicWorkerScope): void => {
             response.error.requestedBytes,
             response.error.limitBytes,
             response.error.retryable,
+            response.error.operationBytes,
           ),
         );
       else pending?.resolve();

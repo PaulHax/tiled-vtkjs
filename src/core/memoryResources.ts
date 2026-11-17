@@ -1,5 +1,6 @@
 import { finiteAtLeast, integerAtLeast } from "./numeric";
 import { safeCall } from "./observers";
+import type { RequestAdmission } from "./requestAdmission";
 
 export type MemoryDomain = "cpu" | "renderer" | "work";
 
@@ -9,12 +10,14 @@ export class ResourcePolicyError extends Error {
   readonly requestedBytes: number;
   readonly limitBytes: number;
   readonly retryable: boolean;
+  readonly operationBytes?: number;
 
   constructor(
     domain: MemoryDomain,
     requestedBytes: number,
     limitBytes: number,
     retryable = false,
+    operationBytes?: number,
   ) {
     super(
       `${domain} memory requires ${requestedBytes} bytes; configured limit is ${limitBytes} bytes`,
@@ -24,6 +27,7 @@ export class ResourcePolicyError extends Error {
     this.requestedBytes = requestedBytes;
     this.limitBytes = limitBytes;
     this.retryable = retryable;
+    this.operationBytes = operationBytes;
   }
 }
 
@@ -80,7 +84,12 @@ export type MemoryOwner = {
     }[],
     replacing?: readonly MemoryLease[],
   ): MemoryLease[];
-  work(signal?: AbortSignal, estimatedBytes?: number): Promise<MemoryWork>;
+  readonly admission: RequestAdmission;
+  availability(): number;
+  canRetry(error: ResourcePolicyError): boolean;
+  canReserveWork(bytes: number): boolean;
+  /** Reserve immediately or throw a policy refusal. The request service handles deferral. */
+  work(signal?: AbortSignal, estimatedBytes?: number): MemoryWork;
   /** Stop accepting work. Existing leases and physical work keep their charges. */
   close(): void;
 };
@@ -98,6 +107,7 @@ export type MemoryResourceStats = MemoryResourceOptions & {
   readonly cpuReservedBytes: number;
   readonly rendererBytes: number;
   readonly workReservedBytes: number;
+  /** Physical work reservations, including fetched bytes waiting to decode. */
   readonly activeOperations: number;
   readonly queuedOperations: number;
   readonly owners: number;
@@ -127,15 +137,6 @@ type WorkEntry = {
   bytes: number;
   released: boolean;
 };
-type WaitingWork = {
-  readonly owner: OwnerEntry;
-  readonly signal?: AbortSignal;
-  readonly bytes: number;
-  readonly resolve: (work: MemoryWork) => void;
-  readonly reject: (error: unknown) => void;
-  readonly abort: () => void;
-};
-
 const abortError = (): DOMException =>
   new DOMException("Memory operation cancelled", "AbortError");
 const bytesValue = (name: string, value: number): number =>
@@ -145,6 +146,7 @@ const bytesValue = (name: string, value: number): number =>
 export const createMemoryResources = (
   initial: MemoryResourceOptions,
   changed: () => void,
+  admission: RequestAdmission,
 ) => {
   let limits = initial;
   let revision = 0;
@@ -155,12 +157,10 @@ export const createMemoryResources = (
   let workReserved = 0;
   let operations = 0;
   let reclaiming = false;
-  let pumping = false;
   const owners = new Set<OwnerEntry>();
   const buffers = new Map<ArrayBuffer, { references: number; bytes: number }>();
   const leases = new WeakMap<MemoryLease, LeaseEntry>();
   const claimedReplacements = new Map<LeaseEntry, number>();
-  const waiting: WaitingWork[] = [];
 
   const retireOwner = (owner: OwnerEntry): void => {
     if (owner.closed && owner.leases.size === 0 && owner.operations.size === 0)
@@ -199,7 +199,6 @@ export const createMemoryResources = (
     entry.buffers = next;
   };
 
-  let pump: () => void;
   const makeLease = (
     owner: OwnerEntry,
     cpuBytes: number,
@@ -232,9 +231,11 @@ export const createMemoryResources = (
         setCpu(values, reservedBytes = 0) {
           if (released || entry.released) return;
           const reserved = bytesValue("reserved CPU bytes", reservedBytes);
+          const before = cpuRetained + cpuReserved;
           replaceBuffers(entry, new Set(values));
           cpuReserved += reserved - entry.cpuReserved;
           entry.cpuReserved = reserved;
+          if (cpuRetained + cpuReserved < before) availabilityRevision += 1;
           changed();
         },
         shrinkRenderer(bytes) {
@@ -265,7 +266,6 @@ export const createMemoryResources = (
           retireOwner(owner);
           availabilityRevision += 1;
           changed();
-          pump();
         },
       };
       leases.set(api, entry);
@@ -285,6 +285,7 @@ export const createMemoryResources = (
         cpuRetained + cpuReserved + added,
         limits.cpuBytes,
         added <= limits.cpuBytes,
+        added,
       );
     }
   };
@@ -312,16 +313,16 @@ export const createMemoryResources = (
     owner.operations.add(entry);
     operations += 1;
     workReserved += bytes;
+    changed();
     const release = (): void => {
       if (entry.released) return;
       entry.released = true;
       operations -= 1;
       workReserved -= entry.bytes;
       owner.operations.delete(entry);
-      availabilityRevision += 1;
+      if (entry.bytes > 0) availabilityRevision += 1;
       retireOwner(owner);
       changed();
-      pump();
     };
     return {
       resize(value) {
@@ -334,7 +335,9 @@ export const createMemoryResources = (
             requested,
             limits.workBytes,
             next <= limits.workBytes,
+            next,
           );
+        if (next < entry.bytes) availabilityRevision += 1;
         workReserved = requested;
         entry.bytes = next;
         changed();
@@ -417,40 +420,6 @@ export const createMemoryResources = (
     return result;
   };
 
-  pump = (): void => {
-    if (pumping || reclaiming) return;
-    pumping = true;
-    try {
-      while (
-        waiting.length > 0 &&
-        operations < limits.maxConcurrentOperations
-      ) {
-        const next = waiting[0]!;
-        if (next.owner.closed || next.signal?.aborted) {
-          waiting.shift();
-          next.signal?.removeEventListener("abort", next.abort);
-          next.reject(abortError());
-          continue;
-        }
-        if (next.bytes > limits.workBytes) {
-          waiting.shift();
-          next.signal?.removeEventListener("abort", next.abort);
-          next.reject(
-            new ResourcePolicyError("work", next.bytes, limits.workBytes),
-          );
-          continue;
-        }
-        if (workReserved + next.bytes > limits.workBytes) break;
-        waiting.shift();
-        next.signal?.removeEventListener("abort", next.abort);
-        next.resolve(startWork(next.owner, next.bytes));
-      }
-    } finally {
-      pumping = false;
-    }
-    changed();
-  };
-
   return {
     createOwner(
       options: { readonly reclaim?: (domain: MemoryDomain) => void } = {},
@@ -489,37 +458,37 @@ export const createMemoryResources = (
           assertOpen();
           return reserveRendererGroup(owner, amounts, replacing);
         },
+        admission,
+        availability: () => availabilityRevision,
+        canRetry(error) {
+          if (error.operationBytes === undefined) return true;
+          if (error.domain === "work")
+            return workReserved + error.operationBytes <= limits.workBytes;
+          if (error.domain === "cpu")
+            return (
+              cpuRetained + cpuReserved + error.operationBytes <=
+              limits.cpuBytes
+            );
+          return true;
+        },
+        canReserveWork: (bytes) => workReserved + bytes <= limits.workBytes,
         work(signal, estimate = 0) {
           assertOpen();
-          if (signal?.aborted) return Promise.reject(abortError());
+          signal?.throwIfAborted();
           const bytes = bytesValue("estimated work bytes", estimate);
-          return new Promise((resolve, reject) => {
-            const item: WaitingWork = {
-              owner,
-              signal,
+          if (workReserved + bytes > limits.workBytes)
+            throw new ResourcePolicyError(
+              "work",
+              workReserved + bytes,
+              limits.workBytes,
+              bytes <= limits.workBytes,
               bytes,
-              resolve,
-              reject,
-              abort: () => {
-                const index = waiting.indexOf(item);
-                if (index < 0) return;
-                waiting.splice(index, 1);
-                reject(abortError());
-                pump();
-              },
-            };
-            waiting.push(item);
-            signal?.addEventListener("abort", item.abort, { once: true });
-            pump();
-          });
+            );
+          return startWork(owner, bytes);
         },
         close() {
           if (owner.closed) return;
           owner.closed = true;
-          // Removing one queued operation mutates the waiting list.
-          // oxlint-disable-next-line unicorn/no-useless-spread
-          for (const item of [...waiting])
-            if (item.owner === owner) item.abort();
           retireOwner(owner);
           changed();
         },
@@ -535,8 +504,10 @@ export const createMemoryResources = (
       availabilityRevision += 1;
       reclaim("renderer");
       reclaim("cpu");
-      pump();
+      changed();
     },
+    availability: () => availabilityRevision,
+    policyRevision: () => revision,
     stats(): MemoryResourceStats {
       return {
         ...limits,
@@ -545,7 +516,7 @@ export const createMemoryResources = (
         rendererBytes: renderer,
         workReservedBytes: workReserved,
         activeOperations: operations,
-        queuedOperations: waiting.length,
+        queuedOperations: admission.queuedOperations(),
         owners: owners.size,
         revision,
         availabilityRevision,

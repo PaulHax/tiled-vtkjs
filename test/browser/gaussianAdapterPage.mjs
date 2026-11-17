@@ -95,6 +95,7 @@ const distanceSorter = createGaussianDistanceSorter();
 let hold = false;
 const pending = [];
 const blockedWork = [];
+let releaseSortLane;
 const blockingOwner = memoryPool.createOwner();
 const factory = createGaussianContentAdapterFactory({
   resourceBudgetBytes: mode === "budget" ? 1600 : 131072,
@@ -863,22 +864,38 @@ globalThis.gaussianFixture = {
   },
   errors: () => errors,
   pending: () => pending.length,
-  async blockWork(kind = "slots") {
+  blockWork(kind = "slots") {
     if (kind !== "slots") {
       memoryPool.configure({ workBytes: 2112 });
       blockedWork.push(
-        await blockingOwner.work(undefined, kind === "bytes" ? 1584 : 1056),
+        blockingOwner.work(undefined, kind === "bytes" ? 1584 : 1056),
       );
-      if (kind === "growth") blockedWork.push(await blockingOwner.work());
-    } else {
-      blockedWork.push(await blockingOwner.work(), await blockingOwner.work());
+    }
+    if (kind !== "bytes") {
+      void memoryPool.admission.run({
+        signal: new AbortController().signal,
+        stage: {
+          lane: "sort",
+          start: (signal) => {
+            const work = blockingOwner.work(signal);
+            return new Promise((resolve) => {
+              releaseSortLane = () => {
+                work.release();
+                resolve({ value: undefined });
+              };
+            });
+          },
+        },
+      });
     }
   },
   releaseWork() {
     for (const work of blockedWork.splice(0)) work.release();
+    globalThis.gaussianFixture.releaseWorkSlot();
   },
   releaseWorkSlot() {
-    blockedWork.pop().release();
+    releaseSortLane?.();
+    releaseSortLane = undefined;
   },
   releaseNext() {
     const entry = pending.shift();
@@ -929,7 +946,7 @@ globalThis.gaussianFixture = {
     paintChannel.port1.close();
     paintChannel.port2.close();
     for (const memory of memoryOwners) memory.close();
-    for (const work of blockedWork.splice(0)) work.release();
+    globalThis.gaussianFixture.releaseWork();
     blockingOwner.close();
     generic.delete();
   },
