@@ -865,6 +865,43 @@ describe("createStreamedSceneCoordinator", () => {
     coordinator.dispose();
   });
 
+  it("shares submission allowance on one page frame and rotates the first paint grant", () => {
+    const memory = createMemoryPool({ totalBytes: 1_000 });
+    const first = makeCoordinator({ memory });
+    const second = makeCoordinator({ memory });
+    const contextA = first.context({});
+    const contextB = second.context({});
+    const frameBytes = contextA.submissions.stats().maxBytesPerFrame;
+    const log: string[] = [];
+    let boundContext = "";
+    const enqueue = (context: typeof contextA, view: string) =>
+      context.submissions.enqueue({
+        bytes: frameBytes,
+        run: () => log.push(`${view}:${boundContext}`),
+      });
+    enqueue(contextA, "A");
+    enqueue(contextA, "A");
+    enqueue(contextB, "B");
+
+    boundContext = "A";
+    first.prepareFrame(10, 100);
+    boundContext = "B";
+    second.prepareFrame(1, 100);
+    expect(log).toEqual(["A:A"]);
+    boundContext = "A";
+    first.prepareFrame(11, 116);
+    expect(log).toEqual(["A:A"]);
+    boundContext = "B";
+    second.prepareFrame(2, 116);
+    expect(log).toEqual(["A:A", "B:B"]);
+    boundContext = "A";
+    first.prepareFrame(12, 132);
+    expect(log).toEqual(["A:A", "B:B", "A:A"]);
+
+    first.dispose();
+    second.dispose();
+  });
+
   it("shares one page pool across independent view coordinators", () => {
     const memory = createMemoryPool({ totalBytes: 1_000 });
     const first = makeCoordinator({ memory });

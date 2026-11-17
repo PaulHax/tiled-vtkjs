@@ -4,6 +4,7 @@ import type { MemoryPool, MemoryPoolMember } from "./memoryPool";
 import { finiteNonNegative } from "./numeric";
 import { allocateViewQuality } from "./viewBudget";
 import {
+  createSubmissionFrameBudget,
   createSubmissionScheduler,
   type SubmissionScheduler,
 } from "./submissionScheduler";
@@ -104,7 +105,7 @@ export type StreamedSceneCoordinator = {
    * admission drain, one read of every member's inputs, and the frame's
    * allocations. This is the only place members receive allocations.
    */
-  prepareFrame(frameSerial: number): void;
+  prepareFrame(frameSerial: number, pageFrame?: number): void;
   /**
    * Report one presented frame. The verdict says whether the governor took it
    * as a capacity sample, whether that sample may train quality, and the
@@ -258,6 +259,11 @@ const allocate = (
   );
 };
 
+const preparationBudgets = new WeakMap<
+  MemoryPool,
+  ReturnType<typeof createSubmissionFrameBudget>
+>();
+
 export const createStreamedSceneCoordinator = (
   options: StreamedSceneCoordinatorOptions,
 ): StreamedSceneCoordinator => {
@@ -267,8 +273,14 @@ export const createStreamedSceneCoordinator = (
     );
   }
   const memory = options.memory;
+  let budget = preparationBudgets.get(memory);
+  if (!budget) {
+    budget = createSubmissionFrameBudget();
+    preparationBudgets.set(memory, budget);
+  }
   const submissions = createSubmissionScheduler({
     scheduleRender: options.scheduleRender,
+    budget,
   });
   const members = new Set<MemberState>();
   let disposed = false;
@@ -468,7 +480,7 @@ export const createStreamedSceneCoordinator = (
    * the page inside microtasks. Such a report still marks the inputs stale,
    * and the next frame reads them.
    */
-  let preparedAvailability = memory.stats().availabilityRevision;
+  let preparedAvailability = memory.availability();
   const checkInputs = (): void => {
     try {
       if (disposed || !inputsStale) return;
@@ -476,7 +488,7 @@ export const createStreamedSceneCoordinator = (
       if (
         owesMeasurement(drained) ||
         allocationOutdated() ||
-        preparedAvailability !== memory.stats().availabilityRevision
+        preparedAvailability !== memory.availability()
       ) {
         options.scheduleRender();
       }
@@ -657,7 +669,7 @@ export const createStreamedSceneCoordinator = (
       markStale();
     },
 
-    prepareFrame(frameSerial) {
+    prepareFrame(frameSerial, pageFrame) {
       if (disposed) return;
       if (!Number.isSafeInteger(frameSerial) || frameSerial < 0) {
         throw new TypeError("frameSerial must be a non-negative safe integer");
@@ -667,8 +679,14 @@ export const createStreamedSceneCoordinator = (
       for (const state of members) {
         if (state.active) state.member.prepareFrame();
       }
-      preparedAvailability = memory.stats().availabilityRevision;
-      submissions.prepareFrame();
+      preparedAvailability = memory.availability();
+      // The document timeline is shared by independently scheduled paint
+      // callbacks and external-context renders in the same browser frame.
+      const timeline = globalThis.document?.timeline?.currentTime;
+      submissions.prepareFrame(
+        pageFrame ?? (typeof timeline === "number" ? timeline : frameSerial),
+      );
+
       capacityWorkSinceLastReport ||=
         submissions.stats().lastFrameAdmittedJobs > 0;
       const owed = owesMeasurement(observe());
@@ -707,7 +725,7 @@ export const createStreamedSceneCoordinator = (
     needsFrame: () =>
       !disposed &&
       (submissions.hasPending() ||
-        preparedAvailability !== memory.stats().availabilityRevision ||
+        preparedAvailability !== memory.availability() ||
         (hasAdaptiveMember() && governor.needsFrame()) ||
         allocationOutdated()),
 

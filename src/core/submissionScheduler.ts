@@ -29,6 +29,7 @@ export type SubmissionSchedulerOptions = {
   readonly maxTimeMsPerFrame?: number;
   /** Injectable monotonic clock for deterministic tests. */
   readonly now?: () => number;
+  readonly budget?: SubmissionFrameBudget;
 };
 
 export type SubmissionSchedulerStats = {
@@ -46,7 +47,7 @@ export type SubmissionSchedulerStats = {
 export type SubmissionScheduler = {
   enqueue(job: SubmissionJob): Submission;
   /** Drain one bounded admission slice immediately before a view paint. */
-  prepareFrame(): void;
+  prepareFrame(pageFrame?: number): void;
   hasPending(): boolean;
   stats(): SubmissionSchedulerStats;
   dispose(): void;
@@ -59,20 +60,87 @@ type QueuedJob = {
   settled: boolean;
 };
 
+type SubmissionFrameBudget = ReturnType<typeof createSubmissionFrameBudget>;
+
+export const createSubmissionFrameBudget = (
+  maxBytes = DEFAULT_SUBMISSION_BYTES_PER_FRAME,
+  maxTimeMs = DEFAULT_SUBMISSION_TIME_MS_PER_FRAME,
+) => {
+  const deferred = new Set<object>();
+  const lastGrant = new WeakMap<object, number>();
+  let grants = 0;
+  let priority: object | undefined;
+  let frame: number | undefined;
+  let bytes = 0;
+  let elapsed = 0;
+  let jobs = 0;
+
+  return {
+    maxBytes,
+    maxTimeMs,
+    begin(pageFrame: number) {
+      if (frame === pageFrame) return;
+      frame = pageFrame;
+      bytes = elapsed = jobs = 0;
+      // A view that ran out of allowance is first in line the next time it
+      // paints. A view that stops painting can hold one frame at most.
+      priority = undefined;
+      for (const view of deferred) {
+        if (
+          !priority ||
+          (lastGrant.get(view) ?? 0) < (lastGrant.get(priority) ?? 0)
+        )
+          priority = view;
+      }
+      deferred.clear();
+    },
+    admit(view: object, size: number) {
+      if (
+        (priority && priority !== view) ||
+        (jobs > 0 && (bytes + size > maxBytes || elapsed >= maxTimeMs))
+      ) {
+        deferred.add(view);
+        return false;
+      }
+      if (priority === view) priority = undefined;
+      lastGrant.set(view, ++grants);
+      deferred.delete(view);
+      bytes += size;
+      jobs += 1;
+      return true;
+    },
+    spend(ms: number) {
+      elapsed += ms;
+    },
+    withdraw(view: object) {
+      deferred.delete(view);
+      if (priority === view) priority = undefined;
+    },
+  };
+};
+
 export const createSubmissionScheduler = (
   options: SubmissionSchedulerOptions,
 ): SubmissionScheduler => {
   const maxBytes = wholeAtLeast(
     "maxBytesPerFrame",
-    options.maxBytesPerFrame ?? DEFAULT_SUBMISSION_BYTES_PER_FRAME,
+    options.budget?.maxBytes ??
+      options.maxBytesPerFrame ??
+      DEFAULT_SUBMISSION_BYTES_PER_FRAME,
     1,
   );
   const maxTimeMs = finiteAtLeast(
     "maxTimeMsPerFrame",
-    options.maxTimeMsPerFrame ?? DEFAULT_SUBMISSION_TIME_MS_PER_FRAME,
+    options.budget?.maxTimeMs ??
+      options.maxTimeMsPerFrame ??
+      DEFAULT_SUBMISSION_TIME_MS_PER_FRAME,
     0,
   );
   const now = options.now ?? (() => performance.now());
+  const budget =
+    options.budget ?? createSubmissionFrameBudget(maxBytes, maxTimeMs);
+  const view = {};
+  let ownFrame = 0;
   const queue: QueuedJob[] = [];
   let queuedBytes = 0;
   let lastFrameAdmittedJobs = 0;
@@ -115,49 +183,49 @@ export const createSubmissionScheduler = (
           queued.job = null;
           queuedBytes -= queued.bytes;
           discardCancelledHead();
+          if (!queue.length) budget.withdraw(view);
           return true;
         },
       };
     },
 
-    prepareFrame() {
+    prepareFrame(pageFrame = ++ownFrame) {
       lastFrameAdmittedJobs = 0;
       lastFrameAdmittedBytes = 0;
       lastFrameElapsedMs = 0;
       if (disposed) return;
-      const started = now();
+      budget.begin(pageFrame);
+      let elapsed = 0;
       let frameBytes = 0;
       let frameJobs = 0;
       discardCancelledHead();
       while (queue.length > 0) {
         const next = queue[0]!;
-        // An indivisible resource may consume a whole frame on its own.
-        // Never combine an oversized atomic job with another job.
-        if (
-          frameJobs > 0 &&
-          (frameBytes + next.bytes > maxBytes || now() - started >= maxTimeMs)
-        ) {
-          break;
-        }
+        if (!budget.admit(view, next.bytes)) break;
         queue.shift();
         next.settled = true;
         queuedBytes -= next.bytes;
         const job = next.job!;
         next.job = null;
+        const started = now();
         try {
           job.run();
         } catch (error) {
           safeCall(() => job.onError?.(error));
         }
+        const spent = Math.max(0, now() - started);
+        budget.spend(spent);
+        elapsed += spent;
         frameJobs += 1;
         frameBytes += next.bytes;
         discardCancelledHead();
       }
       lastFrameAdmittedJobs = frameJobs;
       lastFrameAdmittedBytes = frameBytes;
-      lastFrameElapsedMs = Math.max(0, now() - started);
+      lastFrameElapsedMs = elapsed;
       peakFrameAdmittedBytes = Math.max(peakFrameAdmittedBytes, frameBytes);
       if (queue.length > 0) options.scheduleRender();
+      else budget.withdraw(view);
     },
 
     hasPending: () => !disposed && queue.some((entry) => entry.job),
@@ -180,6 +248,7 @@ export const createSubmissionScheduler = (
     dispose() {
       if (disposed) return;
       disposed = true;
+      budget.withdraw(view);
       for (const entry of queue) {
         entry.job = null;
         entry.settled = true;
