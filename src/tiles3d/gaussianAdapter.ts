@@ -470,6 +470,10 @@ const createManager = (
     candidate: Storage | null = null;
   let presentationStorage: Storage | null = null;
   let presentationMemory: MemoryLease | undefined;
+  let selectionStorage: Storage | null = null;
+  let selectionMemory: MemoryLease | undefined;
+  let presentationTilesForSort = new Set<Tile>();
+  let presentationAcceptsPlacement = true;
   let displayed = new Set<Tile>();
   let desiredPrimitives: PackedPrimitive[] = [];
   let sortRanges: readonly GaussianSortRange[] | null = null;
@@ -609,6 +613,12 @@ const createManager = (
     arena.capacity * 60 +
     (storage && storage.positions !== arena.positions
       ? (storage.positions.length / 3) * 60
+      : 0) +
+    (selectionStorage &&
+    selectionMemory &&
+    selectionStorage !== storage &&
+    selectionStorage.arena !== arena
+      ? selectionStorage.arena.capacity * 60
       : 0);
   const releaseRetiredSources = (): void => {
     for (const tile of retiredSources) {
@@ -618,7 +628,8 @@ const createManager = (
       if (
         !presented &&
         !storage?.tiles.includes(tile) &&
-        !candidate?.tiles.includes(tile)
+        !candidate?.tiles.includes(tile) &&
+        !selectionStorage?.tiles.includes(tile)
       ) {
         tile.sourceMemory?.release();
         tile.sourceMemory = undefined;
@@ -701,8 +712,6 @@ const createManager = (
         }
     return result;
   };
-  const desiredTiles = (): Set<Tile> =>
-    new Set([...presentationTiles()].filter((tile) => tile.count > 0));
   const notify = (): void => {
     workRevision++;
     for (const owner of owners) owner.options.scheduleRender();
@@ -968,15 +977,21 @@ const createManager = (
         orderUploadBytes += order.byteLength;
         actor.setVisibility(order.length > 0);
         storage = next;
-        if (displayedMemory !== nextMemory) displayedMemory?.release();
+        if (displayedMemory !== nextMemory) {
+          displayedMemory?.release();
+          if (selectionMemory === displayedMemory) {
+            selectionMemory = undefined;
+            selectionStorage = null;
+          }
+        }
         displayedMemory = nextMemory;
         releaseRetiredSources();
-        const presentedTiles = presentationTiles();
+        const presentedTiles = presentationTilesForSort;
         for (const owner of owners) {
           const ids = [...presentedTiles]
             .filter((tile) => tile.owner === owner)
             .map((tile) => tile.id);
-          if (next === candidate) {
+          if (presentationAcceptsPlacement) {
             owner.mesh.setBaseMatrix(owner.base);
             owner.presentedBase = [...owner.base];
           }
@@ -1097,6 +1112,7 @@ const createManager = (
           arenaMemory,
           realizedMemory,
           displayedMemory,
+          selectionMemory,
         ]))
           lease?.release();
         arenaMemory = undefined;
@@ -1107,6 +1123,9 @@ const createManager = (
         candidate = empty;
         presentationStorage = empty;
         presentationMemory = undefined;
+        selectionStorage = null;
+        selectionMemory = undefined;
+        presentationTilesForSort.clear();
         desiredPrimitives = [];
         displayed.clear();
         releaseRetiredSources();
@@ -1271,15 +1290,130 @@ const createManager = (
       )
         previousRealizedMemory?.release();
       completeAdmissions(true);
-      const drawn = desiredTiles();
-      const needsDisplayed = [...drawn].some(
-        (tile) => !candidate!.tiles.includes(tile),
+      const requestedPresentation = presentationTiles();
+      const drawn = new Set(
+        [...requestedPresentation].filter((tile) => tile.count > 0),
       );
-      presentationStorage = needsDisplayed ? storage : candidate;
-      presentationMemory = needsDisplayed ? displayedMemory : realizedMemory;
+      const covers = (value: Storage | null): value is Storage =>
+        value !== null &&
+        [...drawn].every((tile) => value.tiles.includes(tile));
+      presentationTilesForSort = requestedPresentation;
+      presentationAcceptsPlacement = true;
+      if (covers(candidate)) {
+        presentationStorage = candidate;
+        presentationMemory = realizedMemory;
+        if (selectionMemory && selectionMemory !== displayedMemory) {
+          selectionMemory.release();
+          selectionMemory = undefined;
+          selectionStorage = null;
+        }
+      } else if (covers(storage)) {
+        if (selectionMemory && selectionMemory !== displayedMemory) {
+          selectionMemory.release();
+          selectionMemory = undefined;
+          selectionStorage = null;
+        }
+        presentationStorage = storage;
+        presentationMemory = displayedMemory;
+        presentationAcceptsPlacement = false;
+      } else {
+        const selected = [...drawn].sort(
+          (left, right) => left.generation - right.generation,
+        );
+        const selectedSignature = selected
+          .map(
+            (tile) =>
+              `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
+          )
+          .join("|");
+        try {
+          if (
+            !selectionStorage ||
+            selectionStorage.signature !== selectedSignature
+          ) {
+            if (selectionMemory && selectionMemory !== displayedMemory) {
+              selectionMemory.release();
+              selectionMemory = undefined;
+              selectionStorage = null;
+            }
+            const selectedArena = createGaussianStorage();
+            const capacity = selectedArena.requiredCapacity(
+              selected.flatMap((tile) =>
+                tile.gaussian.map((primitive, index) => ({
+                  key: `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`,
+                  count: primitive.positions.length / 3,
+                })),
+              ),
+            );
+            for (const owner of owners) {
+              const bytes =
+                gaussianShare(owner, selected, capacity * 60) +
+                [...requestedPresentation]
+                  .filter((tile) => tile.owner === owner)
+                  .reduce((sum, tile) => sum + tile.meshBytes, 0);
+              if (bytes > owner.ceiling)
+                throw new ResourcePolicyError("renderer", bytes, owner.ceiling);
+            }
+            let lease: MemoryLease;
+            try {
+              lease = memory.reserveRenderer(capacity * 60, {
+                cpuBytes: capacity * 60,
+                replacing: displayedMemory ? [displayedMemory] : [],
+              });
+            } catch (error) {
+              // A composite mesh group can still own the displayed atlas's
+              // replacement credit. Extra presentation storage must then fit
+              // without spending that same credit a second time.
+              if (
+                !(error instanceof Error) ||
+                error.message !==
+                  "replacement must own unclaimed live allocations"
+              )
+                throw error;
+              lease = memory.reserveRenderer(capacity * 60, {
+                cpuBytes: capacity * 60,
+              });
+            }
+            try {
+              const prepared = makeStorage(selected, null, selectedArena);
+              lease.setCpu(
+                [
+                  selectedArena.positions.buffer,
+                  selectedArena.scales.buffer,
+                  selectedArena.rotations.buffer,
+                  selectedArena.colors.buffer,
+                ] as ArrayBuffer[],
+                capacity * 4,
+              );
+              selectionStorage = prepared;
+              selectionMemory = lease;
+            } catch (error) {
+              lease.release();
+              throw error;
+            }
+          }
+          presentationStorage = selectionStorage;
+          presentationMemory = selectionMemory;
+        } catch (error) {
+          if (!(error instanceof ResourcePolicyError)) throw error;
+          report(error);
+          // A failed transition preserves the complete accepted frontier,
+          // including its mesh IDs and placement, until all requested tiles
+          // can be published together.
+          presentationStorage = storage;
+          presentationMemory = displayedMemory;
+          presentationAcceptsPlacement = false;
+          presentationTilesForSort = new Set(
+            [
+              ...displayed,
+              ...[...owners].flatMap((owner) => [...owner.presented]),
+            ].filter((tile) => tile.owner.visible),
+          );
+        }
+      }
       if (!presentationStorage) return;
       desiredPrimitives = presentationStorage.primitives.filter((primitive) =>
-        drawn.has(primitive.tile),
+        presentationTilesForSort.has(primitive.tile),
       );
       const visible = desiredPrimitives.reduce(
         (sum, primitive) => sum + primitive.count,
@@ -1378,7 +1512,12 @@ const createManager = (
     ])
       tile.sourceMemory?.release();
     retiredSources.clear();
-    for (const lease of new Set([arenaMemory, realizedMemory, displayedMemory]))
+    for (const lease of new Set([
+      arenaMemory,
+      realizedMemory,
+      displayedMemory,
+      selectionMemory,
+    ]))
       lease?.release();
     memory.close();
     for (const owner of owners) {
@@ -1401,6 +1540,9 @@ const createManager = (
     candidate = null;
     presentationStorage = null;
     presentationMemory = undefined;
+    selectionStorage = null;
+    selectionMemory = undefined;
+    presentationTilesForSort.clear();
     arena.clear();
     desiredPrimitives = [];
     firstOptions.scheduleRender();
@@ -1444,6 +1586,12 @@ const createManager = (
           arena.bytes +
           (storage && storage.positions !== arena.positions
             ? storage.bytes
+            : 0) +
+          (selectionStorage &&
+          selectionMemory &&
+          selectionStorage !== storage &&
+          selectionStorage.arena !== arena
+            ? selectionStorage.bytes
             : 0) +
           current.reduce((sum, tile) => sum + tile.sourceBytes, 0),
         gpuAttributeBytes: storage?.bytes ?? 0,

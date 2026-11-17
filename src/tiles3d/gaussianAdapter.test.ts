@@ -209,6 +209,25 @@ const fixture = () => {
   };
 };
 
+const preparePartial = async (f: ReturnType<typeof fixture>, mixed = false) => {
+  await f.show("a", 1, mixed);
+  expect(f.adapter.submitTile("b", field(4, mixed))).toBe("queued");
+  await f.settle();
+  f.adapter.setDrawnTiles(["a", "b"]);
+  await f.settle();
+  f.adapter.setResourceCeilingBytes(mixed ? 636 : 480);
+  expect(f.adapter.submitTile("newA", field(4, mixed), undefined, ["a"])).toBe(
+    "queued",
+  );
+  await f.settle();
+  expect(f.adapter.submitTile("newB", field(1, mixed), undefined, ["b"])).toBe(
+    "queued",
+  );
+  await f.settle();
+  expect(f.adapter.tileState("newA")).toBe("submitted");
+  expect(f.adapter.tileState("newB")).toBe("submitted");
+};
+
 describe("Gaussian admission ownership", () => {
   it("coarsens under a smaller grant while retaining both atlases until the sort publishes", async () => {
     const f = fixture();
@@ -390,6 +409,120 @@ describe("Gaussian admission ownership", () => {
     } finally {
       for (const entry of work) entry.release();
       blocker.close();
+      f.dispose();
+    }
+  });
+
+  it.each([false, true])(
+    "publishes a compact partial frontier coherently (mixed=%s)",
+    async (mixed) => {
+      const f = fixture();
+      try {
+        await preparePartial(f, mixed);
+        f.hold();
+        const matrix = [...IDENTITY];
+        matrix[12] = 0.6;
+        f.adapter.setBaseMatrix(matrix);
+        f.adapter.setDrawnTiles(["newA", "b"]);
+        await f.started();
+        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
+          mixed ? ["a", "b"] : [],
+        );
+        expect(f.adapter.presentationMatrix()[12]).toBe(0);
+        f.release();
+        await f.settle();
+        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+        expect([...f.adapter.stats().drawnTileIds].sort()).toEqual([
+          "b",
+          "newA",
+        ]);
+        expect(
+          f.adapter
+            .pickableMeshTiles()
+            .map((tile) => tile.id)
+            .sort(),
+        ).toEqual(mixed ? ["b", "newA"] : []);
+        expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
+        expect(f.adapter.tileState("newB")).toBe("submitted");
+        expect(f.pool.stats().rendererBytes).toBe(
+          f.factory.stats(f.renderer)?.residentBytes,
+        );
+        expect(f.errors).toEqual([]);
+        expect(f.refusals).toEqual([]);
+        f.dispose();
+        expect(f.pool.stats()).toMatchObject({
+          rendererBytes: 0,
+          cpuRetainedBytes: 0,
+          cpuReservedBytes: 0,
+          activeOperations: 0,
+          owners: 0,
+        });
+      } finally {
+        f.dispose();
+      }
+    },
+  );
+
+  it("releases an unpublished partial-selection atlas when the complete old frontier is reselected", async () => {
+    const f = fixture();
+    try {
+      await preparePartial(f);
+      const retained = f.pool.stats().rendererBytes;
+      f.hold();
+      f.adapter.setDrawnTiles(["newA", "b"]);
+      await f.started();
+      expect(f.pool.stats().rendererBytes).toBe(retained + 480);
+      f.adapter.setDrawnTiles(["a", "b"]);
+      for (
+        let index = 0;
+        index < 100 && f.pool.stats().rendererBytes !== retained;
+        index++
+      )
+        await Promise.resolve();
+      expect(f.pool.stats().rendererBytes).toBe(retained);
+      f.release();
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+      expect(f.errors).toEqual([]);
+      expect(f.refusals).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("retains complete compact coverage when partial-selection overlap is refused, then retries", async () => {
+    const f = fixture();
+    try {
+      await preparePartial(f);
+      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
+      f.adapter.setDrawnTiles(["newA", "b"]);
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
+      expect(f.pool.stats().rendererBytes).toBe(960);
+      expect(f.refusals).toHaveLength(1);
+      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
+      f.pool.configure({ totalBytes: 1440 });
+      f.adapter.clearRequiredBytes();
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
+      expect(f.pool.stats().rendererBytes).toBe(
+        f.factory.stats(f.renderer)?.residentBytes,
+      );
+      expect(f.errors).toEqual([]);
+      f.dispose();
+      expect(f.pool.stats()).toMatchObject({
+        rendererBytes: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        activeOperations: 0,
+        owners: 0,
+      });
+    } finally {
       f.dispose();
     }
   });
