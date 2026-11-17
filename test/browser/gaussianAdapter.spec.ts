@@ -47,7 +47,38 @@ type Stats = {
   sortCount: number;
   residentBytes: number;
 };
+type MeshCacheState = {
+  drawn: string[];
+  picks: string[];
+  pendingJobs: number;
+  pendingTiles: number;
+  queuedJobs: number;
+  residentBytes: number;
+  residentTextureBytes: number;
+  textureRepresentation: string;
+  hits: { status: string; rayDepth?: number; scenePoint?: number[] }[];
+  gap: { status: string };
+  camera: {
+    position: number[];
+    focalPoint: number[];
+    parallelScale: number;
+    viewport: number[];
+  };
+  cached: string[];
+  cacheReads: string[];
+  errors: string[];
+  refusals: string[];
+};
 type Fixture = {
+  showCachedMeshParent(): Promise<string>;
+  refineCachedMeshesCold(): Promise<string>;
+  hideCachedMeshes(): Promise<void>;
+  refineCachedMeshesWarm(): Promise<{
+    first: string;
+    second: string;
+    retainedAfterFirst: string[];
+  }>;
+  cachedMeshState(): MeshCacheState;
   setupRecovery(): void;
   refineRecovery(): void;
   panRecovery(evict: boolean): void;
@@ -419,6 +450,102 @@ describe("coherent mixed presentations and ownership", () => {
       },
       { method, args },
     ) as Promise<Awaited<ReturnType<Fixture[K]>>>;
+
+  it("restores the textured fine frontier after warm-cache hide and show", async () => {
+    const page = await open("mesh-cache-restoration");
+    const cyanPixels = (image: Awaited<ReturnType<typeof pixels>>): number => {
+      let count = 0;
+      for (let index = 0; index < image.data.length; index += 4) {
+        const r = image.data[index]!,
+          g = image.data[index + 1]!,
+          b = image.data[index + 2]!;
+        if (r < 80 && g > 105 && b > 105 && Math.abs(g - b) < 80) count++;
+      }
+      return count;
+    };
+    try {
+      expect(await api(page, "showCachedMeshParent")).toBe("queued");
+      const coarsePixels = cyanPixels(await pixels(page));
+      expect(await api(page, "refineCachedMeshesCold")).toBe("queued");
+      const before = await api(page, "cachedMeshState");
+      const finePixels = cyanPixels(await pixels(page));
+      expect(finePixels).toBeGreaterThan(200);
+      expect(coarsePixels).toBeGreaterThan(finePixels * 1.5);
+      expect(before.drawn).toEqual(["cache-a", "cache-b"]);
+      expect(before.picks).toEqual(before.drawn);
+      expect(
+        before.hits.every((hit) => hit.status === "hit" && hit.rayDepth! > 0),
+      ).toBe(true);
+      for (const hit of before.hits)
+        expect(hit.scenePoint?.[2]).toBeCloseTo(0, 6);
+      expect(before.gap.status).toBe("miss");
+      expect(before.textureRepresentation).toBe("rgba");
+      expect(before.residentTextureBytes).toBeGreaterThan(0);
+      expect(before.errors).toEqual([]);
+      expect(before.refusals).toEqual([]);
+
+      await api(page, "hideCachedMeshes");
+      expect(cyanPixels(await pixels(page))).toBe(0);
+      const hidden = await api(page, "cachedMeshState");
+      expect(hidden.drawn).toEqual([]);
+      expect(hidden.picks).toEqual([]);
+      expect(hidden.hits.every((hit) => hit.status === "miss")).toBe(true);
+      expect(hidden.residentBytes).toBe(0);
+      expect((await api(page, "ledger")).rendererBytes).toBe(0);
+      expect((await api(page, "ledger")).cpuRetainedBytes).toBeGreaterThan(0);
+      expect(hidden.cached).toEqual(before.cached);
+
+      expect(await api(page, "showCachedMeshParent")).toBe("queued");
+      const replay = await api(page, "refineCachedMeshesWarm");
+      const after = await api(page, "cachedMeshState");
+      const restoredPixels = cyanPixels(await pixels(page));
+      expect(
+        Math.abs(restoredPixels - finePixels),
+        JSON.stringify({ finePixels, restoredPixels, replay, after }),
+      ).toBeLessThanOrEqual(Math.max(50, Math.floor(finePixels / 10)));
+      expect(replay).toEqual({
+        first: "queued",
+        second: "queued",
+        retainedAfterFirst: ["cache-parent"],
+      });
+      expect(after.drawn).toEqual(before.drawn);
+      expect(after.picks).toEqual(before.picks);
+      expect(
+        after.hits.every((hit) => hit.status === "hit" && hit.rayDepth! > 0),
+      ).toBe(true);
+      for (const hit of after.hits)
+        expect(hit.scenePoint?.[2]).toBeCloseTo(0, 6);
+      expect(after.gap.status).toBe("miss");
+      expect(after.camera).toEqual(before.camera);
+      expect(after).toMatchObject({
+        pendingJobs: 0,
+        pendingTiles: 0,
+        queuedJobs: 0,
+      });
+      expect(after.cacheReads).toEqual([
+        "cache-parent",
+        "cache-a",
+        "cache-b",
+        "cache-parent",
+        "cache-a",
+        "cache-b",
+      ]);
+      expect(after.errors).toEqual([]);
+      expect(after.refusals).toEqual([]);
+      await api(page, "dispose");
+      expect(await api(page, "ledger")).toMatchObject({
+        rendererBytes: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        workReservedBytes: 0,
+        activeOperations: 0,
+        queuedOperations: 0,
+        owners: 0,
+      });
+    } finally {
+      await page.close();
+    }
+  });
 
   it.each([false, true])(
     "renders a wanted sibling after group cancellation (evict=%s)",
