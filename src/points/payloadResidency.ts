@@ -40,13 +40,13 @@ export type ResidencyTotals = {
 
 export type PayloadResidency = {
   /** Make a payload resident; the cache gives up any copy of the key. */
-  hold(key: string, tile: TileData): boolean;
+  hold(key: string, tile: TileData, lease?: MemoryLease): boolean;
   /** Move every resident payload the set does not name into the cache. */
   releaseExcept(keep: ReadonlySet<string>): void;
   /** Release the renderer reservation after a failed realization of this payload. */
   failRealization(key: string, tile: TileData): boolean;
   /** Cache a payload, unless residency already owns the key. */
-  park(key: string, tile: TileData): void;
+  park(key: string, tile: TileData, lease?: MemoryLease): void;
   /** Make a cached payload resident; false when the cache has none. */
   promote(key: string): boolean;
   isResident(key: string): boolean;
@@ -88,7 +88,7 @@ export const createPayloadResidency = (options: {
   >();
   const rendererMemory = new Map<string, MemoryLease>();
   const blocked = new Set<string>();
-  const holdCpu = (tile: TileData): void => {
+  const holdCpu = (tile: TileData, lease?: MemoryLease): void => {
     if (!options.memory) return;
     const entry = allocations.get(tile);
     if (entry) {
@@ -96,13 +96,15 @@ export const createPayloadResidency = (options: {
       return;
     }
     allocations.set(tile, {
-      memory: options.memory.retain(
-        [
-          tile.positions.buffer as ArrayBuffer,
-          ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
-        ],
-        64,
-      ),
+      memory:
+        lease?.share() ??
+        options.memory.retain(
+          [
+            tile.positions.buffer as ArrayBuffer,
+            ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+          ],
+          64,
+        ),
       references: 1,
     });
   };
@@ -124,27 +126,27 @@ export const createPayloadResidency = (options: {
   });
   let submitted = new Map<string, TileData>();
 
-  const park = (key: string, tile: TileData): void => {
+  const park = (key: string, tile: TileData, lease?: MemoryLease): void => {
     if (resident.has(key)) return;
-    holdCpu(tile);
+    holdCpu(tile, lease);
     cache.delete(key);
     cache.set(key, tile, tileBytes(tile));
   };
-  const hold = (key: string, tile: TileData): boolean => {
+  const hold = (key: string, tile: TileData, lease?: MemoryLease): boolean => {
     if (resident.get(key) === tile) return true;
     if (resident.has(key))
       throw new Error("resident tile key already owns a different payload");
     let rendererLease: MemoryLease | undefined;
     try {
       rendererLease = options.reserveRenderer?.(key, tile);
-      holdCpu(tile);
+      holdCpu(tile, lease);
     } catch (error) {
       rendererLease?.release();
       if (!(error instanceof ResourcePolicyError)) throw error;
       blocked.add(key);
       options.onPolicyRefusal?.(error);
       try {
-        park(key, tile);
+        park(key, tile, lease);
       } catch (cacheError) {
         if (!(cacheError instanceof ResourcePolicyError)) throw cacheError;
       }
@@ -187,9 +189,9 @@ export const createPayloadResidency = (options: {
       return true;
     },
 
-    park(key, tile) {
+    park(key, tile, lease) {
       try {
-        park(key, tile);
+        park(key, tile, lease);
       } catch (error) {
         if (!(error instanceof ResourcePolicyError)) throw error;
         blocked.add(key);

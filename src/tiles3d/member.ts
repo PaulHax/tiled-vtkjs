@@ -35,6 +35,8 @@ import {
 import {
   TileDecodeError,
   type DecodedTileContent,
+  type DecodeTileRequest,
+  type DecodeWorkerPoolHandle,
   type DecodeWasmUrls,
 } from "./decode";
 import { createMeshContentAdapter } from "./meshContentAdapter";
@@ -114,6 +116,34 @@ const decodedBytes = (content: DecodedTileContent): number =>
 
 const workerUrl = (value: string): string =>
   new URL(value, globalThis.location?.href ?? "http://localhost/").toString();
+
+const contentScopes = new WeakMap<
+  DecodeWorkerPoolHandle,
+  WeakMap<object, object>
+>();
+
+const contentIdentity = (config: Tiles3dMemberConfig): object | undefined =>
+  config.contentSourceIdentity ??
+  (!config.fetchContent && !config.fetchTileset && !config.fetchSubtree
+    ? globalThis.fetch
+    : undefined);
+
+const contentScope = (
+  workers: DecodeWorkerPoolHandle,
+  identity: object,
+): object => {
+  let scopes = contentScopes.get(workers);
+  if (!scopes) {
+    scopes = new WeakMap();
+    contentScopes.set(workers, scopes);
+  }
+  let scope = scopes.get(identity);
+  if (!scope) {
+    scope = {};
+    scopes.set(identity, scope);
+  }
+  return scope;
+};
 
 const contentRequests = (
   tileById: ReadonlyMap<string, TilesetTile>,
@@ -852,6 +882,21 @@ export const createTiles3dMember = (
 
   const createQueue = (): void => {
     queue?.dispose();
+    const sourceConfig = config;
+    const { workers, textureCapabilities } = services;
+    const capabilities = {
+      capabilityKey: textureCapabilities.capabilityKey,
+      compressedFormats: [
+        ...new Set(textureCapabilities.compressedFormats),
+      ].sort(),
+    };
+    const identity = contentIdentity(sourceConfig);
+    const scope = identity && contentScope(workers, identity);
+    const rootUrl = workerUrl(`${sourceConfig.endpoint}/`);
+    const sceneTransform = [
+      ...sourceConfig.tilesetToScene,
+    ] as DecodeTileRequest["tilesetToScene"];
+    const wasm = sourceConfig.wasm;
     queue = createContentQueue({
       revision: config.revision,
       configGeneration,
@@ -863,29 +908,51 @@ export const createTiles3dMember = (
       maxAttempts: config.maxAttempts,
       decodeReady: () => services.workers.hasCapacity?.() ?? true,
       priority: 1,
-      decode: async (bytes, request, decodeContext) => {
+      prepareDecode: (request) => {
         const tile = materializedTileById.get(request.id);
         if (!tile) throw new Error(`unknown 3D tile ${request.id}`);
-        const job = services.workers.decode(
-          {
-            content: bytes,
-            contentUrl: workerUrl(request.url),
-            dependencyRootUrl: workerUrl(`${config.endpoint}/`),
-            revision: decodeContext.revision,
-            accumulatedTransform: [...tile.worldTransform] as any,
-            tilesetToScene: [...config.tilesetToScene] as any,
-            textureCapabilities: services.textureCapabilities,
-            wasm: config.wasm,
+        const inputs = {
+          contentUrl: workerUrl(request.url),
+          dependencyRootUrl: rootUrl,
+          revision: sourceConfig.revision,
+          accumulatedTransform: [
+            ...tile.worldTransform,
+          ] as DecodeTileRequest["accumulatedTransform"],
+          tilesetToScene: sceneTransform,
+          textureCapabilities: capabilities,
+          wasm,
+        };
+        return {
+          share: scope && {
+            scope,
+            key: JSON.stringify([
+              request.id,
+              inputs.contentUrl,
+              rootUrl,
+              sourceConfig.revision,
+              inputs.accumulatedTransform,
+              sceneTransform,
+              capabilities,
+              wasm?.draco?.wrapperUrl,
+              wasm?.draco?.wasmUrl,
+              wasm?.basis?.encoderUrl,
+              wasm?.basis?.wasmUrl,
+            ]),
           },
-          { memory: decodeContext.work },
-        );
-        const abort = () => job.cancel();
-        decodeContext.signal.addEventListener("abort", abort, { once: true });
-        try {
-          return await job.promise;
-        } finally {
-          decodeContext.signal.removeEventListener("abort", abort);
-        }
+          async decode(bytes, { signal, work }) {
+            const job = workers.decode(
+              { ...inputs, content: bytes },
+              { memory: work },
+            );
+            const abort = () => job.cancel();
+            signal.addEventListener("abort", abort, { once: true });
+            try {
+              return await job.promise;
+            } finally {
+              signal.removeEventListener("abort", abort);
+            }
+          },
+        };
       },
       decodedByteLength: decodedBytes,
       onContent: ({ id }) => {
@@ -923,8 +990,10 @@ export const createTiles3dMember = (
       memory,
       fetch: config.fetchSubtree,
       maxAttempts: config.maxAttempts,
-      decode: (bytes) =>
-        parseSubtree(bytes, implicit.subtreeLevels, implicit.metadataSchema),
+      prepareDecode: () => ({
+        decode: (bytes) =>
+          parseSubtree(bytes, implicit.subtreeLevels, implicit.metadataSchema),
+      }),
       decodedByteLength: (subtree) => subtree.byteLength,
       onPolicyRefusal: (_request, error) => {
         workProgressSerial += 1;
@@ -1106,7 +1175,9 @@ export const createTiles3dMember = (
         return;
       }
       const sourceChanged =
-        next.endpoint !== config.endpoint || next.revision !== config.revision;
+        next.endpoint !== config.endpoint ||
+        next.revision !== config.revision ||
+        contentIdentity(next) !== contentIdentity(config);
       const decodeChanged =
         next.tilesetToScene.some(
           (value, index) => value !== config.tilesetToScene[index],

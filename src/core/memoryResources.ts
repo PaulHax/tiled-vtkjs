@@ -61,11 +61,28 @@ export const resourcePolicyError = (
 
 export type MemoryLease = {
   share(): MemoryLease;
+  /** Acquire another reference while any holder keeps this allocation alive. */
+  reacquireWhileHeld(onLastRelease: () => void): () => MemoryLease | undefined;
   /** Replace realized CPU ownership and the still-unrealized CPU reservation atomically. */
   setCpu(buffers: Iterable<ArrayBuffer>, reservedBytes?: number): void;
   /** Only reduces a renderer reservation, for retiring part of a replacement group. */
   shrinkRenderer(bytes: number): void;
   release(): void;
+};
+
+/** Index a completed immutable payload for exactly as long as consumers own it. */
+export const reuseMemoryResult = <T extends { memory?: MemoryLease }>(
+  value: T,
+  onLastRelease: () => void,
+): (() => T | undefined) | undefined => {
+  const acquire = value.memory?.reacquireWhileHeld(onLastRelease);
+  return (
+    acquire &&
+    (() => {
+      const memory = acquire();
+      return memory && { ...value, memory };
+    })
+  );
 };
 
 export type MemoryWork = {
@@ -100,6 +117,8 @@ export type MemoryOwner = {
     replacing?: readonly MemoryLease[],
   ): MemoryLease[];
   readonly admission: RequestAdmission;
+  /** Scope result reuse to owners backed by this allocation ledger. */
+  scopeForSharing(source: object): object;
   availability(): number;
   canRetry(error: ResourcePolicyError): boolean;
   canReserveWork(bytes: number): boolean;
@@ -144,6 +163,7 @@ type LeaseEntry = {
   renderer: number;
   released: boolean;
   references: number;
+  onLastRelease?: Set<() => void>;
   readonly replaces: readonly LeaseEntry[];
 };
 
@@ -175,6 +195,15 @@ export const createMemoryResources = (
   const buffers = new Map<ArrayBuffer, { references: number; bytes: number }>();
   const leases = new WeakMap<MemoryLease, LeaseEntry>();
   const claimedReplacements = new Map<LeaseEntry, number>();
+  const sharingScopes = new WeakMap<object, object>();
+  const scopeForSharing = (source: object): object => {
+    let scope = sharingScopes.get(source);
+    if (!scope) {
+      scope = {};
+      sharingScopes.set(source, scope);
+    }
+    return scope;
+  };
 
   const retireOwner = (owner: OwnerEntry): void => {
     if (
@@ -246,6 +275,12 @@ export const createMemoryResources = (
             throw new Error("allocation already released");
           return handle();
         },
+        reacquireWhileHeld(onLastRelease) {
+          if (released || entry.released)
+            throw new Error("allocation already released");
+          (entry.onLastRelease ??= new Set()).add(onLastRelease);
+          return () => (entry.released ? undefined : handle());
+        },
         setCpu(values, reservedBytes = 0) {
           if (released || entry.released) return;
           const reserved = bytesValue("reserved CPU bytes", reservedBytes);
@@ -287,6 +322,9 @@ export const createMemoryResources = (
           }
           owner.leases.delete(entry);
           retireOwner(owner);
+          const listeners = entry.onLastRelease;
+          entry.onLastRelease = undefined;
+          listeners?.forEach(safeCall);
           if (
             releasedCredit ||
             cpuRetained + cpuReserved + renderer < previousBytes
@@ -501,6 +539,7 @@ export const createMemoryResources = (
           return reserveRendererGroup(owner, amounts, replacing);
         },
         admission,
+        scopeForSharing,
         availability: () => availabilityRevision,
         canRetry(error) {
           if (error.operationBytes === undefined) return true;

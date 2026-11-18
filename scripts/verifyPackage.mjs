@@ -451,6 +451,19 @@ const checkBrowser = async (
       requests.some((url) => url.endsWith("/tiles3dDecodeWorker.classic.js")),
       "default worker URL must reach the staged packed worker",
     );
+    const sharedTiles = await call("sharedTiles");
+    assert.equal(sharedTiles.contentReads, 1);
+    assert.equal(sharedTiles.completedDecodes, 1);
+    assert.deepEqual(sharedTiles.rendered, [
+      [0, 255, 0, 255],
+      [0, 0, 0, 255],
+      [0, 0, 0, 255],
+      [0, 255, 0, 255],
+    ]);
+    assert.deepEqual(sharedTiles.survivingPixel, [0, 255, 0, 255]);
+    assert.equal(sharedTiles.memory.rendererBytes, 0);
+    assert.equal(sharedTiles.memory.cpuRetainedBytes, 0);
+    assert.equal(sharedTiles.memory.workReservedBytes, 0);
     const gaussian = await call("gaussian");
     assert.equal(gaussian.ready.displayedSplats, 3);
     assert(gaussian.ready.sortCount > 0);
@@ -499,6 +512,7 @@ const checkBrowser = async (
       refined,
       released,
       disposed,
+      sharedTiles,
       codecResults,
       gaussian,
       sortWorkerAssets,

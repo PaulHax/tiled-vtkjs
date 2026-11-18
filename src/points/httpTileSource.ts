@@ -13,12 +13,13 @@
 import { keyFromString, keyToString, type VoxelKey } from "./octree";
 import { orderTileForProgressiveDrawing } from "./progressiveOrder";
 import { readMemoryResponse } from "../core/memoryResponse";
-import type {
-  LoadOptions,
-  NodeInfo,
-  TileData,
-  TileSource,
-  TileSourceMetadata,
+import {
+  immutablePointSources,
+  type LoadOptions,
+  type NodeInfo,
+  type TileData,
+  type TileSource,
+  type TileSourceMetadata,
 } from "./tileSource";
 
 /** The asset revision behind this source no longer exists on the server. */
@@ -87,6 +88,8 @@ export type HttpTileSourceOptions = {
    * trailing slash — e.g. `/pointcloud/<asset>/<revision>`.
    */
   endpoint: string;
+  /** Additional identity when a host reports the source revision separately. */
+  revision?: string;
   /** Dataset metadata (the scene anchor carries it; there is no endpoint). */
   metadata: TileSourceMetadata;
   /** Injectable fetch for tests; defaults to the global. */
@@ -111,7 +114,7 @@ export const createHttpTileSource = (
     return response;
   };
 
-  return {
+  const source: TileSource = {
     metadata: () => metadata,
 
     async nodes(key: VoxelKey, opts?: LoadOptions): Promise<NodeInfo[]> {
@@ -154,4 +157,14 @@ export const createHttpTileSource = (
       return orderTileForProgressiveDrawing(parsePct1(buffer), keyString);
     },
   };
+  if (!options.fetchImpl)
+    immutablePointSources.set(source, {
+      scope: fetchImpl,
+      key: JSON.stringify([
+        new URL(endpoint, globalThis.location?.href ?? "http://localhost/")
+          .href,
+        options.revision,
+      ]),
+    });
+  return source;
 };

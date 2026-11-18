@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { perspectiveView } from "../../test/helpers";
 import { createMemoryPool } from "../core/memoryPool";
 import { ROOT_KEY } from "./octree";
+import { createHttpTileSource, PCT1_HEADER_BYTES } from "./httpTileSource";
 import {
   createPointCloudMember,
   type PointCloudMemberConfig,
@@ -181,6 +182,78 @@ const meshContent: DecodedMeshTileContent = {
 };
 
 describe("createPointCloudMember", () => {
+  it.each([false, true])(
+    "shares revision-scoped HTTP payloads across independent views (late=%s)",
+    async (late) => {
+      const memory = createMemoryPool({ totalBytes: 16_000 });
+      const first = preparationView(memory);
+      const second = preparationView(memory);
+      const buffer = new ArrayBuffer(PCT1_HEADER_BYTES + 12);
+      const header = new DataView(buffer);
+      header.setUint32(0, 0x31544350, true);
+      header.setUint32(4, 1, true);
+      const fetch = vi.fn(async (input: string) =>
+        input.endsWith(".json")
+          ? Response.json({
+              nodes: {
+                "0-0-0-0": {
+                  pointCount: 1,
+                  bounds: { min: [-1, -1, -0.5], max: [1, 1, 0.5] },
+                  spacing: 1,
+                  children: [],
+                },
+              },
+            })
+          : new Response(buffer.slice(0)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const makeSource = () =>
+        createHttpTileSource({
+          endpoint: "/points/r1",
+          metadata: { pointCount: 1 },
+        });
+      const pointConfig = () => config({ source: makeSource(), pointCount: 1 });
+      const draw = async (view: ReturnType<typeof preparationView>) => {
+        await view.whenQueued(1);
+        view.submissions.prepareFrame(1, false);
+        view.submissions.prepareFrame(1, true);
+      };
+      const a = first.createPoint(pointConfig());
+      let b: ReturnType<typeof createPointCloudMember> | undefined;
+      try {
+        const firstDrawn = draw(first);
+        if (late) await firstDrawn;
+        b = second.createPoint(pointConfig());
+        await firstDrawn;
+        await draw(second);
+        expect(a.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(b.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+          "/points/r1/hierarchy/0-0-0-0.json",
+          "/points/r1/tile/0-0-0-0.bin",
+        ]);
+        expect(memory.stats().cpuRetainedBytes).toBe(buffer.byteLength);
+        a.dispose();
+        expect(first.release).toHaveBeenCalledOnce();
+        expect(second.release).not.toHaveBeenCalled();
+        expect(b.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(memory.stats().cpuRetainedBytes).toBe(buffer.byteLength);
+      } finally {
+        a.dispose();
+        b?.dispose();
+        first.submissions.dispose();
+        second.submissions.dispose();
+        vi.unstubAllGlobals();
+      }
+      expect(memory.stats()).toMatchObject({
+        activeOperations: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        rendererBytes: 0,
+      });
+    },
+  );
+
   it("shares preparation with mesh and another view, publishing picks only at paint", async () => {
     const memory = createMemoryPool({ totalBytes: 16_000 });
     const budget = createSubmissionFrameBudget(96, 100);

@@ -45,7 +45,9 @@ const makeQueue = (
     maxConcurrency: 2,
     maxDecodedBytes: 100,
     fetch: vi.fn(async (url) => ok(new TextEncoder().encode(String(url)))),
-    decode: async (_bytes, item) => ({ id: item.id, bytes: 10 }),
+    prepareDecode: (item) => ({
+      decode: () => ({ id: item.id, bytes: 10 }),
+    }),
     decodedByteLength: (value) => value.bytes,
     onContent: (item) => decoded.push(item.id),
     ...overrides,
@@ -114,7 +116,7 @@ describe("content queue", () => {
           ? Promise.resolve(ok(new Uint8Array(14)))
           : lateNetwork.promise;
       },
-      decode,
+      prepareDecode: (item) => ({ decode: (bytes) => decode(bytes, item) }),
       decodeReady: () => decoderReady,
     });
     let decoderReady = false;
@@ -162,8 +164,10 @@ describe("content queue", () => {
       memory: first,
       maxConcurrency: 1,
       fetch: fetchFirst,
-      decode: (_bytes, item) =>
-        item.id === "a" ? decode.promise : { id: item.id, bytes: 10 },
+      prepareDecode: (item) => ({
+        decode: () =>
+          item.id === "a" ? decode.promise : { id: item.id, bytes: 10 },
+      }),
     }).queue;
     const secondQueue = makeQueue({ memory: second, fetch: fetchSecond }).queue;
     firstQueue.setSelection([request("a"), request("b")]);
@@ -432,7 +436,12 @@ describe("content queue", () => {
       .fn()
       .mockRejectedValueOnce(new Error("malformed"))
       .mockResolvedValueOnce({ id: "a", bytes: 10 });
-    const { queue } = makeQueue({ clock, decode, maxAttempts: 2, onError });
+    const { queue } = makeQueue({
+      clock,
+      prepareDecode: () => ({ decode }),
+      maxAttempts: 2,
+      onError,
+    });
 
     queue.setSelection([request("a")]);
     await flush();
@@ -466,9 +475,11 @@ describe("content queue", () => {
       "EXT_meshopt_compression",
     );
     const { queue } = makeQueue({
-      decode: async () => {
-        throw typed;
-      },
+      prepareDecode: () => ({
+        decode: () => {
+          throw typed;
+        },
+      }),
       maxAttempts: 1,
       onError,
     });
@@ -594,9 +605,11 @@ describe("content queue", () => {
     const events: string[] = [];
     const { queue } = makeQueue({
       maxDecodedBytes: 10,
-      decode: async (_bytes, item) => ({
-        id: item.id,
-        bytes: item.id === "oversize" ? 20 : 5,
+      prepareDecode: (item) => ({
+        decode: () => ({
+          id: item.id,
+          bytes: item.id === "oversize" ? 20 : 5,
+        }),
       }),
       onContent: (item) => events.push(`content:${item.id}`),
     });

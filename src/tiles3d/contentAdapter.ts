@@ -43,6 +43,7 @@ export type TileContentAdapterStats = MeshAdapterStats;
  * A submitted tile is ready to participate in a coherent presentation.
  * Implementations retain the last complete presentation while asynchronous
  * uploads or draw-order jobs are pending. Only triangles enter the pick set.
+ * Decoded content and its buffers are read-only and can be shared across views.
  */
 export type TileContentAdapter = Omit<
   MeshAdapter,

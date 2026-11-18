@@ -6,9 +6,11 @@ import { TileDecodeError } from "./decode/types";
 import {
   createRequestAdmission,
   type RequestClock,
+  type RequestShare,
   type RequestStage,
 } from "../core/requestAdmission";
 import {
+  reuseMemoryResult,
   type MemoryOwner,
   type MemoryLease,
   type MemoryWork,
@@ -44,6 +46,14 @@ export type ContentDecodeContext = {
 };
 
 export type ContentQueueClock = RequestClock;
+
+type ContentDecoder<T> = {
+  readonly share?: Pick<RequestShare<Decoded<T>>, "scope" | "key">;
+  readonly decode: (
+    bytes: ArrayBuffer,
+    context: ContentDecodeContext,
+  ) => Promise<T> | T;
+};
 
 export type ContentQueueEntryStatus =
   | "queued"
@@ -90,11 +100,7 @@ export type ContentQueueOptions<T> = {
   readonly decodeReady?: () => boolean;
   readonly priority?: number;
   readonly decodedBuffers?: (content: T) => Iterable<ArrayBuffer>;
-  readonly decode: (
-    bytes: ArrayBuffer,
-    request: TileContentRequest,
-    context: ContentDecodeContext,
-  ) => Promise<T> | T;
+  readonly prepareDecode: (request: TileContentRequest) => ContentDecoder<T>;
   readonly decodedByteLength: (
     content: T,
     request: TileContentRequest,
@@ -365,8 +371,14 @@ export const createContentQueue = <T>(
       const { request } = selected.get(id)!;
       const operationRevision = revision;
       const operationGeneration = configGeneration;
+      const { decode, share } = options.prepareDecode(request);
       return {
         lane: "network",
+        share: share && {
+          ...share,
+          scope: options.memory?.scopeForSharing(share.scope) ?? share.scope,
+          reuse: reuseMemoryResult,
+        },
         async start(signal) {
           const work = options.memory?.work(signal);
           let handedOff = false;
@@ -413,7 +425,7 @@ export const createContentQueue = <T>(
                 release: () => work?.release(),
                 async start(signal) {
                   try {
-                    const content = await options.decode(bytes, request, {
+                    const content = await decode(bytes, {
                       signal,
                       revision: operationRevision,
                       configGeneration: operationGeneration,

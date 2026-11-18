@@ -48,7 +48,7 @@ export type NodeInfo = {
   readonly pageRef?: boolean;
 };
 
-/** Decoded payload of one octree node. */
+/** Read-only decoded payload of one octree node, potentially shared across views. */
 export type TileData = {
   /** World-space origin the tile-local positions are relative to. */
   readonly origin: Vec3;
@@ -109,3 +109,9 @@ export type TileSource = {
   /** Release source-owned resources such as a decoding worker. The host owns this lifetime. */
   dispose?(): void;
 };
+
+/** Compatibility established by the built-in readers for immutable results. */
+export const immutablePointSources = new WeakMap<
+  TileSource,
+  { readonly scope: object; readonly key: string }
+>();

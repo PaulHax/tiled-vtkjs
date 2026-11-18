@@ -76,9 +76,21 @@ const decoded = (z = 0): DecodedMeshTileContent => ({
   byteEstimate: { geometry: 42, textures: 0 },
 });
 
+const meshCellBytes = 4 * Uint32Array.BYTES_PER_ELEMENT;
+
 const settle = async (): Promise<void> => {
   for (let index = 0; index < 6; index += 1) await Promise.resolve();
   await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+const defer = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 };
 
 const harness = (withChildren = false, schedulerBytes = 1024) => {
@@ -154,6 +166,243 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
 
 describe("createTiles3dMember", () => {
   beforeEach(resetStubs);
+
+  it.each([
+    "compatible",
+    "capabilities",
+    "revision",
+    "placement",
+    "custom-reader",
+    "memory-pool",
+  ] as const)(
+    "shares content only for compatible views (%s)",
+    async (profile) => {
+      const h = harness();
+      const fetch = vi.fn(async (url: string) =>
+        url.endsWith("tileset.json")
+          ? Response.json(document())
+          : new Response(new ArrayBuffer(8)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const config = {
+        ...h.config,
+        fetchTileset: undefined,
+        fetchContent: profile === "custom-reader" ? fetch : undefined,
+        cacheBytes: 0,
+      };
+      const textureCapabilities =
+        profile === "capabilities"
+          ? { capabilityKey: "rgba", compressedFormats: [] }
+          : h.services.textureCapabilities;
+      const secondMemory =
+        profile === "memory-pool"
+          ? createMemoryPool({
+              totalBytes: 4096,
+              admission: h.memory.admission,
+            })
+          : h.memory;
+      const pools = [...new Set([h.memory, secondMemory])];
+      const retainedBytes = () =>
+        pools.reduce((sum, pool) => sum + pool.stats().cpuRetainedBytes, 0);
+      const placement = [...IDENTITY];
+      if (profile === "placement") placement[12] = 0.125;
+      const members = [
+        createTiles3dMember(h.context, config, h.services),
+        createTiles3dMember(
+          {
+            ...h.context,
+            memory: secondMemory,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...config,
+            revision: profile === "revision" ? "r2" : "r1",
+            tilesetToScene: placement,
+          },
+          { ...h.services, textureCapabilities },
+        ),
+      ];
+      try {
+        for (const member of members) {
+          member.applyAllocation({
+            qualityFraction: 1,
+            memoryBudgetBytes: 4096,
+            regime: "stationary",
+          });
+          member.setCamera(view);
+        }
+        await flush();
+        h.submissions.prepareFrame();
+        for (const member of members)
+          expect(member.pick(view, 50, 50)?.status).toBe("hit");
+        const expected = profile === "compatible" ? 1 : 2;
+        expect(
+          fetch.mock.calls.filter(([url]) => url.endsWith("root.glb")),
+        ).toHaveLength(expected);
+        expect(h.decodedRequests).toHaveLength(expected);
+        expect(retainedBytes()).toBe(
+          expected * decoded().byteEstimate.geometry + 2 * meshCellBytes,
+        );
+        members[0]!.dispose();
+        expect(members[1]!.pick(view, 50, 50)?.status).toBe("hit");
+        expect(retainedBytes()).toBe(
+          decoded().byteEstimate.geometry + meshCellBytes,
+        );
+      } finally {
+        for (const member of members) member.dispose();
+        vi.unstubAllGlobals();
+      }
+      for (const pool of pools)
+        expect(pool.stats()).toMatchObject({
+          activeOperations: 0,
+          cpuRetainedBytes: 0,
+          rendererBytes: 0,
+        });
+    },
+  );
+
+  it.each([false, true])(
+    "keeps shared stages charged while demand withdraws (last=%s)",
+    async (last) => {
+      const h = harness();
+      const network = defer<Response>();
+      const decode = defer<DecodedMeshTileContent>();
+      const cancel = vi.fn();
+      const signals: AbortSignal[] = [];
+      const fetch = vi.fn(
+        async (url: string, { signal }: { signal: AbortSignal }) => {
+          if (url.endsWith("tileset.json")) return Response.json(document());
+          signals.push(signal);
+          return network.promise;
+        },
+      );
+      vi.stubGlobal("fetch", fetch);
+      h.services.workers.decode = vi.fn(() => ({
+        promise: decode.promise,
+        cancel,
+      }));
+      const make = () => {
+        const member = createTiles3dMember(
+          {
+            ...h.context,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...h.config,
+            fetchTileset: undefined,
+            fetchContent: undefined,
+            cacheBytes: 0,
+          },
+          h.services,
+        );
+        member.applyAllocation({
+          qualityFraction: 1,
+          memoryBudgetBytes: 4096,
+          regime: "stationary",
+        });
+        member.setCamera(view);
+        return member;
+      };
+      const a = make();
+      const b = make();
+      try {
+        await flush();
+        expect(signals).toHaveLength(1);
+        expect(h.memory.stats().activeOperations).toBe(1);
+        a.dispose();
+        expect(signals[0]?.aborted).toBe(false);
+        network.resolve(new Response(new ArrayBuffer(8)));
+        await flush();
+        expect(h.services.workers.decode).toHaveBeenCalledOnce();
+        expect(cancel).not.toHaveBeenCalled();
+        if (last) {
+          b.dispose();
+          expect(cancel).toHaveBeenCalledOnce();
+          expect(h.memory.stats()).toMatchObject({
+            activeOperations: 1,
+            workReservedBytes: 8,
+          });
+        }
+        decode.resolve(decoded());
+        await flush();
+        h.submissions.prepareFrame();
+        if (!last) {
+          expect(b.pick(view, 50, 50)?.status).toBe("hit");
+          expect(h.memory.stats()).toMatchObject({
+            activeOperations: 0,
+            workReservedBytes: 0,
+            cpuRetainedBytes: decoded().byteEstimate.geometry + meshCellBytes,
+          });
+        }
+      } finally {
+        a.dispose();
+        b.dispose();
+        vi.unstubAllGlobals();
+      }
+      expect(h.memory.stats()).toMatchObject({
+        activeOperations: 0,
+        workReservedBytes: 0,
+        cpuRetainedBytes: 0,
+        rendererBytes: 0,
+      });
+    },
+  );
+
+  it.each([0, 1024])(
+    "joins a finished tile only while its complete decode is retained (cache=%s)",
+    async (cacheBytes) => {
+      const h = harness();
+      const fetch = vi.fn(async (url: string) =>
+        url.endsWith("tileset.json")
+          ? Response.json(document())
+          : new Response(new ArrayBuffer(8)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const members: ReturnType<typeof createTiles3dMember>[] = [];
+      const open = async () => {
+        const member = createTiles3dMember(
+          {
+            ...h.context,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...h.config,
+            fetchTileset: undefined,
+            fetchContent: undefined,
+            cacheBytes,
+          },
+          h.services,
+        );
+        members.push(member);
+        member.applyAllocation({
+          qualityFraction: 1,
+          memoryBudgetBytes: 4096,
+          regime: "stationary",
+        });
+        member.setCamera(view);
+        await flush();
+        h.submissions.prepareFrame();
+        expect(member.pick(view, 50, 50)?.status).toBe("hit");
+        return member;
+      };
+      try {
+        const first = await open();
+        expect(h.decodedRequests).toHaveLength(1);
+        const second = await open();
+        const expected = cacheBytes > 0 ? 1 : 2;
+        expect(h.decodedRequests).toHaveLength(expected);
+        first.dispose();
+        expect(second.pick(view, 50, 50)?.status).toBe("hit");
+        second.dispose();
+        expect(h.memory.stats().cpuRetainedBytes).toBe(0);
+        await open();
+        expect(h.decodedRequests).toHaveLength(expected + 1);
+      } finally {
+        for (const member of members) member.dispose();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
 
   it.each([104, 110])(
     "recovers mixed pooled and GPU-evicted children within a %i-byte budget",

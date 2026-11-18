@@ -23,6 +23,7 @@ import {
 } from "../core/camera";
 import {
   resourcePolicyError,
+  reuseMemoryResult,
   type MemoryOwner,
   type MemoryLease,
   type ResourcePolicyError,
@@ -37,6 +38,7 @@ import {
 import {
   createRequestAdmission,
   type LoaderCounts,
+  type RequestShare,
 } from "../core/requestAdmission";
 import { sameMatrix, transformPoint, type Mat16 } from "../core/mat4";
 import { scenePoint } from "../core/frames";
@@ -74,6 +76,7 @@ import {
 import { pointCapacity } from "./pointQuality";
 import type { RetryPolicy } from "../core/retryPolicy";
 import {
+  immutablePointSources,
   tileBytes,
   type NodeInfo,
   type TileData,
@@ -535,6 +538,20 @@ export const createLodController = (
     adoptCancelled: true,
     keepUnwantedResults: true,
   };
+  const sharePointRequest = <T extends { memory?: MemoryLease }>(
+    kind: "hierarchy" | "tile",
+    key: string,
+  ): RequestShare<T> | undefined => {
+    const identity = immutablePointSources.get(source);
+    return (
+      identity && {
+        scope:
+          options.memory?.scopeForSharing(identity.scope) ?? identity.scope,
+        key: JSON.stringify([identity.key, kind, key]),
+        reuse: reuseMemoryResult,
+      }
+    );
+  };
   let pointBudget = wholeAtLeast(
     "pointBudget",
     options.pointBudget ?? 2_000_000,
@@ -701,6 +718,7 @@ export const createLodController = (
     ...admissionOptions,
     operation: (keyString) => ({
       lane: source.hierarchyLane ?? "network",
+      share: sharePointRequest("hierarchy", keyString),
       ready: () =>
         source.canRead?.("hierarchy", keyFromString(keyString)) ?? true,
       async start(signal) {
@@ -761,6 +779,7 @@ export const createLodController = (
       priority: 1,
       operation: (keyString) => ({
         lane: source.tileLane ?? "network",
+        share: sharePointRequest("tile", keyString),
         ready: () => source.canRead?.("tile", keyFromString(keyString)) ?? true,
         async start(signal) {
           const estimate = nodes.get(keyString);
@@ -778,10 +797,13 @@ export const createLodController = (
             return {
               value: {
                 tile,
-                memory: work?.commit([
-                  tile.positions.buffer as ArrayBuffer,
-                  ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
-                ]),
+                memory: work?.commit(
+                  [
+                    tile.positions.buffer as ArrayBuffer,
+                    ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+                  ],
+                  64,
+                ),
               },
             };
           } finally {
@@ -805,7 +827,7 @@ export const createLodController = (
           // that cost before admitting the payload, and keep it after cache
           // eviction so another selection cannot refetch the same oversized tile.
           if (exceedsEstimate && selection.target.has(keyString)) {
-            runSelection(undefined, { keyString, tile });
+            runSelection(undefined, { keyString, tile, memory });
             return;
           }
           // Cancellation is advisory, so a cancelled read can still deliver. If
@@ -815,10 +837,10 @@ export const createLodController = (
             selection.target.has(keyString) &&
             !residency.isResident(keyString)
           ) {
-            residency.hold(keyString, tile);
+            residency.hold(keyString, tile, memory);
             scheduleFlush();
           } else {
-            residency.park(keyString, tile);
+            residency.park(keyString, tile, memory);
           }
         } finally {
           memory?.release();
@@ -886,7 +908,11 @@ export const createLodController = (
 
   const runSelection = (
     seed?: ReadonlySet<string>,
-    arrival?: { readonly keyString: string; readonly tile: TileData },
+    arrival?: {
+      readonly keyString: string;
+      readonly tile: TileData;
+      readonly memory?: MemoryLease;
+    },
   ): void => {
     if (disposed || !active || view === null) return;
     const previous = selection.target;
@@ -931,9 +957,9 @@ export const createLodController = (
         target.has(arrival.keyString) &&
         !residency.isResident(arrival.keyString)
       ) {
-        residency.hold(arrival.keyString, arrival.tile);
+        residency.hold(arrival.keyString, arrival.tile, arrival.memory);
       } else {
-        residency.park(arrival.keyString, arrival.tile);
+        residency.park(arrival.keyString, arrival.tile, arrival.memory);
       }
     }
 

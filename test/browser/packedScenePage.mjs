@@ -300,6 +300,120 @@ window.packedScene = {
     generic.delete();
     return result;
   },
+  sharedTiles: async () => {
+    const memory = createMemoryPool({ totalBytes: 16_384 });
+    const pool = new DecodeWorkerPool({ size: 1, admission: memory.admission });
+    const coordinator = createStreamedSceneCoordinator({
+      memory,
+      scheduleRender() {},
+    });
+    const opens = [];
+    let contentReads = 0;
+    const sourceConfig = {
+      ...meshConfig,
+      revision: "packed-shared",
+      fetchContent: async () => {
+        contentReads += 1;
+        return new Response(files["root.glb"].slice(0));
+      },
+      contentSourceIdentity: {},
+    };
+    const services = {
+      workers: pool,
+      textureCapabilities: {
+        capabilityKey: "packed-rgba",
+        compressedFormats: [],
+      },
+    };
+    const open = (id, x) => {
+      const pane = document.createElement("div");
+      Object.assign(pane.style, {
+        width: "128px",
+        height: "128px",
+        position: "absolute",
+        inset: 0,
+      });
+      document.body.append(pane);
+      const surface = vtkGenericRenderWindow.newInstance({
+        background: [0, 0, 0],
+      });
+      surface.setContainer(pane);
+      surface.resize();
+      const renderer = surface.getRenderer();
+      const camera = renderer.getActiveCamera();
+      camera.setParallelProjection(true);
+      camera.setPosition(0, 0, 2);
+      camera.setFocalPoint(0, 0, 0);
+      camera.setViewUp(0, 1, 0);
+      camera.setParallelScale(1);
+      camera.setClippingRange(0.01, 10);
+      const rw = surface.getRenderWindow();
+      rw.render();
+      const context = rw.getViews()[0].getContext();
+      const member = createTiles3dMember(
+        coordinator.context(renderer),
+        sourceConfig,
+        services,
+      );
+      const registration = coordinator.register(member, { id });
+      const model = [...identity];
+      model[12] = x;
+      registration.setModelMatrix(model);
+      registration.setCamera(view);
+      const read = (x) => {
+        rw.render();
+        const rgba = new Uint8Array(4);
+        context.readPixels(
+          x,
+          size / 2,
+          1,
+          1,
+          context.RGBA,
+          context.UNSIGNED_BYTE,
+          rgba,
+        );
+        return [...rgba];
+      };
+      opens.push(() => {
+        surface.delete();
+        pane.remove();
+      });
+      return { member, registration, read };
+    };
+    try {
+      const left = open("left", 0);
+      const right = open("right", -0.875);
+      let frameSerial = 0;
+      while (
+        left.member.pick(view, 92, 64)?.status !== "hit" ||
+        right.member.pick(view, 36, 64)?.status !== "hit"
+      ) {
+        if (errors.length) throw new Error(errors.join("\n"));
+        coordinator.prepareFrame(++frameSerial);
+        await new Promise(requestAnimationFrame);
+      }
+      const rendered = [
+        left.read(92),
+        left.read(36),
+        right.read(92),
+        right.read(36),
+      ];
+      left.registration.release();
+      const survivingPixel = right.read(36);
+      right.registration.release();
+      return {
+        contentReads,
+        completedDecodes: pool.stats().completedJobs,
+        rendered,
+        survivingPixel,
+        memory: memory.stats(),
+      };
+    } finally {
+      coordinator.dispose();
+      pool.dispose();
+      opens.forEach((close) => close());
+    }
+  },
   gaussian: async () => {
     const window = vtkGenericRenderWindow.newInstance({
       background: [0, 0, 0],

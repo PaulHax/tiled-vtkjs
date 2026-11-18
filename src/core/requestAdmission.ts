@@ -14,8 +14,20 @@ import {
 
 export type RequestLane = "network" | "compute" | "sort";
 
+export type RequestShare<T> = {
+  readonly scope: object;
+  readonly key: string;
+  /** Reacquire the immutable result while its existing allocation is held. */
+  readonly reuse: (
+    value: T,
+    onLastRelease: () => void,
+  ) => (() => T | undefined) | undefined;
+};
+
 export type RequestStage<T> = {
   readonly lane: RequestLane;
+  /** Optional identity of an initial stage that acquires resources only when started. */
+  readonly share?: RequestShare<T>;
   /** Called before admission. The executor signals when readiness changes. */
   readonly ready?: () => boolean;
   readonly start: (
@@ -125,7 +137,28 @@ type Operation<T> = {
   availability?: number;
   clearTimer?: () => void;
   clearGrace?: () => void;
+  shared?: SharedOperation<T>;
 };
+
+type OperationOutcome<T> = { result: RequestResult<T> } | { error: unknown };
+
+type SharedClaim<T> = {
+  readonly operation: Operation<T>;
+  readonly settle: (outcome: OperationOutcome<T>) => void;
+  readonly change: () => void;
+};
+
+type SharedOperation<T> = {
+  readonly controller: AbortController;
+  readonly claims: Map<Operation<T>, SharedClaim<T>>;
+  readonly remove: () => void;
+  readonly publish: (value: T) => (() => T | undefined) | undefined;
+  started: boolean;
+  active: boolean;
+  stage?: RequestStage<T>;
+};
+
+type SharedResult<T> = { readonly reuse: () => T | undefined };
 
 const systemClock: RequestClock = {
   now: () => Date.now(),
@@ -172,6 +205,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let sortReservations = 0;
   let preferSort = true;
   const owners = new Set<PendingOwner>();
+  const sharedScopes = new WeakMap<object, Map<string, unknown>>();
   const workers = {
     copc: new Set<{ reclaimable?: IdleWorker }>(),
     decode: new Set<{ reclaimable?: IdleWorker }>(),
@@ -274,11 +308,23 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       !!options.retry &&
       isResting(failures.get(key), options.retry, clock.now());
 
+    const detach = (op: Operation<T>): void => {
+      const shared = op.shared;
+      if (!shared) return;
+      op.shared = undefined;
+      shared.claims.delete(op);
+      if (shared.claims.size > 0) return;
+      shared.remove();
+      if (shared.active) shared.controller.abort();
+      else shared.stage?.release?.();
+    };
+
     const remove = (op: Operation<T>): void => {
       if (records.get(op.key) === op) records.delete(op.key);
       op.clearTimer?.();
       op.clearTimer = undefined;
-      if (op.status === "queued") op.stage.release?.();
+      if (op.shared) detach(op);
+      else if (op.status === "queued") op.stage.release?.();
     };
 
     const retry = (op: Operation<T>, delay: number, rest: boolean): void => {
@@ -290,6 +336,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
         if (cancelled || records.get(op.key) !== op || !op.wanted) return;
         op.clearTimer = undefined;
         op.status = "queued";
+        join(op);
         onChange();
         pump();
       }, delay);
@@ -376,16 +423,9 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       safeCall(() => options.onFailed(key, error));
     };
 
-    const finish = (
-      op: Operation<T>,
-      outcome: { result: RequestResult<T> } | { error: unknown },
-    ): void => {
-      const lane = op.stage.lane;
-      running.delete(op.key);
-      charge(lane, -1);
+    const settle = (op: Operation<T>, outcome: OperationOutcome<T>): void => {
       op.clearGrace?.();
       op.clearGrace = undefined;
-      op.stage.release?.();
       const current = records.get(op.key) === op && !disposed;
       if ("result" in outcome) {
         const { result } = outcome;
@@ -410,25 +450,147 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       } else if (current) fail(op, outcome.error);
       refreshRegistration();
       onChange();
+    };
+
+    // Only a claimant that still needs physical work can make an offer.
+    const join = (op: Operation<T>): boolean => {
+      const share = op.stage.share;
+      if (!share || op.shared) return false;
+      let scope = sharedScopes.get(share.scope);
+      if (!scope) {
+        scope = new Map();
+        sharedScopes.set(share.scope, scope);
+      }
+      // Each executor owns its scope and the result type of keys in it.
+      const cached = scope.get(share.key) as
+        | SharedOperation<T>
+        | SharedResult<T>
+        | undefined;
+      let shared: SharedOperation<T> | undefined;
+      if (cached && "reuse" in cached) {
+        const value = cached.reuse();
+        if (value !== undefined) {
+          op.status = "active";
+          queueMicrotask(() => settle(op, { result: { value } }));
+          return true;
+        }
+      } else shared = cached;
+      if (!shared) {
+        const group = scope;
+        shared = {
+          controller: new AbortController(),
+          claims: new Map(),
+          remove: () => group.delete(share.key),
+          publish(value) {
+            const reuse = share.reuse(value, () => {
+              if (group.get(share.key) === result) group.delete(share.key);
+            });
+            if (!reuse) {
+              group.delete(share.key);
+              return undefined;
+            }
+            const result = { reuse };
+            group.set(share.key, result);
+            return reuse;
+          },
+          started: false,
+          active: false,
+        };
+        scope.set(share.key, shared);
+      }
+      if (op.status === "blocked") op.attempt = 0;
+      op.shared = shared;
+      op.status = shared.active ? "active" : "queued";
+      if (shared.started) op.attempt += 1;
+      shared.claims.set(op, {
+        operation: op,
+        settle: (outcome) => settle(op, outcome),
+        change: onChange,
+      });
+      return shared.active;
+    };
+
+    const settleShared = (
+      shared: SharedOperation<T>,
+      outcome: OperationOutcome<T>,
+    ): void => {
+      shared.active = false;
+      const claims = [...shared.claims.values()];
+      const result = "result" in outcome ? outcome.result : undefined;
+      if (result && "next" in result) {
+        if (claims.length === 0) result.next.release?.();
+        else {
+          shared.stage = result.next;
+          for (const { operation } of claims) operation.status = "queued";
+          for (const { change } of claims) change();
+        }
+        return;
+      }
+      shared.claims.clear();
+      shared.stage = undefined;
+      for (const { operation } of claims) operation.shared = undefined;
+      if (!result) {
+        if (claims.length > 0) shared.remove();
+        for (const claim of claims) claim.settle(outcome);
+      } else {
+        const { value } = result;
+        const reuse = claims.length > 0 ? shared.publish(value) : undefined;
+        try {
+          for (const claim of claims)
+            claim.settle({ result: { value: reuse?.() ?? value } });
+        } finally {
+          options.onDiscarded?.(value);
+        }
+      }
+    };
+
+    const finish = (
+      op: Operation<T>,
+      stage: RequestStage<T>,
+      shared: SharedOperation<T> | undefined,
+      outcome: OperationOutcome<T>,
+    ): void => {
+      running.delete(op.key);
+      charge(stage.lane, -1);
+      stage.release?.();
+      if (shared) {
+        const executorStillClaimed = shared.claims.has(op);
+        settleShared(shared, outcome);
+        refreshRegistration();
+        if (!executorStillClaimed) onChange();
+      } else settle(op, outcome);
       pump();
     };
 
     const start = (op: Operation<T>): void => {
-      const lane = op.stage.lane;
-      if (op.status === "blocked") op.attempt = 0;
-      if (op.firstStage) op.attempt += 1;
-      op.status = "active";
+      const shared = op.shared;
+      const stage = shared?.stage ?? op.stage;
+      const signal = (shared?.controller ?? op.controller).signal;
       running.set(op.key, op);
-      charge(lane, 1);
-      onChange();
+      charge(stage.lane, 1);
+      if (shared) {
+        shared.active = true;
+        const claims = [...shared.claims.values()];
+        for (const { operation } of claims) {
+          operation.status = "active";
+          if (!shared.started) operation.attempt += 1;
+        }
+        shared.started = true;
+        for (const { change } of claims) change();
+      } else {
+        if (op.status === "blocked") op.attempt = 0;
+        if (op.firstStage) op.attempt += 1;
+        op.status = "active";
+        onChange();
+      }
       try {
-        op.controller.signal.throwIfAborted();
-        Promise.resolve(op.stage.start(op.controller.signal)).then(
-          (result) => finish(op, { result }),
-          (error: unknown) => finish(op, { error }),
+        signal.throwIfAborted();
+        Promise.resolve(stage.start(signal)).then(
+          (result) => finish(op, stage, shared, { result }),
+          (error: unknown) => finish(op, stage, shared, { error }),
         );
       } catch (error) {
-        finish(op, { error });
+        finish(op, stage, shared, { error });
       }
     };
 
@@ -437,7 +599,6 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
         if (running.size >= concurrency) return undefined;
         for (const op of records.values()) {
           if (
-            op.stage.lane !== lane ||
             !op.wanted ||
             running.has(op.key) ||
             (op.status !== "queued" &&
@@ -450,7 +611,9 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
               ))
           )
             continue;
-          if (op.stage.ready?.() === false) continue;
+          if (join(op)) continue;
+          const stage = op.shared?.stage ?? op.stage;
+          if (stage.lane !== lane || stage.ready?.() === false) continue;
           return { group, priority, start: () => start(op) };
         }
         return undefined;
@@ -461,7 +624,8 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
           if (
             op.wanted &&
             (op.status === "queued" ||
-              (op.status === "blocked" && op.refusal?.retryable))
+              (op.status === "blocked" && op.refusal?.retryable)) &&
+            (!op.shared || op.shared.claims.keys().next().value === op)
           )
             count++;
         return count;
@@ -475,15 +639,21 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       } else if (immediate || grace === 0) {
         op.clearGrace?.();
         op.clearGrace = undefined;
-        op.controller.abort();
-        if (!options.adoptCancelled) records.delete(op.key);
+        if (op.shared) remove(op);
+        else {
+          op.controller.abort();
+          if (!options.adoptCancelled) records.delete(op.key);
+        }
       } else if (!op.clearGrace && grace !== Infinity) {
         const timer = setTimeout(() => {
           op.clearGrace = undefined;
           if (!op.wanted) {
-            op.controller.abort();
-            if (!options.adoptCancelled && records.get(op.key) === op)
-              records.delete(op.key);
+            if (op.shared) remove(op);
+            else {
+              op.controller.abort();
+              if (!options.adoptCancelled && records.get(op.key) === op)
+                records.delete(op.key);
+            }
           }
         }, grace);
         op.clearGrace = () => clearTimeout(timer);
@@ -519,14 +689,19 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       records = ordered;
       for (const op of records.values()) {
         const failure = failures.get(op.key);
-        if (!op.wanted || op.status !== "queued" || !failure || !options.retry)
-          continue;
-        const now = clock.now();
-        const rest = resting(op.key);
-        const delay =
-          retryDelayMs(failure, options.retry, now) -
-          (rest ? 0 : now - failure.lastMs);
-        if (delay > 0) retry(op, delay, rest);
+        if (!op.wanted || op.status !== "queued") continue;
+        if (failure && options.retry) {
+          const now = clock.now();
+          const rest = resting(op.key);
+          const delay =
+            retryDelayMs(failure, options.retry, now) -
+            (rest ? 0 : now - failure.lastMs);
+          if (delay > 0) {
+            retry(op, delay, rest);
+            continue;
+          }
+        }
+        join(op);
       }
       refreshRegistration();
       pump();
@@ -563,6 +738,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
               continue;
             op.status = "queued";
             op.attempt = 0;
+            join(op);
           }
         pump();
       },

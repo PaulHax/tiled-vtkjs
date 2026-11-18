@@ -98,6 +98,8 @@ export type Tiles3dMemberConfig = {
   readonly fetchTileset?: TilesetFetch;
   readonly fetchContent?: ContentQueueFetch;
   readonly fetchSubtree?: ContentQueueFetch;
+  /** Opt custom readers into sharing with the same immutable source and trust configuration. */
+  readonly contentSourceIdentity?: object;
   readonly onError?: (error: unknown) => void;
   readonly onResourceState?: (state: Tiles3dResourceState) => void;
 };
