@@ -1304,11 +1304,6 @@ export const createTiles3dMember = (
       };
     },
 
-    onStall(error) {
-      if (!disposed)
-        setResourceState({ status: "stalled", message: errorMessage(error) });
-    },
-
     applyAllocation(next) {
       if (disposed) return;
       const previousMemoryBudgetBytes = allocation.memoryBudgetBytes;

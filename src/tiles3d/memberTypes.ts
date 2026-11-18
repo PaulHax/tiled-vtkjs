@@ -25,8 +25,7 @@ export type Tiles3dResourceState =
       readonly status: "error" | "unsupported";
       readonly errorName: string;
       readonly message: string;
-    }
-  | { readonly status: "stalled"; readonly message: string };
+    };
 import type {
   TileContentAdapterFactory,
   TileCountLimit,
