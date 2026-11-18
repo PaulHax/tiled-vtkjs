@@ -15,9 +15,14 @@ import { capabilityTarget, loadersBasisFormat } from "./capabilities";
 import { repairMeshoptFallbackOffsets } from "./meshoptFallback";
 import { collectContentBuffers } from "./transfer";
 import { ResourcePolicyError } from "../../core/memoryResources";
-import { decodeGaussian, GAUSSIAN_EXTENSION } from "./gaussian";
+import {
+  decodeGaussian,
+  GAUSSIAN_EXTENSION,
+  gaussianProfileFor,
+} from "./gaussian";
 import {
   decodeSpzGaussian,
+  spzProfileFor,
   SPZ_EXTENSION,
   SPLAT_OPACITY_EXTENSION,
 } from "./spz";
@@ -34,7 +39,11 @@ import type {
   SerializableMaterial,
   SerializableSampler,
 } from "./types";
-import { TileDecodeError, TileUnsupportedExtensionError } from "./types";
+import {
+  TileDecodeError,
+  TileUnsupportedExtensionError,
+  TileUnsupportedGaussianProfileError,
+} from "./types";
 
 type BasisMetadata = {
   width: number;
@@ -2000,8 +2009,11 @@ const primitiveInstanceBytes = (
   return checkedGeometryBytes(bytes);
 };
 
-/** Estimate the active scene without expanding repeated node subtrees. */
-const sceneInstanceBytes = (json: GltfJson): number => {
+/** Visit meshes and estimate the active scene without expanding repeated node subtrees. */
+const sceneInstanceBytes = (
+  json: GltfJson,
+  primitiveBytes: (primitive: GltfPrimitive) => number,
+): number => {
   const scene = requireIndex(json.scenes, json.scene ?? 0, "active scene");
   const estimates = new Map<number, number>();
   const meshEstimates = new Map<number, number>();
@@ -2031,9 +2043,7 @@ const sceneInstanceBytes = (json: GltfJson): number => {
           const mesh = requireIndex(json.meshes, node.mesh, "mesh");
           meshBytes = mesh.primitives.reduce(
             (sum, primitive) =>
-              checkedGeometryBytes(
-                sum + primitiveInstanceBytes(primitive, json),
-              ),
+              checkedGeometryBytes(sum + primitiveBytes(primitive)),
             0,
           );
           meshEstimates.set(node.mesh, meshBytes);
@@ -2068,6 +2078,30 @@ const decodeTileContentInner = async (
   const content = repairMeshoptFallbackOffsets(request.content);
   const originalJson = contentJson(content);
   await options.reserveMemory?.(0);
+  const colorSpaces = request.gaussianColorSpaces;
+  const instanceBytes =
+    options.reserveMemory || colorSpaces
+      ? sceneInstanceBytes(originalJson, (primitive) => {
+          const extension = primitive.extensions?.[GAUSSIAN_EXTENSION] as
+            | { extensions?: Record<string, unknown> }
+            | undefined;
+          if (colorSpaces && extension !== undefined) {
+            const profile =
+              extension?.extensions?.[SPZ_EXTENSION] !== undefined
+                ? spzProfileFor(extension, request.contentUrl)
+                : gaussianProfileFor(extension, request.contentUrl);
+            if (!colorSpaces.includes(profile.colorSpace))
+              throw new TileUnsupportedGaussianProfileError(
+                request.contentUrl,
+                "colorSpace",
+                profile.colorSpace,
+              );
+          }
+          return options.reserveMemory
+            ? primitiveInstanceBytes(primitive, originalJson)
+            : 0;
+        })
+      : 0;
   if (options.reserveMemory) {
     let geometry = 0;
     for (const [index, accessor] of (originalJson.accessors ?? []).entries()) {
@@ -2096,9 +2130,7 @@ const decodeTileContentInner = async (
       }
       geometry += accessor.count * components * 4 * 3;
     }
-    geometry = checkedGeometryBytes(
-      geometry + sceneInstanceBytes(originalJson),
-    );
+    geometry = checkedGeometryBytes(geometry + instanceBytes);
     await options.reserveMemory(geometry);
   }
   validateRequiredExtensions(originalJson, request.contentUrl);

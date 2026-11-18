@@ -4,7 +4,7 @@ import type { MemoryPool } from "../core/memoryPool";
 import type { ResourcePolicyError } from "../core/memoryResources";
 import type { Mat16 } from "../core/mat4";
 import type { CameraView } from "../core/camera";
-import type { DecodedTileContent } from "./decode";
+import type { DecodedTileContent, GaussianAppearanceProfile } from "./decode";
 import type {
   MeshAdapter,
   MeshAdapterOptions,
@@ -54,6 +54,8 @@ export type TileContentAdapter = Omit<
   | "submitTileGroup"
   | "submittedTiles"
 > & {
+  /** Gaussian reconstruction color spaces this adapter can present. */
+  readonly gaussianColorSpaces?: readonly GaussianAppearanceProfile["colorSpace"][];
   presentationMatrix(): Mat16;
   estimateTileBytes(content: DecodedTileContent): number;
   setCamera(view: CameraView): void;

@@ -1164,6 +1164,12 @@ describe("Gaussian admission ownership", () => {
       ]);
       f.adapter.setDrawnTiles(["coarse"]);
       f.adapter.retireTile("fine");
+      await Promise.resolve();
+      f.submissions.prepareFrame(undefined, false);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "fine",
+      ]);
       await f.settle();
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(0);
       expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
@@ -1171,6 +1177,48 @@ describe("Gaussian admission ownership", () => {
       ]);
       expect(f.pool.stats().rendererBytes).toBe(meshBytes);
       expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("does not readmit a retained generation when another member of its group is refused", async () => {
+    const f = fixture(undefined, 4);
+    try {
+      await f.show("kept", 1);
+      expect(f.adapter.retireTile("kept")).toBe(true);
+      const outcome = f.adapter.submitTileGroup(
+        [
+          { id: "kept", content: field(1) },
+          { id: "oversized", content: field(5) },
+        ],
+        [],
+      );
+      expect(outcome).toMatchObject({
+        status: "blocked",
+        refusal: { domain: "count" },
+      });
+      expect(f.adapter.tileState("kept")).toBe("absent");
+      expect(f.adapter.tileState("oversized")).toBe("absent");
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("hides already retired generations as soon as their source is cleared", async () => {
+    const f = fixture();
+    try {
+      await f.show("old", 1, true);
+      expect(f.adapter.retireTile("old")).toBe(true);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(1);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "old",
+      ]);
+      f.adapter.clearTiles();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(0);
+      expect(f.adapter.pickableMeshTiles()).toEqual([]);
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(0);
     } finally {
       f.dispose();
     }

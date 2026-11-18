@@ -37,21 +37,29 @@ type SpzGaussianInput = {
 const finiteArray = (array: Float32Array): boolean =>
   array.every(Number.isFinite);
 
-/** The draft SPZ profile supplies sRGB DC coefficients, logits and log scales. */
-export const decodeSpzGaussian = async (
-  input: SpzGaussianInput,
-): Promise<DecodedGaussianPrimitive> => {
+export const spzProfileFor = (
+  extension: Record<string, unknown>,
+  tileUri: string,
+) => {
   const profile = gaussianProfileFor(
-    { colorSpace: "srgb_rec709_display", ...input.extension },
-    input.tileUri,
+    { colorSpace: "srgb_rec709_display", ...extension },
+    tileUri,
   );
   if (profile.colorSpace !== "srgb_rec709_display") {
     throw new TileUnsupportedGaussianProfileError(
-      input.tileUri,
+      tileUri,
       "SPZ colorSpace",
       profile.colorSpace,
     );
   }
+  return profile;
+};
+
+/** The draft SPZ profile supplies sRGB DC coefficients, logits and log scales. */
+export const decodeSpzGaussian = async (
+  input: SpzGaussianInput,
+): Promise<DecodedGaussianPrimitive> => {
+  const profile = spzProfileFor(input.extension, input.tileUri);
   const fail = (reason: string): never => {
     throw new TileDecodeError(
       input.tileUri,

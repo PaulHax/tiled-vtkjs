@@ -1,3 +1,6 @@
+export const GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE =
+  14 * Float32Array.BYTES_PER_ELEMENT;
+
 export type GaussianBounds = [number, number, number, number, number, number];
 
 /** Stable tuple ranges; retirement is committed only after a draw-order swap. */
@@ -16,7 +19,6 @@ export const createGaussianStorage = () => {
   >();
   let free: { offset: number; count: number }[] = [];
   let pending: [number, number][] = [];
-  let grew = false;
   const packed = new Map<number, GaussianBounds>();
   const progress = new Map<number, { count: number; bounds: GaussianBounds }>();
 
@@ -32,7 +34,7 @@ export const createGaussianStorage = () => {
     coalesce();
     packed.clear();
     progress.clear();
-    grew = true;
+    pending = [];
   };
 
   const coalesce = (): void => {
@@ -68,7 +70,7 @@ export const createGaussianStorage = () => {
       return capacity;
     },
     get bytes() {
-      return capacity * 14 * Float32Array.BYTES_PER_ELEMENT;
+      return capacity * GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE;
     },
     get origin(): [number, number, number] {
       return origin ?? [0, 0, 0];
@@ -130,16 +132,21 @@ export const createGaussianStorage = () => {
       range.count -= count;
       free = free.filter((entry) => entry.count > 0);
       allocations.set(key, allocation);
-      pending.push([allocation.offset, count]);
       return { ...allocation, fresh: true };
     },
     grow,
     isPacked: (revision: number): boolean => packed.has(revision),
     packedBounds: (revision: number) => packed.get(revision),
     packingProgress: (revision: number) => progress.get(revision),
-    markPacked(revision: number, bounds: GaussianBounds): void {
+    markPacked(
+      revision: number,
+      bounds: GaussianBounds,
+      offset: number,
+      count: number,
+    ): void {
       progress.delete(revision);
       packed.set(revision, bounds);
+      pending.push([offset, count]);
     },
     markPartial(revision: number, count: number, bounds: GaussianBounds): void {
       progress.set(revision, { count, bounds });
@@ -158,14 +165,10 @@ export const createGaussianStorage = () => {
         }
       coalesce();
     },
-    updates(): { grew: boolean; ranges: [number, number][] } {
-      const result = { grew, ranges: pending };
+    takePackedUpdates(): [number, number][] {
+      const ranges = pending;
       pending = [];
-      grew = false;
-      return result;
-    },
-    mark(offset: number, count: number): void {
-      pending.push([offset, count]);
+      return ranges;
     },
     clear(): void {
       bufferRevision++;
@@ -180,7 +183,6 @@ export const createGaussianStorage = () => {
       progress.clear();
       free = [];
       pending = [];
-      grew = true;
     },
   };
   return api;

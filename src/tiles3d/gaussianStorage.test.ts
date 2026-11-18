@@ -7,7 +7,6 @@ describe("Gaussian resident tuple ranges", () => {
     const parent = arena.allocate("parent:1", 3);
     arena.positions.set([1, 2, 3, 4, 5, 6, 7, 8, 9], parent.offset * 3);
     const accepted = arena.positions;
-    arena.updates();
     const child = arena.allocate("child:1", 3);
     expect(child.offset).toBeGreaterThanOrEqual(parent.offset + parent.count);
     expect(
@@ -17,10 +16,6 @@ describe("Gaussian resident tuple ranges", () => {
     expect(arena.allocate("parent:1", 3)).toMatchObject({
       offset: parent.offset,
       fresh: false,
-    });
-    expect(arena.updates()).toMatchObject({
-      grew: true,
-      ranges: [[child.offset, 3]],
     });
   });
 
@@ -51,4 +46,26 @@ it("plans the same coalesced growth ranges that allocation will use", () => {
   arena.allocate("c", 6);
   expect(projected).toBe(16);
   expect(projected).toBe(arena.capacity);
+});
+
+it("reports dirty texture ranges only after the reserved tuples are packed", () => {
+  const arena = createGaussianStorage();
+  arena.grow(8);
+  const parent = arena.allocate("parent", 3);
+  const child = arena.allocate("child", 3);
+  arena.markPacked(
+    parent.revision,
+    [0, 1, 0, 1, 0, 1],
+    parent.offset,
+    parent.count,
+  );
+  arena.markPartial(child.revision, 1, [0, 1, 0, 1, 0, 1]);
+  expect(arena.takePackedUpdates()).toEqual([[parent.offset, parent.count]]);
+  arena.markPacked(
+    child.revision,
+    [0, 1, 0, 1, 0, 1],
+    child.offset,
+    child.count,
+  );
+  expect(arena.takePackedUpdates()).toEqual([[child.offset, child.count]]);
 });

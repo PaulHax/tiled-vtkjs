@@ -890,6 +890,9 @@ export const createTiles3dMember = (
         ...new Set(textureCapabilities.compressedFormats),
       ].sort(),
     };
+    const gaussianColorSpaces =
+      adapter.gaussianColorSpaces &&
+      [...new Set(adapter.gaussianColorSpaces)].sort();
     const identity = contentIdentity(sourceConfig);
     const scope = identity && contentScope(workers, identity);
     const rootUrl = workerUrl(`${sourceConfig.endpoint}/`);
@@ -920,6 +923,7 @@ export const createTiles3dMember = (
           ] as DecodeTileRequest["accumulatedTransform"],
           tilesetToScene: sceneTransform,
           textureCapabilities: capabilities,
+          gaussianColorSpaces,
           wasm,
         };
         return {
@@ -933,6 +937,7 @@ export const createTiles3dMember = (
               inputs.accumulatedTransform,
               sceneTransform,
               capabilities,
+              gaussianColorSpaces,
               wasm?.draco?.wrapperUrl,
               wasm?.draco?.wasmUrl,
               wasm?.basis?.encoderUrl,

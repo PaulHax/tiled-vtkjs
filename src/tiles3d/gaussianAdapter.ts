@@ -6,10 +6,6 @@ import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkPointGaussianMapper, {
   type PreparedPointTextures,
 } from "@kitware/vtk.js/Rendering/Core/PointGaussianMapper";
-import {
-  createPointTextureBank,
-  type PointTextureBank,
-} from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
 import vtkRenderPass, {
   type vtkRenderPass as RenderPass,
 } from "@kitware/vtk.js/Rendering/SceneGraph/RenderPass";
@@ -31,6 +27,7 @@ import type {
   DecodedGaussianPrimitive,
   DecodedMeshTileContent,
   DecodedTileContent,
+  GaussianAppearanceProfile,
 } from "./decode";
 import { TileRenderingProfileError } from "./contentAdapter";
 import type {
@@ -55,98 +52,21 @@ import {
   type GaussianSortRange,
 } from "./gaussianSort";
 import {
-  gaussianModelCamera,
-  createGaussianShapeTransform,
-  writeGaussianColor,
-} from "./gaussianGeometry";
-import { createGaussianStorage, type GaussianBounds } from "./gaussianStorage";
-
-type GaussianGpuContext = Pick<
-  PreparedPointTextures,
-  "window" | "context" | "generation"
->;
-
-type GaussianGpuAtlas = ReturnType<typeof createGaussianGpuAtlas>;
-
-/** Geometry occupies stable ranges. Two small sets of presentation textures
- * keep writes for the next view away from the current draw's colors and order.
- */
-const createGaussianGpuAtlas = (
-  context: GaussianGpuContext,
-  positions: Float32Array,
-) => {
-  const geometry = createPointTextureBank(context.window);
-  const makePresentation = () => ({
-    textures: createPointTextureBank(context.window),
-    staticColors: new Set<number>(),
-  });
-  const presentations = [makePresentation(), makePresentation()] as const;
-  let active = 0;
-  const geometryRanges = new Set<number>();
-  return {
-    positions,
-    geometry,
-    geometryRanges,
-    next: () => presentations[1 - active]!,
-    activate() {
-      active = 1 - active;
-    },
-    retireExcept(live: ReadonlySet<number>) {
-      for (const ranges of [
-        geometryRanges,
-        ...presentations.map((draw) => draw.staticColors),
-      ])
-        for (const revision of ranges)
-          if (!live.has(revision)) ranges.delete(revision);
-    },
-    prepared(maximumId: number): PreparedPointTextures {
-      const draw = presentations[1 - active]!.textures;
-      return {
-        ...context,
-        maximumId,
-        bind(program) {
-          geometry.bind(program);
-          draw.bind(program);
-        },
-        unbind() {
-          geometry.unbind();
-          draw.unbind();
-        },
-      };
-    },
-    release() {
-      geometry.release();
-      for (const { textures } of presentations) textures.release();
-    },
-  };
-};
-
-const writeGaussianTexture = (
-  bank: PointTextureBank,
-  name: string,
-  values: Float32Array | Uint32Array,
-  components: number,
-  capacity: number,
-  offset: number,
-  count: number,
-): number => {
-  bank.write(name, values, components, capacity, offset, count);
-  return count * components * values.BYTES_PER_ELEMENT;
-};
-
-const contiguousTupleRanges = (
-  primitives: readonly Pick<PackedPrimitive, "offset" | "count">[],
-): [number, number][] => {
-  const ranges: [number, number][] = [];
-  for (const { offset, count } of [...primitives].sort(
-    (a, b) => a.offset - b.offset,
-  )) {
-    const previous = ranges.at(-1);
-    if (previous && previous[0] + previous[1] === offset) previous[1] += count;
-    else ranges.push([offset, count]);
-  }
-  return ranges;
-};
+  packGaussianRanges,
+  type GaussianAttributes,
+  type GaussianPackedRange,
+} from "./gaussianPacking";
+import {
+  createGaussianGpuAtlas,
+  stageGaussianAttributes,
+  stageGaussianOrder,
+  type GaussianGpuAtlas,
+  type GaussianGpuContext,
+} from "./gaussianPresentation";
+import {
+  createGaussianStorage,
+  GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE,
+} from "./gaussianStorage";
 
 export type GaussianRendererStats = {
   displayedSplats: number;
@@ -250,18 +170,13 @@ type Owner = {
   disposed: boolean;
 };
 
-type PackedPrimitive = {
+type PackedPrimitive = GaussianPackedRange & {
   id: string;
   tile: Tile;
-  primitive: DecodedGaussianPrimitive;
-  matrix: number[];
   allocationKey: string;
-  allocationRevision: number;
-  offset: number;
-  count: number;
 };
 
-type Storage = {
+type Storage = GaussianAttributes & {
   arena: ReturnType<typeof createGaussianStorage>;
   bufferRevision: number;
   signature: string;
@@ -269,10 +184,6 @@ type Storage = {
   tiles: Tile[];
   primitives: PackedPrimitive[];
   origin: [number, number, number];
-  positions: Float32Array;
-  scales: Float32Array;
-  rotations: Float32Array;
-  colors: Float32Array;
   count: number;
   bytes: number;
 };
@@ -295,11 +206,12 @@ type SortSnapshot = {
   count: number;
 };
 
-type SortTarget = {
+type Realization = {
   storage: Storage;
   memory: MemoryLease | undefined;
-  snapshot: SortSnapshot;
 };
+
+type SortTarget = Realization & { snapshot: SortSnapshot };
 
 const tileBuffers = (content: DecodedTileContent) => {
   const buffers = collectContentBuffers(content.primitives);
@@ -347,8 +259,11 @@ const sameSortRanges = (
     );
   });
 
+const gaussianColorSpaces: readonly GaussianAppearanceProfile["colorSpace"][] =
+  ["srgb_rec709_display"];
+
 const validateProfile = (primitive: DecodedGaussianPrimitive): void => {
-  if (primitive.profile.colorSpace !== "srgb_rec709_display")
+  if (!gaussianColorSpaces.includes(primitive.profile.colorSpace))
     throw new GaussianRenderingProfileError(
       `unsupported Gaussian reconstruction colorSpace ${primitive.profile.colorSpace}; shared composition currently requires srgb_rec709_display`,
     );
@@ -364,8 +279,22 @@ const validateProfile = (primitive: DecodedGaussianPrimitive): void => {
     throw new Error("Gaussian placement must be invertible");
 };
 
+const tileAllocationSignature = (tile: Tile): string =>
+  `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`;
+
 const allocationKey = (tile: Tile, index: number): string =>
-  `${tile.key}:${tile.generation}:${tile.owner.placementRevision}/${index}`;
+  `${tileAllocationSignature(tile)}/${index}`;
+
+const allocationSignature = (tiles: readonly Tile[]): string =>
+  tiles.map(tileAllocationSignature).join("|");
+
+const allocationRequests = (tiles: readonly Tile[]) =>
+  tiles.flatMap((tile) =>
+    tile.gaussian.map((primitive, index) => ({
+      key: allocationKey(tile, index),
+      count: primitive.positions.length / 3,
+    })),
+  );
 
 const matchesStorage = (
   value: Storage | null,
@@ -384,25 +313,11 @@ const makeStorage = (
   previous: Storage | null,
   arena: ReturnType<typeof createGaussianStorage>,
 ): Storage => {
-  const signature = tiles
-    .map(
-      (tile) =>
-        `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
-    )
-    .join("|");
+  const signature = allocationSignature(tiles);
   if (previous && matchesStorage(previous, arena, signature)) return previous;
   if (!tiles.length) arena.clear();
   const count = tiles.reduce((sum, tile) => sum + tile.count, 0);
-  arena.grow(
-    arena.requiredCapacity(
-      tiles.flatMap((tile) =>
-        tile.gaussian.map((primitive, index) => ({
-          key: allocationKey(tile, index),
-          count: primitive.positions.length / 3,
-        })),
-      ),
-    ),
-  );
+  arena.grow(arena.requiredCapacity(allocationRequests(tiles)));
   const primitives: PackedPrimitive[] = [];
   const allocationKeys = new Set<string>();
   for (const tile of tiles)
@@ -441,92 +356,6 @@ const makeStorage = (
     bytes: arena.bytes,
   };
 };
-
-function* packStorage(
-  storage: Storage,
-  tuplesPerStep: number,
-  onPacked: () => void,
-) {
-  const priority = (packed: PackedPrimitive) =>
-    packed.tile.id.split("/").length;
-  const ordered = [...storage.primitives].sort(
-    (a, b) => priority(a) - priority(b),
-  );
-  for (const packed of ordered) {
-    const { primitive, matrix, offset, count, allocationRevision } = packed;
-    if (storage.arena.isPacked(allocationRevision)) continue;
-    const { origin } = storage;
-    const transformShape = createGaussianShapeTransform(matrix);
-    const staticCamera = [0, 0, 0] as const;
-    const partial = storage.arena.packingProgress(allocationRevision);
-    const bounds: GaussianBounds = partial?.bounds ?? [
-      Infinity,
-      -Infinity,
-      Infinity,
-      -Infinity,
-      Infinity,
-      -Infinity,
-    ];
-    for (
-      let first = partial?.count ?? 0;
-      first < count;
-      first += tuplesPerStep
-    ) {
-      const end = Math.min(count, first + tuplesPerStep);
-      yield {
-        bytes: (end - first) * 56,
-        run() {
-          for (let index = first; index < end; index++) {
-            const p = index * 3,
-              q = index * 4,
-              destination = offset + index;
-            const x = primitive.positions[p]!,
-              y = primitive.positions[p + 1]!,
-              z = primitive.positions[p + 2]!;
-            storage.positions[destination * 3] =
-              matrix[0]! * x +
-              matrix[4]! * y +
-              matrix[8]! * z +
-              (matrix[12]! - origin[0]);
-            storage.positions[destination * 3 + 1] =
-              matrix[1]! * x +
-              matrix[5]! * y +
-              matrix[9]! * z +
-              (matrix[13]! - origin[1]);
-            storage.positions[destination * 3 + 2] =
-              matrix[2]! * x +
-              matrix[6]! * y +
-              matrix[10]! * z +
-              (matrix[14]! - origin[2]);
-            for (let axis = 0; axis < 3; axis++) {
-              const value = storage.positions[destination * 3 + axis]!;
-              bounds[axis * 2] = Math.min(bounds[axis * 2]!, value);
-              bounds[axis * 2 + 1] = Math.max(bounds[axis * 2 + 1]!, value);
-            }
-            const shape = transformShape(
-              primitive.scales.subarray(p, p + 3),
-              primitive.rotations.subarray(q, q + 4),
-            );
-            storage.scales.set(shape.scales, destination * 3);
-            storage.rotations.set(shape.rotation, destination * 4);
-            if (primitive.harmonicDegree === 0)
-              writeGaussianColor(
-                primitive,
-                index,
-                staticCamera,
-                storage.colors,
-                destination * 4,
-              );
-          }
-          if (end === count) {
-            storage.arena.markPacked(allocationRevision, bounds);
-            onPacked();
-          } else storage.arena.markPartial(allocationRevision, end, bounds);
-        },
-      };
-    }
-  }
-}
 
 const premultipliedGaussianActors = new WeakSet<object>();
 
@@ -732,12 +561,12 @@ const createManager = (
   let stagingGpu: GaussianGpuAtlas | null = null;
   let packing: { storage: Storage; job: Submission } | null = null;
   let allocationJob: Submission | null = null;
-  let publication: {
-    snapshot: SortSnapshot;
-    target: SortTarget;
-    job: Submission;
-    scratch: MemoryLease;
-  } | null = null;
+  let publication:
+    | (SortTarget & {
+        job: Submission;
+        scratch?: MemoryLease;
+      })
+    | null = null;
   let newerPublication = false;
   const idleWaiters = new Set<() => void>();
   let sortAvailability = 0;
@@ -946,6 +775,12 @@ const createManager = (
     for (const owner of owners) safeCall(owner.options.onPresentationChange);
     notify(true);
   };
+  const hideOwner = (owner: Owner): void => {
+    const presented = owner.presented;
+    owner.presented = new Set();
+    owner.mesh.setDrawnTiles([]);
+    hideTiles(presented);
+  };
   const refuse = (
     error: TileSubmissionRefusal,
     tiles: readonly Tile[],
@@ -1058,7 +893,7 @@ const createManager = (
     );
     return count ? count * 32 + 1024 : 0;
   };
-  const compatible = (snapshot: SortSnapshot, target: SortTarget): boolean => {
+  const compatible = (snapshot: SortSnapshot, target: Realization): boolean => {
     const next = target.storage;
     return (
       snapshot.revision >= acceptedSortRevision &&
@@ -1108,7 +943,7 @@ const createManager = (
   const cancelPublication = (): void => {
     if (!publication) return;
     publication.job.cancel();
-    publication.scratch.release();
+    publication.scratch?.release();
     publication = null;
     newerPublication = false;
     if (stagingGpu !== displayedGpu) stagingGpu?.release();
@@ -1118,7 +953,7 @@ const createManager = (
   const commitPresentation = (
     presentation: Pick<GaussianSortPresentation, "cameraPosition">,
     snapshot: SortSnapshot,
-    target: SortTarget,
+    target: Realization,
     order: Uint32Array,
     colorRanges: [number, number][],
     sortElapsedMs: number | null,
@@ -1138,7 +973,7 @@ const createManager = (
       Math.max(0, next.arena.capacity * 4 - order.byteLength),
     );
     const changedStorage = storage !== next;
-    const updates = next.arena.updates();
+    const updates = next.arena.takePackedUpdates();
     const histories: Parameters<
       typeof mapper.setPointAttributeUpdateRanges
     >[0] = {};
@@ -1148,28 +983,28 @@ const createManager = (
         source: polyData.getPoints(),
         values: next.positions,
         components: 3,
-        ranges: updates.ranges,
+        ranges: updates,
       },
       {
         name: "radius" as const,
         source: scaleArray,
         values: next.scales,
         components: 3,
-        ranges: updates.ranges,
+        ranges: updates,
       },
       {
         name: "rotation" as const,
         source: rotationArray,
         values: next.rotations,
         components: 4,
-        ranges: updates.ranges,
+        ranges: updates,
       },
       {
         name: "colors" as const,
         source: colorArray,
         values: next.colors,
         components: 4,
-        ranges: [...updates.ranges, ...colorRanges],
+        ranges: [...updates, ...colorRanges],
       },
     ];
     for (const { name, source, values, components, ranges } of sources) {
@@ -1305,12 +1140,7 @@ const createManager = (
     const retained = sourceTiles();
     if (
       next === candidate &&
-      retained
-        .map(
-          (tile) =>
-            `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
-        )
-        .join("|") !== storage.signature
+      allocationSignature(retained) !== storage.signature
     )
       scheduleRefresh();
   };
@@ -1318,7 +1148,7 @@ const createManager = (
   const publish = (
     presentation: Pick<GaussianSortPresentation, "cameraPosition" | "order">,
     snapshot: SortSnapshot,
-    target: SortTarget,
+    target: Realization,
     sortElapsedMs: number | null,
   ): boolean => {
     if (!compatible(snapshot, target)) return false;
@@ -1348,7 +1178,7 @@ const createManager = (
       return true;
     }
     if (publication) {
-      if (compatible(publication.snapshot, publication.target)) {
+      if (compatible(publication.snapshot, publication)) {
         newerPublication = true;
         return true;
       }
@@ -1358,39 +1188,20 @@ const createManager = (
       sortFailure(new Error("Gaussian sort returned an invalid order length"));
       return true;
     }
-    if (!snapshot.count) {
-      commitPresentation(
-        presentation,
-        snapshot,
-        target,
-        new Uint32Array(),
-        [],
-        sortElapsedMs,
-        null,
-        null,
-      );
-      return true;
-    }
-    if (getOpenGLRenderWindow && !context) return true;
+    if (snapshot.count && getOpenGLRenderWindow && !context) return true;
     const next = target.storage;
-    const capacity = next.positions.length / 3;
-    const colorRanges: [number, number][] = [];
-    let scratch: MemoryLease;
-    try {
-      scratch = memory.retain(
-        [presentation.order.buffer as ArrayBuffer],
-        snapshot.count * 8,
-      );
-    } catch (error) {
-      sortFailure(error);
-      return true;
-    }
+    let scratch: MemoryLease | undefined;
     let order: Uint32Array;
     let drawToStorage: Uint32Array;
     try {
+      if (snapshot.count)
+        scratch = memory.retain(
+          [presentation.order.buffer as ArrayBuffer],
+          snapshot.count * 8,
+        );
       order = new Uint32Array(snapshot.count);
       drawToStorage = new Uint32Array(snapshot.count);
-      scratch.setCpu(
+      scratch?.setCpu(
         [
           presentation.order.buffer,
           order.buffer,
@@ -1399,13 +1210,12 @@ const createManager = (
         0,
       );
     } catch (error) {
-      scratch.release();
+      scratch?.release();
       sortFailure(error);
       return true;
     }
-    let maximumId = -1;
     const failPublication = (error: unknown): void => {
-      scratch.release();
+      scratch?.release();
       publication = null;
       newerPublication = false;
       if (stagingGpu !== displayedGpu) stagingGpu?.release();
@@ -1415,44 +1225,15 @@ const createManager = (
       wakeIdle();
     };
     const steps = function* () {
-      let drawnOffset = 0;
-      for (const packed of snapshot.primitives) {
-        const base = drawnOffset;
-        drawnOffset += packed.count;
-        const step = tuplesPerStep(4);
-        for (let first = 0; first < packed.count; first += step) {
-          const end = Math.min(packed.count, first + step);
-          yield {
-            bytes: (end - first) * 4,
-            run() {
-              for (let index = first; index < end; index++)
-                drawToStorage[base + index] = packed.offset + index;
-            },
-          };
-        }
-      }
-      const orderStep = tuplesPerStep(8);
-      for (let first = 0; first < order.length; first += orderStep) {
-        const end = Math.min(order.length, first + orderStep);
-        yield {
-          bytes: (end - first) * 8,
-          run() {
-            for (let index = first; index < end; index++) {
-              const id = presentation.order[index]!;
-              const offset = drawToStorage[id];
-              if (offset === undefined || offset === 0xffffffff)
-                throw new Error("Gaussian sort returned an invalid draw index");
-              drawToStorage[id] = 0xffffffff;
-              order[index] = offset;
-              maximumId = Math.max(maximumId, offset);
-            }
-          },
-        };
-      }
-
-      // The view installs its live context before draining submission work.
-      // The first write to each texture also allocates its WebGL storage.
-      const windowContext = context;
+      const maximumId = yield* stageGaussianOrder(
+        snapshot.primitives,
+        presentation.order,
+        order,
+        drawToStorage,
+        tuplesPerStep(4),
+        tuplesPerStep(8),
+      );
+      const windowContext = snapshot.count ? context : null;
       if (windowContext) {
         stagingGpu =
           displayedGpu?.positions === next.positions
@@ -1460,140 +1241,27 @@ const createManager = (
             : createGaussianGpuAtlas(windowContext, next.positions);
       }
       const gpu = stagingGpu;
-      const draw = gpu?.next();
-      const changedCamera =
-        latestColorCamera === null ||
-        latestColorCamera.some(
-          (value, index) => value !== presentation.cameraPosition[index],
-        );
-      function* writeAttribute(
-        bank: PointTextureBank,
-        name: string,
-        values: Float32Array,
-        components: number,
-        ranges: readonly [number, number][],
-      ) {
-        const bytesPerTuple = components * values.BYTES_PER_ELEMENT;
-        const step = uploadTuplesPerStep(bytesPerTuple);
-        for (const [offset, count] of ranges)
-          for (let first = 0; first < count; first += step) {
-            const size = Math.min(step, count - first);
-            yield {
-              bytes: size * bytesPerTuple,
-              run() {
-                attributeUploadBytes += writeGaussianTexture(
-                  bank,
-                  name,
-                  values,
-                  components,
-                  capacity,
-                  offset + first,
-                  size,
-                );
-              },
-            };
-          }
-      }
-      if (gpu) {
-        const dirtyGeometry = snapshot.primitives.filter(
-          ({ allocationRevision }) =>
-            !gpu.geometryRanges.has(allocationRevision),
-        );
-        const ranges = contiguousTupleRanges(dirtyGeometry);
-        yield* writeAttribute(
-          gpu.geometry,
-          "pointPositions",
-          next.positions,
-          3,
-          ranges,
-        );
-        yield* writeAttribute(
-          gpu.geometry,
-          "pointRadius",
-          next.scales,
-          3,
-          ranges,
-        );
-        yield* writeAttribute(
-          gpu.geometry,
-          "pointRotation",
-          next.rotations,
-          4,
-          ranges,
-        );
-        for (const { allocationRevision } of dirtyGeometry)
-          gpu.geometryRanges.add(allocationRevision);
-      }
-      const dirtyColors: PackedPrimitive[] = [];
-      for (const packed of snapshot.primitives) {
-        const { allocationRevision, offset, count, primitive } = packed;
-        const harmonic = primitive.harmonicDegree > 0;
-        const colorChanged =
-          harmonic &&
-          (gpu ||
-            changedCamera ||
-            storage !== next ||
-            !displayed.has(packed.tile));
-        if (
-          !colorChanged &&
-          (!draw || draw.staticColors.has(allocationRevision))
-        )
-          continue;
-        const modelCamera = harmonic
-          ? gaussianModelCamera(packed.matrix, presentation.cameraPosition)
-          : null;
-        if (modelCamera) {
-          const step = tuplesPerStep(16);
-          for (let first = 0; first < count; first += step) {
-            const size = Math.min(step, count - first);
-            yield {
-              bytes: size * 16,
-              run() {
-                for (let index = first; index < first + size; index++)
-                  writeGaussianColor(
-                    primitive,
-                    index,
-                    modelCamera,
-                    next.colors,
-                    (offset + index) * 4,
-                  );
-              },
-            };
-          }
-        }
-        if (draw) dirtyColors.push(packed);
-        if (colorChanged) colorRanges.push([offset, count]);
-      }
-      if (draw) {
-        yield* writeAttribute(
-          draw.textures,
-          "pointColors",
-          next.colors,
-          4,
-          contiguousTupleRanges(dirtyColors),
-        );
-        for (const { primitive, allocationRevision } of dirtyColors)
-          if (primitive.harmonicDegree === 0)
-            draw.staticColors.add(allocationRevision);
-        const step = uploadTuplesPerStep(4);
-        for (let first = 0; first < order.length; first += step) {
-          const count = Math.min(step, order.length - first);
-          yield {
-            bytes: count * 4,
-            run() {
-              orderUploadBytes += writeGaussianTexture(
-                draw.textures,
-                "pointOrder",
-                order,
-                1,
-                capacity,
-                first,
-                count,
-              );
-            },
-          };
-        }
-      }
+      const colorRanges = yield* stageGaussianAttributes({
+        attributes: next,
+        ranges: snapshot.primitives,
+        gpu,
+        camera: presentation.cameraPosition,
+        recolor: (packed) =>
+          storage !== next ||
+          !displayed.has(packed.tile) ||
+          !latestColorCamera?.every(
+            (value, axis) => value === presentation.cameraPosition[axis],
+          ),
+        order,
+        colorTuplesPerStep: tuplesPerStep(16),
+        uploadTuplesPerStep,
+        onAttributeUpload: (bytes) => {
+          attributeUploadBytes += bytes;
+        },
+        onOrderUpload: (bytes) => {
+          orderUploadBytes += bytes;
+        },
+      });
       yield {
         bytes: 0,
         requiresPaint: true,
@@ -1624,7 +1292,7 @@ const createManager = (
               scheduleRefresh();
             }
           } finally {
-            scratch.release();
+            scratch?.release();
             wakeIdle();
           }
         },
@@ -1632,7 +1300,8 @@ const createManager = (
     };
     publication = {
       snapshot,
-      target,
+      storage: target.storage,
+      memory: target.memory,
       scratch,
       job: enqueueSubmissionSteps(
         submissions,
@@ -1835,7 +1504,15 @@ const createManager = (
       return true;
     if (packing) return false;
     function* steps() {
-      yield* packStorage(value, tuplesPerStep(56), scheduleRefresh);
+      const depth = (packed: PackedPrimitive) =>
+        packed.tile.id.split("/").length;
+      const ranges = [...value.primitives].sort((a, b) => depth(a) - depth(b));
+      yield* packGaussianRanges(
+        value,
+        ranges,
+        tuplesPerStep(GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE),
+        scheduleRefresh,
+      );
       yield {
         bytes: 0,
         run() {
@@ -2020,7 +1697,7 @@ const createManager = (
       count: visible,
     };
     sortTarget = { storage: targetStorage, memory: targetMemory, snapshot };
-    if (publication && !compatible(publication.snapshot, publication.target))
+    if (publication && !compatible(publication.snapshot, publication))
       cancelPublication();
     setSortScene(ranges);
     const order = cachedOrder;
@@ -2057,7 +1734,7 @@ const createManager = (
     try {
       // A live atlas migration leaves exactly two physical atlases. Keep its
       // eligible upload running and merge new demand after its presentation.
-      if (publication && publication.target.storage.arena !== storage?.arena) {
+      if (publication && publication.storage.arena !== storage?.arena) {
         newerPublication = true;
         return;
       }
@@ -2092,6 +1769,7 @@ const createManager = (
         packing = null;
         displayedGpu?.release();
         displayedGpu = null;
+        mapper.setPreparedPointTextures(null);
         setSortScene([]);
         const empty = makeStorage([], null, arena);
         polyData.getPoints().setData(empty.positions, 3);
@@ -2142,18 +1820,8 @@ const createManager = (
         return;
       }
       if (!camera) return;
-      const requests = nextTiles.flatMap((tile) =>
-        tile.gaussian.map((primitive, index) => ({
-          key: allocationKey(tile, index),
-          count: primitive.positions.length / 3,
-        })),
-      );
-      const signature = nextTiles
-        .map(
-          (tile) =>
-            `${tile.key}:${tile.generation}:${tile.owner.placementRevision}`,
-        )
-        .join("|");
+      const requests = allocationRequests(nextTiles);
+      const signature = allocationSignature(nextTiles);
       if (
         storage &&
         candidate !== storage &&
@@ -2566,16 +2234,14 @@ const createManager = (
           (entry) => !owner.tiles.has(entry.id) && retainedGeneration(entry.id),
         );
         if (retained.length) {
-          for (const entry of retained) {
-            const tile = restoreRetired(entry.id)!;
-            tile.onSubmitted = entry.onSubmitted;
-          }
           const fresh = entries.filter((entry) => !retained.includes(entry));
           const outcome = fresh.length
             ? submit(fresh, replacementIds)
             : "queued";
-          if (outcome === "queued")
+          if (outcome === "queued") {
+            for (const entry of retained) restoreRetired(entry.id);
             for (const entry of retained) safeCall(entry.onSubmitted);
+          }
           return outcome;
         }
         const group: Tile[] = [];
@@ -2664,13 +2330,9 @@ const createManager = (
             (sum, tile) => sum + tile.count,
             0,
           );
-          const storageRequests = combined.flatMap((tile) =>
-            tile.gaussian.map((primitive, index) => ({
-              key: allocationKey(tile, index),
-              count: primitive.positions.length / 3,
-            })),
+          const projectedCapacity = arena.requiredCapacity(
+            allocationRequests(combined),
           );
-          const projectedCapacity = arena.requiredCapacity(storageRequests);
           const finalTiles = combined.filter(
             (tile) => tile.owner !== owner || !replacements.has(tile.id),
           );
@@ -2679,11 +2341,12 @@ const createManager = (
             combined,
             projectedCapacity * gpuBytesPerTuple,
           );
+          const meshDemand = Math.max(
+            owner.mesh.workState().residentBytes,
+            owner.mesh.requiredBytes(),
+          );
           const fullMeshBytes =
-            Math.max(
-              owner.mesh.workState().residentBytes,
-              owner.mesh.requiredBytes(),
-            ) +
+            meshDemand +
             group.reduce((sum, tile) => sum + tile.meshBytes, 0) -
             [...owner.tiles.values()]
               .filter((tile) => replacements.has(tile.id))
@@ -2695,12 +2358,7 @@ const createManager = (
                 memoryPool.stats().totalBytes);
           const finalCapacity = compactReplacement
             ? createGaussianStorage().requiredCapacity(
-                finalTiles.flatMap((tile) =>
-                  tile.gaussian.map((primitive, index) => ({
-                    key: allocationKey(tile, index),
-                    count: primitive.positions.length / 3,
-                  })),
-                ),
+                allocationRequests(finalTiles),
               )
             : projectedCapacity;
           const gaussianBytes = gaussianShare(
@@ -2708,17 +2366,7 @@ const createManager = (
             compactReplacement ? finalTiles : combined,
             finalCapacity * gpuBytesPerTuple,
           );
-          const meshDemand = Math.max(
-            owner.mesh.workState().residentBytes,
-            owner.mesh.requiredBytes(),
-          );
-          const finalBytes =
-            gaussianBytes +
-            meshDemand +
-            group.reduce((sum, tile) => sum + tile.meshBytes, 0) -
-            [...owner.tiles.values()]
-              .filter((tile) => replacements.has(tile.id))
-              .reduce((sum, tile) => sum + tile.meshBytes, 0);
+          const finalBytes = gaussianBytes + fullMeshBytes;
           const finalCount = residentCount + additionalCount - replacedCount;
           const peakCount = residentCount + additionalCount;
           if (finalCount > maximum || peakCount > maximum * 2) {
@@ -2888,6 +2536,7 @@ const createManager = (
         }
       };
       return {
+        gaussianColorSpaces,
         estimateTileBytes,
         presentationMatrix: () => owner.presentedBase,
         requiredBytes: () =>
@@ -2967,14 +2616,9 @@ const createManager = (
           owner.visible = visible;
           owner.visibilityRevision++;
           cancelPublication();
-          if (!visible)
-            hideTiles(
-              new Set([...displayed].filter((tile) => tile.owner === owner)),
-            );
           if (!visible) {
-            owner.presented.clear();
             owner.mesh.setVisible(false);
-            owner.mesh.setDrawnTiles([]);
+            hideOwner(owner);
           }
           safeCall(owner.options.onPresentationChange);
           scheduleRefresh();
@@ -3015,11 +2659,12 @@ const createManager = (
           return [...new Set([...cancelled, ...meshCancelled])];
         },
         clearTiles() {
+          hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.clearTiles();
           owner.failed.clear();
           owner.drawn.clear();
-          owner.presented.clear();
+          safeCall(owner.options.onPresentationChange);
           scheduleRefresh();
         },
         tileState(id) {
@@ -3093,9 +2738,9 @@ const createManager = (
         dispose() {
           if (owner.disposed) return;
           owner.disposed = true;
+          hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.dispose();
-          owner.presented.clear();
           owners.delete(owner);
           if (!owners.size) onEmpty();
           else scheduleRefresh();

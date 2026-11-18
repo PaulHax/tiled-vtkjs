@@ -7,8 +7,9 @@ packed-bundle checks enforce these boundaries.
 
 Core owns `Vec3` and `Bounds`, camera/matrix math, neutral `StreamedMember`
 contracts, the member factory registry, coordinator, view quality governor,
-page memory pool and submission scheduler. The package root and `/core` expose
-this neutral surface. The formats retain different selection algorithms:
+page memory pool, request admission and submission scheduler. The package
+root and `/core` expose the neutral API. The formats retain different
+selection algorithms:
 points use additive parent-closed draw prefixes, while meshes use replacement
 frontiers and sibling admission barriers. They share resource accounting,
 quality allocation and scheduling rather than traversal policy.
@@ -63,9 +64,21 @@ workers.dispose();
 The host owns the decoder pool and can share it across tiles members. Member
 disposal cancels that member's work; it never disposes the host's pool.
 Coordinator disposal releases registrations and members. The page memory pool
-can outlive an individual view. Decoded CPU cache, GPU residency and active draw
-remain separate lifecycles. Point draw-plan changes preserve the existing
-prefix upload behavior; extraction does not add staged GPU upload admission.
+can outlive an individual view. Active source demand, optional CPU cache
+retention, GPU residency and presented coverage have independent lifetimes.
+Views can share live decoded payloads for compatible immutable sources.
+The decoder capabilities and placement inputs are part of that identity.
+
+The submission scheduler shares a time and byte allowance across views. CPU
+packing and dirty-range GPU transfers can run on the owning live view through
+`prepareWork(pageFrame)`. Use `prepareFrame(frameSerial, pageFrame)` immediately
+before rendering to commit staged coverage. Pass the same page frame to sibling
+coordinators that share an allowance. The VTK adapters use live OpenGL render
+windows to stage point ranges, mesh geometry, and Gaussian attribute and
+order ranges. Mesh texture payloads are prepared in scheduler jobs and
+uploaded by VTK during paint. Some allocations are indivisible, including
+texture storage allocation. Hosts without a live window resolver use each
+mapper's paint-time uploads.
 
 ## Memory policy
 
@@ -91,10 +104,13 @@ const usage = memory.stats();
 `totalBytes` bounds estimated managed renderer residency. `cpuBytes` separately
 admits retained CPU buffers and reserved realization arrays; shared backing
 buffers count once. `workBytes` admits conservative estimates of overlapping
-fetch, queued input, decoder workspace and output. A shared FIFO operation
-queue bounds unknown work and remains occupied until physical completion or
-worker termination, including after cancellation. Finished output transfers to
-retained ownership before queued renderer jobs release their source buffers.
+fetch, input buffers, decoder workspace and output. One keyed admission service
+chooses ready network, compute and sort work using current demand priorities and
+fairness across owners. It preserves sort headroom and keeps independent
+persistent-worker limits. Waiting for a memory charge or worker does not occupy
+a running slot. Cancelled work retains its charges until completion,
+acknowledgement or worker termination. Finished output transfers to retained
+ownership before renderer jobs release their references.
 
 The renderer default retains the existing device-memory heuristic and 512 MiB
 fallback. CPU and work limits default to twice that renderer allowance;
@@ -121,16 +137,11 @@ refusals from `error` failures; mesh members also report `stalled`. Blocked stat
 include the domain, requested estimate, configured limit and whether competing
 ownership can make the request feasible. Limit changes retry blocked work;
 intrinsically oversized work does not repeatedly decode under unchanged limits.
-Wanted content whose realization was cancelled and whose decoded payload was
-evicted is fetched again, including content retained only for fallback coverage.
-Recorded admission failures and budget refusals retain their existing retry rules.
-Errors retain their error name and are also delivered to `onError`, preserving
-the distinction between decode/validation errors and allocation failures.
-Cancellation remains an operation-lifetime event. WebGL context loss belongs
-to the host's canvas lifecycle, separately from policy refusal. Retained arrays
-remain available for graphics-resource reconstruction. Hosts own renderer
-recreation after context loss; this policy does not implement automatic WebGL
-context restoration.
+Live demand and accepted coverage maintain their own references to immutable
+payloads. Evicting optional cache entries only affects later reuse. Errors retain
+their names and are delivered to `onError`. For WebGL context changes, hosts
+provide the current render window before draining staged work. Retained arrays
+remain available for reconstructing graphics resources in a new context.
 
 These counters are accounting estimates, not total browser memory or physical
 VRAM measurements. Standard raster dimensions, accessor ranges, COPC records
