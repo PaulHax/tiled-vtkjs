@@ -7,6 +7,7 @@ const vtk = vi.hoisted(() => {
     let data = initial.values ?? new Float32Array();
     let components = initial.numberOfComponents ?? 1;
     let mtime = 0;
+    let mapper: any, pointOrder: any, inputData: any, userMatrix: number[];
     const children = new Map();
     const target = {
       ...initial,
@@ -17,6 +18,22 @@ const vtk = vi.hoisted(() => {
       },
       getData: () => data,
       getNumberOfTuples: () => data.length / components,
+      setMapper(value: any) {
+        mapper = value;
+      },
+      getMapper: () => mapper,
+      setPointOrder(value: any) {
+        pointOrder = value;
+      },
+      getPointOrder: () => pointOrder,
+      setInputData(value: any) {
+        inputData = value;
+      },
+      getInputData: () => inputData,
+      setUserMatrix(value: number[]) {
+        userMatrix = value;
+      },
+      getUserMatrix: () => userMatrix,
       getMTime: () => mtime,
       modified() {
         mtime++;
@@ -53,7 +70,14 @@ import { createMemoryPool } from "../core/memoryPool";
 import { ResourcePolicyError } from "../core/memoryResources";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createGaussianContentAdapterFactory } from "./gaussianAdapter";
-import { createGaussianDistanceSorter } from "./gaussianSort";
+import {
+  createGaussianDistanceSorter,
+  createGaussianSortWorkerBackend,
+  type GaussianSortBackend,
+  type GaussianSortRange,
+  type GaussianSortWorkerLike,
+  type GaussianSortWorkerRequest,
+} from "./gaussianSort";
 import type { DecodedTileContent } from "./decode";
 
 const field = (count: number, mixed = false): DecodedTileContent => ({
@@ -103,8 +127,20 @@ const field = (count: number, mixed = false): DecodedTileContent => ({
   ],
 });
 
-const fixture = () => {
-  const renderer = { addActor() {}, removeActor() {} };
+const fixture = (
+  createSortBackend?: () => GaussianSortBackend,
+  maximumVisibleSplats?: number,
+  maxBytesPerFrame?: number,
+) => {
+  const actors = new Set<any>();
+  const renderer = {
+    addActor(actor: any) {
+      actors.add(actor);
+    },
+    removeActor(actor: any) {
+      actors.delete(actor);
+    },
+  };
   const pool = createMemoryPool({
     totalBytes: 1000000,
     cpuBytes: 1000000,
@@ -114,6 +150,7 @@ const fixture = () => {
   const extraMemory: (typeof memory)[] = [];
   const submissions = createSubmissionScheduler({
     scheduleRender() {},
+    ...(maxBytesPerFrame === undefined ? {} : { maxBytesPerFrame }),
     now: () => 0,
   });
   const distance = createGaussianDistanceSorter();
@@ -122,19 +159,22 @@ const fixture = () => {
   let held = false;
   const pending: (() => void)[] = [];
   const factory = createGaussianContentAdapterFactory({
-    createSortBackend: () => ({
-      sort(job) {
-        const order = distance.sort(job.ranges, job.cameraPosition);
-        return held
-          ? new Promise<Uint32Array>((resolve) =>
-              pending.push(() => resolve(order)),
-            )
-          : Promise.resolve(order);
-      },
-      dispose() {
-        for (const release of pending.splice(0)) release();
-      },
-    }),
+    maximumVisibleSplats,
+    createSortBackend:
+      createSortBackend ??
+      (() => ({
+        sort(job) {
+          const order = distance.sort(job.ranges, job.cameraPosition);
+          return held
+            ? new Promise<Uint32Array>((resolve) => {
+                pending.push(() => resolve(order));
+              })
+            : Promise.resolve(order);
+        },
+        dispose() {
+          for (const release of pending.splice(0)) release();
+        },
+      })),
   });
   const adapter = factory({
     renderer,
@@ -145,17 +185,32 @@ const fixture = () => {
     onError: (error) => errors.push(error),
     onPolicyRefusal: (error) => refusals.push(error),
   });
-  adapter.setCamera({
-    projection: "perspective",
-    fovY: Math.PI / 3,
-    position: [0, 0, 10],
-    viewProj: IDENTITY,
-    viewportWidthCssPx: 100,
-    viewportHeightCssPx: 100,
-  });
+  const move = (x: number) =>
+    adapter.setCamera({
+      projection: "perspective",
+      fovY: Math.PI / 3,
+      position: [x, 0, 10],
+      viewProj: IDENTITY,
+      viewportWidthCssPx: 100,
+      viewportHeightCssPx: 100,
+    });
+  move(0);
+  const drainUntil = async (condition: () => boolean) => {
+    while (!condition()) {
+      submissions.prepareFrame();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+  };
+  const withFrames = async <T>(pending: Promise<T>): Promise<T> => {
+    let done = false;
+    void pending.finally(() => (done = true));
+    await drainUntil(() => done);
+    return pending;
+  };
   const settle = async () => {
-    while (submissions.hasPending()) submissions.prepareFrame();
-    await factory.whenIdle(renderer);
+    let idle = false;
+    void factory.whenIdle(renderer).then(() => (idle = true));
+    await drainUntil(() => idle && !submissions.hasPending());
   };
   return {
     adapter,
@@ -166,6 +221,25 @@ const fixture = () => {
     refusals,
     submissions,
     settle,
+    drainUntil,
+    withFrames,
+    move,
+    drawnX() {
+      for (const actor of actors) {
+        const mapper = actor.getMapper();
+        const order = mapper?.getPointOrder();
+        if (!order) continue;
+        const positions: Float32Array = mapper
+          .getInputData()
+          .getPoints()
+          .getData();
+        return Array.from(
+          order.getData() as Uint32Array,
+          (id) => positions[id * 3]! + actor.getUserMatrix()[12],
+        );
+      }
+      return [];
+    },
     additionalAdapter() {
       const otherMemory = pool.createOwner();
       extraMemory.push(otherMemory);
@@ -190,8 +264,8 @@ const fixture = () => {
       for (const release of pending.splice(0)) release();
     },
     async started() {
-      for (let index = 0; index < 100 && pending.length === 0; index++)
-        await Promise.resolve();
+      await drainUntil(() => pending.length > 0);
+      submissions.prepareFrame();
       expect(pending).toHaveLength(1);
     },
     async show(id: string, count: number, mixed = false) {
@@ -220,12 +294,7 @@ const preparePartial = async (f: ReturnType<typeof fixture>, mixed = false) => {
     "queued",
   );
   await f.settle();
-  expect(f.adapter.submitTile("newB", field(1, mixed), undefined, ["b"])).toBe(
-    "queued",
-  );
-  await f.settle();
   expect(f.adapter.tileState("newA")).toBe("submitted");
-  expect(f.adapter.tileState("newB")).toBe("submitted");
 };
 
 const meshOnly = (): DecodedTileContent => {
@@ -243,6 +312,315 @@ const showMeshParent = async (f: ReturnType<typeof fixture>) => {
   f.adapter.setDrawnTiles(["parent"]);
   await f.settle();
 };
+
+const locatedField = (xs: readonly number[], mixed = false) => {
+  const content = field(xs.length, mixed);
+  const primitive = content.primitives[0]!;
+  xs.forEach((x, index) => {
+    primitive.positions[index * 3] = x;
+  });
+  return content;
+};
+
+const controlledSortWorkers = () => {
+  type Dispatch = {
+    camera: readonly number[];
+    worker: GaussianSortWorkerLike;
+    finish(): void;
+    crash(): void;
+  };
+  let held = false;
+  let started: ((dispatch: Dispatch) => void) | undefined;
+  let pending: Dispatch | undefined;
+  const workers: GaussianSortWorkerLike[] = [];
+  const create = () => {
+    const sorter = createGaussianDistanceSorter();
+    let ranges: readonly GaussianSortRange[] = [];
+    const worker: GaussianSortWorkerLike = {
+      onmessage: null,
+      onerror: null,
+      terminate: vi.fn(),
+      postMessage(message) {
+        const request = message as GaussianSortWorkerRequest;
+        if (request.kind === "scene") {
+          ranges = request.ranges;
+          return;
+        }
+        const deliver = worker.onmessage!;
+        const order = sorter.sort(ranges, request.cameraPosition);
+        const dispatch: Dispatch = {
+          camera: request.cameraPosition,
+          worker,
+          finish() {
+            deliver({
+              data: { kind: "order", jobId: request.jobId, order },
+            } as MessageEvent);
+          },
+          crash() {
+            worker.onerror!({ message: "worker crashed" } as ErrorEvent);
+          },
+        };
+        if (!held) dispatch.finish();
+        else if (started) {
+          const resolve = started;
+          started = undefined;
+          resolve(dispatch);
+        } else pending = dispatch;
+      },
+    };
+    workers.push(worker);
+    return createGaussianSortWorkerBackend(worker);
+  };
+  return {
+    create,
+    workers,
+    hold() {
+      held = true;
+    },
+    next(): Promise<Dispatch> {
+      if (!pending)
+        return new Promise((resolve) => {
+          started = resolve;
+        });
+      const dispatch = pending;
+      pending = undefined;
+      return Promise.resolve(dispatch);
+    },
+  };
+};
+
+describe("Gaussian sort publication", () => {
+  it("publishes captured geometry, order, and meshes while camera and selection keep changing", async () => {
+    const f = fixture();
+    try {
+      f.adapter.submitTile("a", locatedField([0, 2], true));
+      f.adapter.submitTile("b", locatedField([5, 9, 11], true));
+      await f.settle();
+      f.adapter.setDrawnTiles(["a"]);
+      await f.settle();
+
+      f.hold();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      f.move(1);
+      await f.started();
+      f.adapter.setDrawnTiles(["b"]);
+      f.move(7);
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([11, 9, 5, 0, 2]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "a",
+        "b",
+      ]);
+      expect(f.factory.stats(f.renderer)?.pendingSort).toBe(true);
+
+      f.adapter.setDrawnTiles(["a"]);
+      f.move(10);
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([11, 5, 9]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual(["b"]);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.drawnX()).toEqual([0, 2]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual(["a"]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the accepted placement until its replacement sort completes", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1, true);
+      f.hold();
+      f.move(1);
+      await f.started();
+      const revision = f.factory.stats(f.renderer)?.presentationRevision;
+      const matrix = [...IDENTITY];
+      matrix[12] = 10;
+      f.adapter.setBaseMatrix(matrix);
+      f.releaseNext();
+      await f.started();
+      expect(f.factory.stats(f.renderer)?.presentationRevision).toBe(revision);
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.presentationMatrix()[12]).toBe(0);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.drawnX()).toEqual([10]);
+      expect(f.adapter.presentationMatrix()[12]).toBe(10);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the newer mesh selection when a cached order publishes before an in-flight sort", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      f.adapter.submitTile("previous", meshOnly());
+      f.adapter.submitTile("current", meshOnly());
+      await f.settle();
+      f.adapter.setDrawnTiles(["field", "previous"]);
+      await f.settle();
+
+      f.hold();
+      f.move(1);
+      await f.started();
+      f.adapter.setDrawnTiles(["field", "current"]);
+      f.move(0);
+      await f.drainUntil(() =>
+        f.adapter.pickableMeshTiles().some(({ id }) => id === "current"),
+      );
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+      f.releaseNext();
+      await f.started();
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+
+      f.releaseNext();
+      await f.settle();
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "current",
+      ]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps physical work charged and rejects a cleared generation before reusing its slots", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      f.hold();
+      f.move(1);
+      await f.started();
+      const bytes = f.pool.stats().workReservedBytes;
+      expect(bytes).toBeGreaterThan(0);
+      f.adapter.clearTiles();
+      await Promise.resolve();
+      expect(f.drawnX()).toEqual([]);
+      expect(f.pool.stats().workReservedBytes).toBe(bytes);
+      expect(f.adapter.submitTile("field", locatedField([10]))).toBe("queued");
+      f.submissions.prepareFrame();
+      f.releaseNext();
+      await f.started();
+      expect(f.drawnX()).toEqual([]);
+
+      f.release();
+      await f.settle();
+      f.adapter.setDrawnTiles(["field"]);
+      await f.settle();
+      expect(f.drawnX()).toEqual([10]);
+      expect(f.pool.stats().workReservedBytes).toBe(0);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("restarts a crashed worker for the latest coverage and ignores late replies", async () => {
+    const workers = controlledSortWorkers();
+    const f = fixture(workers.create);
+    try {
+      await f.show("parent", 1, true);
+      f.adapter.submitTile("child", locatedField([5, 9], true), undefined, [
+        "parent",
+      ]);
+      await f.settle();
+      workers.hold();
+      f.move(1);
+      const crashed = await workers.next();
+
+      f.adapter.setDrawnTiles(["child"]);
+      f.move(7);
+      crashed.crash();
+      const retry = await f.withFrames(workers.next());
+      expect(crashed.worker.terminate).toHaveBeenCalledOnce();
+      expect(retry.worker).not.toBe(crashed.worker);
+      expect(retry.camera).toEqual([7, 0, 10]);
+      expect(f.pool.stats().activeOperations).toBe(1);
+      crashed.finish();
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "parent",
+      ]);
+
+      retry.finish();
+      await f.settle();
+      expect(f.drawnX()).toEqual([5, 9]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "child",
+      ]);
+      expect(f.pool.stats().workReservedBytes).toBe(0);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("restarts a lazy backend when worker construction fails at dispatch", async () => {
+    const workers = controlledSortWorkers();
+    const unavailable = {
+      sort() {
+        throw new Error("worker construction failed");
+      },
+      dispose: vi.fn(),
+    };
+    const create = vi.fn(workers.create).mockReturnValueOnce(unavailable);
+    const f = fixture(create);
+    try {
+      await f.show("field", 1);
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(unavailable.dispose).toHaveBeenCalledOnce();
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("keeps the last coherent draw and preserves admissions when the restart also fails", async () => {
+    const workers = controlledSortWorkers();
+    const f = fixture(workers.create);
+    try {
+      await f.show("accepted", 1, true);
+      const other = f.additionalAdapter();
+      workers.hold();
+      f.move(1);
+      const crashed = await workers.next();
+      expect(other.submitTile("unrelated", locatedField([9], true))).toBe(
+        "queued",
+      );
+      f.submissions.prepareFrame();
+      crashed.crash();
+      const retry = await f.withFrames(workers.next());
+      retry.crash();
+      await f.settle();
+      expect(other.tileState("unrelated")).toBe("submitted");
+      other.setDrawnTiles(["unrelated"]);
+      f.move(2);
+      await f.settle();
+      expect(workers.workers).toHaveLength(2);
+      expect(f.errors).toHaveLength(2);
+      expect(f.drawnX()).toEqual([0]);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "accepted",
+      ]);
+      expect(f.pool.stats()).toMatchObject({
+        activeOperations: 0,
+        workReservedBytes: 0,
+      });
+    } finally {
+      f.dispose();
+    }
+  });
+});
 
 describe("Gaussian admission ownership", () => {
   it("admits another pure-mesh successor while a retained parent lease is already claimed", async () => {
@@ -365,14 +743,23 @@ describe("Gaussian admission ownership", () => {
       );
       await f.settle();
       f.pool.configure({ totalBytes: bytes * 2, transitionBytes: bytes });
-      expect(f.adapter.submitTile("b", meshOnly(), undefined, ["parent"])).toBe(
-        "budget-blocked",
-      );
+      expect(
+        f.adapter.submitTile("b", meshOnly(), undefined, ["parent"]),
+      ).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "renderer",
+          estimate: {
+            reason: "contention",
+            wake: "availability",
+            finalBytes: bytes * 3,
+            peakBytes: bytes * 3,
+          },
+        },
+      });
       await f.settle();
       expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
       expect(f.pool.stats().rendererBytes).toBe(bytes * 2);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
       expect(f.errors).toEqual([]);
       f.adapter.retireTile("a");
       await f.settle();
@@ -593,17 +980,12 @@ describe("Gaussian admission ownership", () => {
         f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
       ).toBe("queued");
       await f.settle();
-      work.push(await blocker.work(), await blocker.work());
+      work.push(blocker.work(undefined, f.pool.stats().workBytes));
       f.hold();
       const matrix = [...IDENTITY];
       matrix[12] = 0.6;
       f.adapter.setBaseMatrix(matrix);
-      for (
-        let index = 0;
-        index < 100 && f.pool.stats().queuedOperations === 0;
-        index++
-      )
-        await Promise.resolve();
+      await f.drainUntil(() => f.pool.stats().queuedOperations > 0);
       expect(f.pool.stats().queuedOperations).toBe(1);
       matrix[12] = -0.6;
       f.adapter.setBaseMatrix(matrix);
@@ -660,7 +1042,6 @@ describe("Gaussian admission ownership", () => {
             .sort(),
         ).toEqual(mixed ? ["b", "newA"] : []);
         expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
-        expect(f.adapter.tileState("newB")).toBe("submitted");
         expect(f.pool.stats().rendererBytes).toBe(
           f.factory.stats(f.renderer)?.residentBytes,
         );
@@ -680,185 +1061,191 @@ describe("Gaussian admission ownership", () => {
     },
   );
 
-  it.each([false, true])(
-    "updates selected compact coverage placement coherently (mixed=%s)",
-    async (mixed) => {
-      const f = fixture();
-      try {
-        await preparePartial(f, mixed);
-        f.hold();
-        const matrix = [...IDENTITY];
-        matrix[12] = 0.6;
-        f.adapter.setBaseMatrix(matrix);
-        await f.started();
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
-          mixed ? ["a", "b"] : [],
-        );
-        expect(f.adapter.presentationMatrix()[12]).toBe(0);
-        f.release();
-        await f.settle();
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.adapter.pickableMeshTiles().map((tile) => tile.id)).toEqual(
-          mixed ? ["a", "b"] : [],
-        );
-        expect(f.adapter.presentationMatrix()[12]).toBe(0.6);
-        expect(f.adapter.tileState("newA")).toBe("submitted");
-        expect(f.adapter.tileState("newB")).toBe("submitted");
-        expect(f.pool.stats().rendererBytes).toBe(
-          f.factory.stats(f.renderer)?.residentBytes,
-        );
-        expect(f.errors).toEqual([]);
-        expect(f.refusals).toEqual([]);
-        f.dispose();
-        expect(f.pool.stats()).toMatchObject({
-          rendererBytes: 0,
-          cpuRetainedBytes: 0,
-          cpuReservedBytes: 0,
-          activeOperations: 0,
-          owners: 0,
-        });
-      } finally {
-        f.dispose();
-      }
-    },
-  );
-
-  it.each([false, true])(
-    "keeps a promoted selected atlas charged while it remains the resident candidate (mixed=%s)",
-    async (mixed) => {
-      const f = fixture();
-      try {
-        await preparePartial(f, mixed);
-        f.adapter.setDrawnTiles(["newA", "b"]);
-        await f.settle();
-        expect(f.adapter.retireTile("newB")).toBe(true);
-        await f.settle();
-        const resident = f.pool.stats().rendererBytes;
-        expect(resident).toBe(f.factory.stats(f.renderer)?.residentBytes);
-        f.adapter.setDrawnTiles(["a", "b"]);
-        await f.settle();
-        expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-        expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-        expect(f.pool.stats().rendererBytes).toBe(resident + 480);
-        expect(f.pool.stats().rendererBytes).toBe(
-          f.factory.stats(f.renderer)?.residentBytes,
-        );
-        expect(f.adapter.tileState("newA")).toBe("submitted");
-        expect(f.errors).toEqual([]);
-        expect(f.refusals).toEqual([]);
-        f.dispose();
-        expect(f.pool.stats()).toMatchObject({
-          rendererBytes: 0,
-          cpuRetainedBytes: 0,
-          cpuReservedBytes: 0,
-          activeOperations: 0,
-          owners: 0,
-        });
-      } finally {
-        f.dispose();
-      }
-    },
-  );
-
-  it("refuses transition credit from a displayed atlas that remains the main candidate", async () => {
-    const f = fixture();
+  it("publishes a broad ready region while a larger unrelated field is still packing", async () => {
+    const f = fixture(undefined, undefined, 64);
     try {
-      await preparePartial(f);
-      f.adapter.setDrawnTiles(["newA", "b"]);
-      await f.settle();
-      f.adapter.retireTile("newB");
-      await f.settle();
-      expect(f.pool.stats().rendererBytes).toBe(480);
-      f.pool.configure({ totalBytes: 720, transitionBytes: 240 });
-      f.adapter.setDrawnTiles(["a", "b"]);
-      await f.settle();
-      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
-      expect(f.pool.stats().rendererBytes).toBe(480);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
-      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
-      f.adapter.clearRequiredBytes();
-      await f.settle();
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.pool.stats().rendererBytes).toBe(960);
-      expect(f.pool.stats().rendererBytes).toBe(
-        f.factory.stats(f.renderer)?.residentBytes,
-      );
+      await f.show("root/0/0", 1);
+      expect(f.adapter.submitTile("root/2/0/0", field(200))).toBe("queued");
+      await f.drainUntil(() => f.submissions.hasPending());
+      f.submissions.prepareFrame();
+      expect(f.adapter.submitTile("root/1", locatedField([10]))).toBe("queued");
+      await f.drainUntil(() => f.adapter.tileState("root/1") === "submitted");
+      expect(f.adapter.tileState("root/2/0/0")).toBe("queued");
+      f.adapter.setDrawnTiles(["root/1"]);
+      await f.drainUntil(() => f.drawnX()[0] === 10);
+      expect(f.adapter.tileState("root/2/0/0")).toBe("queued");
       expect(f.errors).toEqual([]);
-      f.dispose();
-      expect(f.pool.stats()).toMatchObject({
-        rendererBytes: 0,
-        cpuRetainedBytes: 0,
-        cpuReservedBytes: 0,
-        activeOperations: 0,
-        owners: 0,
-      });
     } finally {
       f.dispose();
     }
   });
 
-  it("releases an unpublished partial-selection atlas when the complete old frontier is reselected", async () => {
+  it("keeps a blocked region while unrelated complete replacements publish", async () => {
     const f = fixture();
     try {
-      await preparePartial(f);
-      const retained = f.pool.stats().rendererBytes;
+      expect(f.adapter.submitTile("left", locatedField([0, 1], true))).toBe(
+        "queued",
+      );
+      expect(
+        f.adapter.submitTile("right", locatedField([20, 21, 22], true)),
+      ).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["left", "right"]);
+      await f.settle();
+      const accepted = f.pool.stats().rendererBytes;
+      // The right group fits after its predecessor is gone, but its atlas
+      // cannot coexist with current coverage under this hard peak.
+      f.pool.configure({ totalBytes: accepted + 2 * 52, transitionBytes: 0 });
+      const blocked = f.adapter.submitTile(
+        "right/0",
+        locatedField([30, 31, 32, 33, 34, 35], true),
+        undefined,
+        ["right"],
+      );
+      expect(blocked).toMatchObject({ status: "blocked" });
+      expect(
+        f.adapter.submitTileGroup(
+          [
+            { id: "left/0", content: locatedField([10], true) },
+            { id: "left/1", content: locatedField([11], true) },
+          ],
+          ["left"],
+        ),
+      ).toBe("queued");
+      await f.settle();
+      f.hold();
+      f.adapter.setDrawnTiles(["left/0", "left/1", "right"]);
+      await f.started();
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["left", "right"]);
+      f.release();
+      await f.settle();
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["left/0", "left/1", "right"]);
+      expect(f.drawnX().sort((a, b) => a - b)).toEqual([10, 11, 20, 21, 22]);
+      expect(f.pool.stats().rendererBytes).toBeLessThanOrEqual(
+        accepted + 2 * 52,
+      );
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+    expect(f.pool.stats()).toMatchObject({
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+      owners: 0,
+    });
+  });
+
+  it("keeps Gaussian coverage until a staged mesh-only replacement is selected", async () => {
+    const f = fixture();
+    try {
+      await f.show("fine", 8, true);
+      const accepted = f.pool.stats().rendererBytes;
+      const meshBytes = f.adapter.estimateTileBytes(meshOnly());
+      f.pool.configure({ totalBytes: meshBytes, transitionBytes: accepted });
+      f.adapter.setResourceCeilingBytes(meshBytes);
+      expect(
+        f.adapter.submitTile("coarse", meshOnly(), undefined, ["fine"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("coarse")).toBe("submitted");
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "fine",
+      ]);
+      f.adapter.setDrawnTiles(["coarse"]);
+      f.adapter.retireTile("fine");
+      await Promise.resolve();
+      f.submissions.prepareFrame(undefined, false);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "fine",
+      ]);
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(0);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "coarse",
+      ]);
+      expect(f.pool.stats().rendererBytes).toBe(meshBytes);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("does not readmit a retained generation when another member of its group is refused", async () => {
+    const f = fixture(undefined, 4);
+    try {
+      await f.show("kept", 1);
+      expect(f.adapter.retireTile("kept")).toBe(true);
+      const outcome = f.adapter.submitTileGroup(
+        [
+          { id: "kept", content: field(1) },
+          { id: "oversized", content: field(5) },
+        ],
+        [],
+      );
+      expect(outcome).toMatchObject({
+        status: "blocked",
+        refusal: { domain: "count" },
+      });
+      expect(f.adapter.tileState("kept")).toBe("absent");
+      expect(f.adapter.tileState("oversized")).toBe("absent");
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("hides already retired generations as soon as their source is cleared", async () => {
+    const f = fixture();
+    try {
+      await f.show("old", 1, true);
+      expect(f.adapter.retireTile("old")).toBe(true);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(1);
+      expect(f.adapter.pickableMeshTiles().map(({ id }) => id)).toEqual([
+        "old",
+      ]);
+      f.adapter.clearTiles();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(0);
+      expect(f.adapter.pickableMeshTiles()).toEqual([]);
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(0);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("releases canceled compact scratch while the old frontier remains pickable", async () => {
+    const f = fixture();
+    try {
+      await preparePartial(f, true);
       f.hold();
       f.adapter.setDrawnTiles(["newA", "b"]);
       await f.started();
-      expect(f.pool.stats().rendererBytes).toBe(retained + 480);
+      f.adapter.retireTile("newA");
       f.adapter.setDrawnTiles(["a", "b"]);
-      for (
-        let index = 0;
-        index < 100 && f.pool.stats().rendererBytes !== retained;
-        index++
-      )
-        await Promise.resolve();
-      expect(f.pool.stats().rendererBytes).toBe(retained);
       f.release();
       await f.settle();
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["a", "b"]);
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.errors).toEqual([]);
-      expect(f.refusals).toEqual([]);
-    } finally {
-      f.dispose();
-    }
-  });
-
-  it("retains complete compact coverage when partial-selection overlap is refused, then retries", async () => {
-    const f = fixture();
-    try {
-      await preparePartial(f);
-      f.pool.configure({ totalBytes: 960, transitionBytes: 0 });
-      f.adapter.setDrawnTiles(["newA", "b"]);
-      await f.settle();
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
-      expect(f.adapter.stats().drawnTileIds).toEqual(["a", "b"]);
-      expect(f.pool.stats().rendererBytes).toBe(960);
-      expect(f.refusals).toHaveLength(1);
-      expect(f.refusals[0]).toBeInstanceOf(ResourcePolicyError);
-      f.pool.configure({ totalBytes: 1440 });
-      f.adapter.clearRequiredBytes();
-      await f.settle();
-      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
-      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual(["b", "newA"]);
       expect(f.pool.stats().rendererBytes).toBe(
         f.factory.stats(f.renderer)?.residentBytes,
       );
       expect(f.errors).toEqual([]);
-      f.dispose();
-      expect(f.pool.stats()).toMatchObject({
-        rendererBytes: 0,
-        cpuRetainedBytes: 0,
-        cpuReservedBytes: 0,
-        activeOperations: 0,
-        owners: 0,
-      });
     } finally {
       f.dispose();
     }
@@ -938,6 +1325,55 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("releases a failed mixed realization and keeps the accepted parent", async () => {
+    const f = fixture();
+    try {
+      await f.show("parent", 2);
+      const before = f.pool.stats().rendererBytes;
+      f.renderer.addActor = () => {
+        throw new Error("mesh attachment failed");
+      };
+      expect(
+        f.adapter.submitTile("child", field(1, true), undefined, ["parent"]),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.tileState("child")).toBe("failed");
+      expect(f.adapter.stats()).toMatchObject({
+        drawnTileIds: ["parent"],
+        pendingTiles: 0,
+      });
+      expect(f.pool.stats().rendererBytes).toBe(before);
+      expect(f.errors).toEqual([new Error("mesh attachment failed")]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("refuses an over-count representation independently of renderer memory", async () => {
+    const f = fixture(undefined, 2);
+    try {
+      await f.show("parent", 2);
+      const before = f.pool.stats().rendererBytes;
+      expect(
+        f.adapter.submitTile("child", field(3), undefined, ["parent"]),
+      ).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "count",
+          finalCount: 3,
+          peakCount: 5,
+          limitCount: 2,
+          wake: "selection",
+        },
+      });
+      expect(f.adapter.stats().drawnTileIds).toEqual(["parent"]);
+      expect(f.pool.stats().rendererBytes).toBe(before);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("preserves coverage on transition refusal and recovers when overlap capacity increases", async () => {
     const f = fixture();
     try {
@@ -955,7 +1391,18 @@ describe("Gaussian admission ownership", () => {
           },
           ["detail"],
         );
-      expect(submit()).toBe("budget-blocked");
+      expect(submit()).toMatchObject({
+        status: "blocked",
+        refusal: {
+          domain: "renderer",
+          estimate: {
+            reason: "transition-unavailable",
+            wake: "policy",
+            finalBytes: 60,
+            peakBytes: 540,
+          },
+        },
+      });
       await f.settle();
       expect(f.pool.stats().rendererBytes).toBe(480);
       expect(f.pool.stats().cpuRetainedBytes).toBe(baseline);
@@ -1036,6 +1483,65 @@ describe("Gaussian admission ownership", () => {
       );
       expect(f.adapter.tileState("retry")).toBe("submitted");
       expect(f.adapter.stats().drawnTileIds).toEqual(["field"]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("redraws a readmitted parent after retiring its detailed children", async () => {
+    const f = fixture();
+    try {
+      await f.show("root", 3);
+      const children = ["root/0", "root/1"];
+      expect(
+        f.adapter.submitTileGroup(
+          children.map((id) => ({ id, content: field(3) })),
+          ["root"],
+        ),
+      ).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(children);
+      f.adapter.retireTile("root");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(children);
+      f.move(100);
+      expect(
+        f.adapter.submitTile(
+          "root",
+          field(3),
+          () => {
+            for (const child of children) f.adapter.retireTile(child);
+            f.adapter.setDrawnTiles(["root"]);
+          },
+          children,
+        ),
+      ).toBe("queued");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["root"]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("retires part of a frontier without reuploading its accepted geometry", async () => {
+    const f = fixture();
+    try {
+      await f.show("a", 8);
+      expect(f.adapter.submitTile("b", field(5))).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      const before = f.factory.stats(f.renderer)?.attributeUploadBytes;
+      f.adapter.retireTile("b");
+      await f.settle();
+      expect(f.adapter.stats().drawnTileIds).toEqual(["a"]);
+      expect(f.factory.stats(f.renderer)).toMatchObject({
+        displayedSplats: 8,
+        attributeUploadBytes: before,
+        pendingPreparation: false,
+      });
       expect(f.errors).toEqual([]);
     } finally {
       f.dispose();

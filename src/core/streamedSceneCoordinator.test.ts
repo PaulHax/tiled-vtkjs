@@ -71,6 +71,73 @@ const makeMember = (overrides: Partial<GovernorInputs> = {}) => {
 };
 
 describe("createStreamedSceneCoordinator", () => {
+  it("wakes a member when a later member frees renderer capacity during preparation", async () => {
+    const memory = createMemoryPool({ totalBytes: 1000 });
+    const owner = memory.createOwner();
+    const retained = owner.reserveRenderer(500);
+    const schedulePreparation = vi.fn();
+    const coordinator = makeCoordinator({ memory, schedulePreparation });
+    const blocked = makeMember();
+    const releasing = makeMember();
+    let refined = false;
+    blocked.prepareFrame.mockImplementation(() => {
+      refined ||= memory.stats().rendererBytes === 0;
+    });
+    releasing.prepareFrame.mockImplementationOnce(() => retained.release());
+    coordinator.register(blocked);
+    coordinator.register(releasing);
+    await settle();
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(10);
+    expect(refined).toBe(false);
+    await settle();
+    expect(schedulePreparation).toHaveBeenCalledOnce();
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(11);
+    expect(refined).toBe(true);
+    await settle();
+    expect(schedulePreparation).not.toHaveBeenCalled();
+    coordinator.dispose();
+    owner.close();
+  });
+
+  it("requests another drain when preparation follows a budget-limited paint", () => {
+    let preparationPending = false;
+    const coordinator = makeCoordinator({
+      schedulePreparation: () => {
+        preparationPending = true;
+      },
+    });
+    const member = makeMember();
+    coordinator.register(member);
+    const { submissions } = coordinator.context({});
+    const painted = vi.fn();
+    const deferred = vi.fn();
+    submissions.enqueue({
+      bytes: submissions.stats().maxBytesPerFrame,
+      run: painted,
+    });
+    submissions.enqueue({ bytes: 1, run: deferred });
+    expect(preparationPending).toBe(true);
+
+    coordinator.prepareFrame(1, 10);
+    expect(painted).toHaveBeenCalledOnce();
+    expect(deferred).not.toHaveBeenCalled();
+    expect(preparationPending).toBe(true);
+
+    preparationPending = false;
+    coordinator.prepareWork(10);
+    expect(member.prepareFrame).toHaveBeenCalledOnce();
+    expect(deferred).not.toHaveBeenCalled();
+    expect(preparationPending).toBe(true);
+
+    coordinator.prepareWork(11);
+    expect(deferred).toHaveBeenCalledOnce();
+    coordinator.dispose();
+  });
+
   it.each(["hide", "release"])(
     "remeasures after an active peer is removed by %s",
     (action) => {
@@ -863,6 +930,43 @@ describe("createStreamedSceneCoordinator", () => {
     await settle();
     expect(hung.onStall).toHaveBeenCalledOnce();
     coordinator.dispose();
+  });
+
+  it("shares submission allowance on one page frame and rotates the first paint grant", () => {
+    const memory = createMemoryPool({ totalBytes: 1_000 });
+    const first = makeCoordinator({ memory });
+    const second = makeCoordinator({ memory });
+    const contextA = first.context({});
+    const contextB = second.context({});
+    const frameBytes = contextA.submissions.stats().maxBytesPerFrame;
+    const log: string[] = [];
+    let boundContext = "";
+    const enqueue = (context: typeof contextA, view: string) =>
+      context.submissions.enqueue({
+        bytes: frameBytes,
+        run: () => log.push(`${view}:${boundContext}`),
+      });
+    enqueue(contextA, "A");
+    enqueue(contextA, "A");
+    enqueue(contextB, "B");
+
+    boundContext = "A";
+    first.prepareFrame(10, 100);
+    boundContext = "B";
+    second.prepareFrame(1, 100);
+    expect(log).toEqual(["A:A"]);
+    boundContext = "A";
+    first.prepareFrame(11, 116);
+    expect(log).toEqual(["A:A"]);
+    boundContext = "B";
+    second.prepareFrame(2, 116);
+    expect(log).toEqual(["A:A", "B:B"]);
+    boundContext = "A";
+    first.prepareFrame(12, 132);
+    expect(log).toEqual(["A:A", "B:B", "A:A"]);
+
+    first.dispose();
+    second.dispose();
   });
 
   it("shares one page pool across independent view coordinators", () => {

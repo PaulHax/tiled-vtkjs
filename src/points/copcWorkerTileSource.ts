@@ -1,3 +1,7 @@
+import {
+  getPageRequestAdmission,
+  type RequestAdmission,
+} from "../core/requestAdmission";
 import type { CopcNodeEntry } from "./copcTileSource";
 import type {
   CopcWorkerError,
@@ -9,6 +13,7 @@ import type { LoadOptions, NodeInfo, TileData, TileSource } from "./tileSource";
 
 export type CopcWorkerTileSourceOptions = {
   readonly signal?: AbortSignal;
+  readonly admission?: RequestAdmission;
   /** Remote COPC URL or a local file/blob sent to the source workers. */
   readonly source: string | Blob;
   /** A fresh module worker, owned and terminated by the returned source. */
@@ -21,6 +26,15 @@ export type CopcWorkerTileSourceOptions = {
    */
   readonly workers?: number;
 };
+
+export class CopcWorkerCapacityError extends Error {
+  constructor() {
+    super(
+      "All page COPC hierarchy worker slots are occupied. Close a COPC source before opening another.",
+    );
+    this.name = "CopcWorkerCapacityError";
+  }
+}
 
 type PendingRequest = {
   readonly resolve: (response: CopcWorkerResponse) => void;
@@ -66,7 +80,12 @@ const defaultWorkerCount = (): number => {
  * lifetime as its real concurrency ceiling even when an abort arrives during
  * synchronous WASM decoding.
  */
-const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
+const openChannel = (
+  worker: Worker,
+  fail: (error: Error) => void,
+  settled: () => void,
+  release: () => void,
+): Channel => {
   const pending = new Map<number, PendingRequest>();
   let closed = false;
 
@@ -85,6 +104,7 @@ const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
     } else {
       request.resolve(event.data);
     }
+    settled();
   };
   const onError = (event: ErrorEvent): void =>
     fail(new Error(event.message || "COPC worker failed"));
@@ -103,7 +123,11 @@ const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
           const current = pending.get(request.id);
           if (current === undefined || current.aborted) return;
           current.aborted = true;
-          worker.postMessage({ type: "cancel", id: request.id });
+          try {
+            worker.postMessage({ type: "cancel", id: request.id });
+          } catch {
+            fail(new Error("Could not cancel COPC worker request"));
+          }
         };
         pending.set(request.id, {
           resolve,
@@ -113,7 +137,11 @@ const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
           aborted: false,
         });
         signal?.addEventListener("abort", onAbort, { once: true });
-        worker.postMessage(request);
+        try {
+          worker.postMessage(request);
+        } catch {
+          fail(new Error("Could not send COPC worker request"));
+        }
       });
     },
     inFlight: () => pending.size,
@@ -129,6 +157,7 @@ const openChannel = (worker: Worker, fail: (error: Error) => void): Channel => {
       }
       pending.clear();
       worker.terminate();
+      release();
     },
   };
 };
@@ -149,9 +178,11 @@ export const createCopcWorkerTileSource = async (
   options: CopcWorkerTileSourceOptions,
 ): Promise<TileSource> => {
   options.signal?.throwIfAborted();
+  const admission = options.admission ?? getPageRequestAdmission();
+  const lifetime = new AbortController();
   const workerCount = Math.max(
     1,
-    Math.floor(options.workers ?? defaultWorkerCount()),
+    Math.min(4, Math.floor(options.workers ?? defaultWorkerCount())),
   );
   const lazPerfWasmUrl = options.lazPerfWasmUrl ?? defaultWasmUrl();
   const channels = new Set<Channel>();
@@ -161,20 +192,48 @@ export const createCopcWorkerTileSource = async (
   const teardown = (error: unknown): void => {
     if (disposed) return;
     disposed = true;
+    lifetime.abort(error);
     for (const channel of channels) channel.close(error);
+    channels.clear();
   };
-
-  const hierarchy = openChannel(options.createWorker(), teardown);
-  channels.add(hierarchy);
   const abortOpen = (): void => teardown(abortReason(options.signal));
   options.signal?.addEventListener("abort", abortOpen, { once: true });
+  let hierarchy!: Channel;
   let opened: CopcWorkerResponse;
   try {
-    opened = await hierarchy.send({
-      type: "open",
-      id: ++nextId,
-      source: options.source,
-      lazPerfWasmUrl,
+    opened = await admission.run({
+      signal: lifetime.signal,
+      stage: {
+        lane: "compute",
+        ready: () =>
+          admission.canAcquireWorker("copc") ||
+          admission.workerCapacityPinned("copc"),
+        async start(signal) {
+          signal.throwIfAborted();
+          const release = admission.acquireWorker("copc");
+          if (!release) throw new CopcWorkerCapacityError();
+          try {
+            hierarchy = openChannel(
+              options.createWorker(),
+              teardown,
+              admission.wake,
+              release,
+            );
+            channels.add(hierarchy);
+          } catch (error) {
+            release();
+            throw error;
+          }
+          return {
+            value: await hierarchy.send({
+              type: "open",
+              id: ++nextId,
+              source: options.source,
+              lazPerfWasmUrl,
+            }),
+          };
+        },
+      },
     });
   } catch (error) {
     teardown(error);
@@ -200,52 +259,85 @@ export const createCopcWorkerTileSource = async (
     const index = decoders.indexOf(decoder);
     if (index >= 0) decoders.splice(index, 1);
   };
-  for (let index = 1; index < workerCount; index += 1) {
-    let worker: Worker;
-    try {
-      worker = options.createWorker();
-    } catch {
-      // Extra decoders only add capacity. Keep the already-open source usable
-      // if the browser cannot allocate another worker.
-      break;
-    }
-    const decoder: Channel = openChannel(worker, (error) =>
-      drop(decoder, error),
-    );
-    channels.add(decoder);
-    decoder
-      .send({
-        type: "open-decoder",
-        id: ++nextId,
-        source: options.source,
-        lazPerfWasmUrl,
-        state,
-      })
-      .then(
-        () => {
-          if (channels.has(decoder)) decoders.push(decoder);
+  let constructorFailed = false;
+  const openDecoder = async (): Promise<boolean> => {
+    if (!admission.canAcquireWorker("copc", false)) return false;
+    return admission.run({
+      signal: lifetime.signal,
+      stage: {
+        lane: "compute",
+        async start(signal) {
+          signal.throwIfAborted();
+          if (constructorFailed) return { value: false };
+          let decoder: Channel | undefined;
+          const release = admission.acquireWorker(
+            "copc",
+            {
+              idle: () => decoder !== undefined && decoder.inFlight() === 0,
+              retire: () => {
+                if (decoder) drop(decoder, new Error("COPC decoder retired"));
+              },
+            },
+            false,
+          );
+          if (!release) return { value: false };
+          try {
+            decoder = openChannel(
+              options.createWorker(),
+              (error) => {
+                if (decoder) drop(decoder, error);
+              },
+              admission.wake,
+              release,
+            );
+            channels.add(decoder);
+            await decoder.send({
+              type: "open-decoder",
+              id: ++nextId,
+              source: options.source,
+              lazPerfWasmUrl,
+              state,
+            });
+            if (channels.has(decoder)) decoders.push(decoder);
+            return { value: true };
+          } catch (error) {
+            if (decoder) drop(decoder, error);
+            else {
+              release();
+              constructorFailed = true;
+            }
+            return { value: false };
+          }
         },
-        (error: unknown) => drop(decoder, error),
-      );
+      },
+    });
+  };
+  // Extra codec workers are optional and yield to page limits and source lifetimes.
+  for (let index = 1; index < workerCount; index += 1) {
+    if (!admission.canAcquireWorker("copc", false)) break;
+    void openDecoder().catch(() => {});
   }
 
   /** The file location of each node the hierarchy reads have described. */
   const entries = new Map<string, CopcNodeEntry>();
   const rootKey = keyToString(ROOT_KEY);
 
+  const channelFor = (key: VoxelKey): Channel => {
+    const keyString = keyToString(key);
+    let channel = hierarchy;
+    // The hierarchy worker holds the root sample and the only hierarchy state.
+    if (keyString !== rootKey && entries.has(keyString)) {
+      for (const decoder of decoders)
+        if (decoder.inFlight() < channel.inFlight()) channel = decoder;
+    }
+    return channel;
+  };
+
   const tileRequest = (
     key: VoxelKey,
   ): { readonly channel: Channel; readonly request: CopcWorkerRequest } => {
-    const keyString = keyToString(key);
-    // The root stays with the hierarchy worker, which kept its decoded points
-    // from the colour sample.
-    const entry = keyString === rootKey ? undefined : entries.get(keyString);
-    let channel = hierarchy;
-    if (entry !== undefined) {
-      for (const decoder of decoders) {
-        if (decoder.inFlight() < channel.inFlight()) channel = decoder;
-      }
-    }
+    const channel = channelFor(key);
+    const entry = entries.get(keyToString(key));
     const id = ++nextId;
     return channel === hierarchy
       ? { channel, request: { type: "load-tile", id, key } }
@@ -253,6 +345,13 @@ export const createCopcWorkerTileSource = async (
   };
 
   return {
+    admission,
+    hierarchyLane: "compute",
+    tileLane: "compute",
+    canRead: (kind, key) => {
+      const channel = kind === "hierarchy" ? hierarchy : channelFor(key);
+      return disposed || channel.inFlight() === 0;
+    },
     metadata: () => metadata,
 
     async nodes(key: VoxelKey, load?: LoadOptions): Promise<NodeInfo[]> {

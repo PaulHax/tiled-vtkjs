@@ -37,6 +37,7 @@ export const createMeshContentAdapter: TileContentAdapterFactory = (
   };
   return {
     ...adapter,
+    gaussianColorSpaces: [],
     setCamera() {},
     presentationMatrix: () => placement,
     setBaseMatrix(matrix) {

@@ -61,6 +61,7 @@ export {
   createGaussianDistanceSorter,
   createGaussianSortController,
   createGaussianSortWorkerBackend,
+  GaussianSortWorkerError,
   type GaussianCameraPosition,
   type GaussianSortBackend,
   type GaussianSortJob,

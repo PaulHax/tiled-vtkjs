@@ -224,6 +224,8 @@ export type DecodeTileRequest = {
   accumulatedTransform: Mat4;
   tilesetToScene: Mat4;
   textureCapabilities: TextureCapabilities;
+  /** Omit to decode any supported Gaussian color space. Empty excludes splats. */
+  gaussianColorSpaces?: readonly GaussianAppearanceProfile["colorSpace"][];
   wasm?: DecodeWasmUrls;
 };
 
@@ -234,13 +236,13 @@ export type DecodeJob = {
 
 /** Minimal pool surface supplied to renderer-neutral members. */
 export type DecodeWorkerPoolHandle = {
+  hasCapacity?(): boolean;
   decode(
     request: DecodeTileRequest,
     options?: { readonly memory?: MemoryWork },
   ): DecodeJob;
   stats?(): {
     readonly size: number;
-    readonly queuedJobs: number;
     readonly activeJobs: number;
     readonly completedJobs: number;
     readonly failedJobs: number;

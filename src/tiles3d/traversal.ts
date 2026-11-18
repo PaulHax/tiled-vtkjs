@@ -57,6 +57,8 @@ export type TilesetTraversalOptions = {
   /** Maximum-axis 3D Tiles convention, or local XY for terrain-derived error. */
   readonly geometricErrorScale?: GeometricErrorScale;
   readonly readiness: (tileId: string) => TileReadiness;
+  /** Physical publication when it follows logical admission asynchronously. */
+  readonly presented?: (tileId: string) => boolean;
   /**
    * Whether a contentful tile may still be refined past, default true.
    *
@@ -67,6 +69,8 @@ export type TilesetTraversalOptions = {
    * of being refined past into content that will be requested forever.
    */
   readonly refinable?: (tileId: string) => boolean;
+  /** Skip this content representation and seek coverage below it. */
+  readonly unavailable?: (tileId: string) => boolean;
   /** Immutable hierarchy state sampled at the beginning of this pass. */
   readonly subtrees?: SubtreeHierarchyState | null;
 };
@@ -78,6 +82,7 @@ export type TilesetTraversalResult = {
   readonly requestedTileIds: readonly string[];
   /** Submitted draw set with REPLACE fallback applied. */
   readonly drawnTileIds: readonly string[];
+  readonly recoveringCoverage: boolean;
   readonly effectiveScreenSpaceErrorPx: number;
   /**
    * Screen-space error of the root's own content, before refinement.
@@ -188,6 +193,10 @@ const screenSpaceError = (
 type VisitResult = {
   readonly visible: boolean;
   readonly coverageSubmitted: boolean;
+  readonly coveragePresented: boolean;
+  readonly recoveringCoverage?: boolean;
+  /** False when complete coverage requires an excluded representation. */
+  readonly coveragePossible: boolean;
   readonly desired: string[];
   readonly requested: string[];
   readonly drawn: string[];
@@ -196,6 +205,7 @@ type VisitResult = {
 type MaterializedHierarchy = {
   readonly root: TilesetTile;
   readonly tileById: ReadonlyMap<string, TilesetTile>;
+  readonly subtreeRequestByTileId: ReadonlyMap<string, TileContentRequest>;
   readonly unknownRequestByTileId: ReadonlyMap<string, TileContentRequest>;
 };
 
@@ -252,6 +262,7 @@ const explicitHierarchy = (root: TilesetTile): MaterializedHierarchy => {
   return {
     root,
     tileById,
+    subtreeRequestByTileId: new Map(),
     unknownRequestByTileId: new Map(),
   };
 };
@@ -262,6 +273,7 @@ const implicitHierarchy = (
 ): MaterializedHierarchy => {
   const descriptor = documentRoot.implicitTiling!;
   const tileById = new Map<string, TilesetTile>();
+  const subtreeRequestByTileId = new Map<string, TileContentRequest>();
   const unknownRequestByTileId = new Map<string, TileContentRequest>();
   const entryById = new Map(
     snapshot?.entries.map((entry) => [entry.id, entry]) ?? [],
@@ -355,6 +367,7 @@ const implicitHierarchy = (
         implicitAddress: address,
         ...(address.level === 0 ? { implicitTiling: descriptor } : {}),
       });
+      subtreeRequestByTileId.set(id, request);
       tileById.set(id, tile);
       return tile;
     };
@@ -373,6 +386,7 @@ const implicitHierarchy = (
   return {
     root: buildSubtree(rootAddress, documentRoot.boundingVolume),
     tileById,
+    subtreeRequestByTileId,
     unknownRequestByTileId,
   };
 };
@@ -472,15 +486,19 @@ const traverseHierarchy = (
         hasSubmittedDescendant(child),
     );
 
-  // Where each visible tile sits in the request order: coarser levels first,
-  // so a view never waits on detail while it still has holes, then nearest
-  // the centre of the view, where the user is looking.
-  const requestOrder = new Map<string, readonly [number, number]>();
+  type Region = { readonly error: number; readonly offset: number };
+  type RequestOrder = {
+    readonly depth: number;
+    readonly offset: number;
+    readonly coveredRegion: Region | undefined;
+  };
+  const requestOrder = new Map<string, RequestOrder>();
 
   const visit = (
     tile: TilesetTile,
     parentTransform: readonly number[],
     depth: number,
+    coveredRegion?: Region,
   ): VisitResult => {
     let placement = placements.get(tile);
     if (!placement) {
@@ -496,13 +514,20 @@ const traverseHierarchy = (
       return {
         visible: false,
         coverageSubmitted: true,
+        coveragePresented: true,
+        coveragePossible: true,
         desired: [],
         requested: [],
         drawn: [],
       };
     }
-    requestOrder.set(tile.id, [depth, view.centerRayOffset(bounds.center)]);
+    const offset = view.centerRayOffset(bounds.center);
+    requestOrder.set(tile.id, { depth, offset, coveredRegion });
+    const ownPresented = options.presented?.(tile.id) ?? false;
+    const covered = !!coveredRegion || ownPresented;
 
+    const subtreeRequest = hierarchy.subtreeRequestByTileId.get(tile.id);
+    if (subtreeRequest) neededSubtrees.set(subtreeRequest.id, subtreeRequest);
     const unknownRequest = hierarchy.unknownRequestByTileId.get(tile.id);
     if (unknownRequest) {
       neededSubtrees.set(unknownRequest.id, unknownRequest);
@@ -510,35 +535,52 @@ const traverseHierarchy = (
       return {
         visible: true,
         coverageSubmitted: submitted,
+        coveragePresented: covered,
+        coveragePossible: true,
         desired: [],
         requested: submitted ? [tile.id] : [],
         drawn: submitted ? [tile.id] : [],
       };
     }
 
-    const contentful = hasContent(tile);
+    const authoredContent = hasContent(tile);
+    const available = !options.unavailable?.(tile.id);
+    const contentful =
+      authoredContent &&
+      (available || options.readiness(tile.id) === "submitted");
     // Contentless tiles are hierarchy nodes, not drawable levels of detail.
     // Their descendants remain reachable regardless of the node's own SSE, and
     // regardless of `refinable` — such a node has no content of its own to
     // stand as a frontier, so refusing to descend would draw nothing at all.
+    const error =
+      tile.children.length > 0 && (ownPresented || contentful)
+        ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
+        : 0;
+    const childRegion = ownPresented ? { error, offset } : coveredRegion;
     const refine =
       tile.children.length > 0 &&
       (!contentful ||
-        (screenSpaceError(tile, accumulated, bounds, view, errorScale) >
-          effective &&
-          (options.refinable?.(tile.id) ?? true)));
+        (error > effective && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
-      ? tile.children.map((child) => visit(child, accumulated, depth + 1))
+      ? tile.children.map((child) =>
+          visit(child, accumulated, depth + 1, childRegion),
+        )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
 
-    if (!refine || visibleChildren.length === 0) {
+    if (
+      !refine ||
+      visibleChildren.length === 0 ||
+      (contentful && visibleChildren.some((child) => !child.coveragePossible))
+    ) {
       if (!contentful) {
         return {
           visible: true,
           // A contentless leaf (or a hierarchy branch whose descendants are
           // all culled) has no draw obligation of its own.
-          coverageSubmitted: true,
+          coverageSubmitted: !authoredContent,
+          coveragePresented: covered || !authoredContent,
+          coveragePossible: !authoredContent,
           desired: [],
           requested: [],
           drawn: [],
@@ -550,7 +592,9 @@ const traverseHierarchy = (
       // Fresh coarse startup does not request the entire hierarchy.
       const fallbacks =
         !submitted && hasSubmittedDescendant(tile)
-          ? tile.children.map((child) => visit(child, accumulated, depth + 1))
+          ? tile.children.map((child) =>
+              visit(child, accumulated, depth + 1, childRegion),
+            )
           : [];
       const visibleFallbacks = fallbacks.filter((child) => child.visible);
       return {
@@ -559,6 +603,14 @@ const traverseHierarchy = (
           submitted ||
           (visibleFallbacks.length > 0 &&
             visibleFallbacks.every((child) => child.coverageSubmitted)),
+        coveragePossible: true,
+        coveragePresented:
+          covered ||
+          (visibleFallbacks.length > 0 &&
+            visibleFallbacks.every((child) => child.coveragePresented)),
+        recoveringCoverage: visibleFallbacks.some(
+          (child) => child.recoveringCoverage,
+        ),
         desired: [tile.id],
         requested: [tile.id, ...fallbacks.flatMap((child) => child.requested)],
         drawn: submitted
@@ -568,20 +620,41 @@ const traverseHierarchy = (
     }
 
     const desired = visibleChildren.flatMap((child) => child.desired);
+    const coveragePresented =
+      covered || visibleChildren.every((child) => child.coveragePresented);
+    const submitted = contentful && options.readiness(tile.id) === "submitted";
+    const recoveringCoverage = Boolean(
+      options.presented && submitted && !coveragePresented,
+    );
     if (visibleChildren.every((child) => child.coverageSubmitted)) {
       return {
         visible: true,
         coverageSubmitted: true,
+        coveragePossible: true,
+        coveragePresented,
+        recoveringCoverage:
+          recoveringCoverage ||
+          visibleChildren.some((child) => child.recoveringCoverage),
         desired,
-        requested: visibleChildren.flatMap((child) => child.requested),
-        drawn: visibleChildren.flatMap((child) => child.drawn),
+        requested: [
+          ...(recoveringCoverage ? [tile.id] : []),
+          ...visibleChildren.flatMap((child) => child.requested),
+        ],
+        drawn: recoveringCoverage
+          ? [tile.id]
+          : visibleChildren.flatMap((child) => child.drawn),
       };
     }
 
-    const submitted = contentful && options.readiness(tile.id) === "submitted";
     return {
       visible: true,
       coverageSubmitted: submitted,
+      coveragePresented,
+      recoveringCoverage: visibleChildren.some(
+        (child) => child.recoveringCoverage,
+      ),
+      coveragePossible:
+        contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
       requested: [
         ...(contentful ? [tile.id] : []),
@@ -598,9 +671,17 @@ const traverseHierarchy = (
   const rootParent = options.modelMatrix ?? IDENTITY;
   const result = visit(hierarchy.root, rootParent, 0);
   const requested = [...result.requested].sort((left, right) => {
-    const [leftDepth, leftOffset] = requestOrder.get(left)!;
-    const [rightDepth, rightOffset] = requestOrder.get(right)!;
-    return leftDepth - rightDepth || leftOffset - rightOffset;
+    const a = requestOrder.get(left)!;
+    const b = requestOrder.get(right)!;
+    // First restore regions without coverage. Then let the highest-error
+    // visible fallback refine without waiting for a whole breadth level.
+    const aRegion = a.coveredRegion;
+    const bRegion = b.coveredRegion;
+    const coverageOrder =
+      aRegion && bRegion
+        ? bRegion.error - aRegion.error || aRegion.offset - bRegion.offset
+        : Number(!!aRegion) - Number(!!bRegion);
+    return coverageOrder || a.depth - b.depth || a.offset - b.offset;
   });
   const rootAccumulated = multiply(rootParent, hierarchy.root.transform);
   const rootSse = result.visible
@@ -616,6 +697,7 @@ const traverseHierarchy = (
     desiredTileIds: Object.freeze(result.desired),
     requestedTileIds: Object.freeze(requested),
     drawnTileIds: Object.freeze(result.drawn),
+    recoveringCoverage: result.recoveringCoverage ?? false,
     effectiveScreenSpaceErrorPx: effective,
     rootScreenSpaceErrorPx: rootSse,
     neededSubtreeRequests: Object.freeze([...neededSubtrees.values()]),

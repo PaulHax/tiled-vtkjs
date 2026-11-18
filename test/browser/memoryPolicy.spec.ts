@@ -232,6 +232,10 @@ it("borrows spare capacity across live assets and preserves coverage through bud
     const points = await call(page, "add", "points", 1);
     await waitDrawn(page, 2);
     expect((await colors(page, "#viewer-2")).blue).toBeGreaterThan(10);
+    const pointRenderer = (await state(page)).stats.find(
+      (entry: { kind: string }) => entry.kind === "pointCloud",
+    ).renderer;
+    expect(pointRenderer.gpuGeometryUploadBytes).toBeGreaterThan(0);
     await call(page, "remove", points);
     await call(page, "remove", "asset-0");
     await eventually(async () => (await state(page)).memory.owners).toBe(0);
@@ -308,22 +312,29 @@ it("finishes competing replacement groups within shared transition headroom", as
 
 it("reports an intrinsic work refusal once and retries after its allowance increases", async () => {
   const { page, failures } = await open();
+  let contentRequests = 0;
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/memory-fixtures/large/model.gltf")
+      contentRequests += 1;
+  });
   try {
     await call(page, "configure", { workBytes: 4096 });
     await call(page, "add", "large");
     await eventually(
       async () => (await state(page)).stats[0].resourceState,
     ).toMatchObject({ status: "blocked", domain: "work", retryable: false });
-    const attempts = (await state(page)).stats[0].queue.entries[0].attempt;
+    expect(contentRequests).toBe(1);
     for (let frame = 0; frame < 3; frame++) {
       await call(page, "render");
       await page.evaluate(
         () => new Promise<void>((done) => requestAnimationFrame(() => done())),
       );
     }
-    expect((await state(page)).stats[0].queue.entries[0].attempt).toBe(
-      attempts,
-    );
+    expect(contentRequests).toBe(1);
+    expect((await state(page)).stats[0].resourceState).toMatchObject({
+      status: "blocked",
+      domain: "work",
+    });
     expect((await state(page)).errors).toEqual([]);
     await call(page, "configure", { workBytes: 65536 });
     await waitDrawn(page, 1);

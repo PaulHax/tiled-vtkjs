@@ -3,7 +3,11 @@ import { safeCall } from "../core/observers";
 import { createLodController, type LodController } from "./controller";
 import type { PointPresentation } from "./pointPresentation";
 import { pointBudgets } from "./pointQuality";
-import { createRendererAdapter, type RendererAdapter } from "./rendererAdapter";
+import {
+  createRendererAdapter,
+  type RendererAdapter,
+  type RendererAdapterOptions,
+} from "./rendererAdapter";
 import {
   occlusionFromPick,
   importanceFromRootSseCssPx,
@@ -17,6 +21,7 @@ import {
 import type { TileSource } from "./tileSource";
 import {
   ResourcePolicyError,
+  resourcePolicyError,
   type MemoryDomain,
 } from "../core/memoryResources";
 
@@ -44,6 +49,11 @@ export type PointCloudMemberConfig = {
     state: PointCloudMemberStats["resourceState"],
   ) => void;
 };
+
+export type PointCloudMemberServices = Pick<
+  RendererAdapterOptions,
+  "getOpenGLRenderWindow"
+>;
 
 export type PointCloudMemberStats = {
   readonly kind: "pointCloud";
@@ -94,6 +104,7 @@ const configuredCeiling = (config: PointCloudMemberConfig): number => {
 export const createPointCloudMember = (
   context: StreamedMemberContext,
   initialConfig: PointCloudMemberConfig,
+  services?: PointCloudMemberServices,
 ): StreamedMember => {
   let config = initialConfig;
   let active = true;
@@ -109,8 +120,8 @@ export const createPointCloudMember = (
     safeCall(() => config.onResourceState?.(next));
     context.onWorkChange?.();
   };
-  let lastAvailability = context.memory.stats().availabilityRevision;
-  let lastPolicy = context.memory.stats().revision;
+  let lastAvailability = context.memory.availability();
+  let lastPolicy = context.memory.policyRevision();
   let retryOnAvailability = false;
   const onPolicyRefusal = (error: ResourcePolicyError): void => {
     retryOnAvailability = error.retryable;
@@ -121,9 +132,9 @@ export const createPointCloudMember = (
       limitBytes: error.limitBytes,
       retryable: error.retryable,
     });
-    lastAvailability = context.memory.stats().availabilityRevision;
+    lastAvailability = context.memory.availability();
     queueMicrotask(() => {
-      lastAvailability = context.memory.stats().availabilityRevision;
+      lastAvailability = context.memory.availability();
     });
     context.onWorkChange?.();
   };
@@ -139,16 +150,6 @@ export const createPointCloudMember = (
     regime: "stationary",
   };
 
-  const adapter = createRendererAdapter({
-    renderer: context.renderer as {
-      addActor(actor: unknown): void;
-      removeActor(actor: unknown): void;
-    },
-    scheduleRender: context.scheduleRender,
-    devicePixelRatio: context.devicePixelRatio,
-    visible: active,
-    memory,
-  });
   const report = (error: unknown): void => {
     resourceState = {
       status: "error",
@@ -159,6 +160,26 @@ export const createPointCloudMember = (
     safeCall(() => config.onError?.(error));
     context.onWorkChange?.();
   };
+  const adapter = createRendererAdapter({
+    renderer: context.renderer as {
+      addActor(actor: unknown): void;
+      removeActor(actor: unknown): void;
+    },
+    scheduleRender: context.scheduleRender,
+    devicePixelRatio: context.devicePixelRatio,
+    visible: active,
+    memory,
+    submissions: context.submissions,
+    getOpenGLRenderWindow: services?.getOpenGLRenderWindow,
+    onWorkChange: context.onWorkChange,
+    onError: report,
+    onTileError: ({ key, tile }, error) => {
+      controller.failRealization(key, tile);
+      const refusal = resourcePolicyError(error);
+      if (refusal) onPolicyRefusal(refusal);
+      else report(error);
+    },
+  });
   const controller = createLodController({
     source: config.source,
     onTiles(batch) {
@@ -169,7 +190,9 @@ export const createPointCloudMember = (
       }
     },
     onDrawPlan: adapter.applyDrawPlan,
-    scheduleRender: context.scheduleRender,
+    presentedTiles: adapter.presentedTiles,
+    // The submission scheduler requests a paint only when work can publish.
+    scheduleRender: () => {},
     onWorkChange: context.onWorkChange,
     onPointDiameterCssPx: adapter.setPointDiameterCssPx,
     active,
@@ -212,7 +235,7 @@ export const createPointCloudMember = (
           next.memoryBudgetBytes,
         ),
       );
-      if (adapter.workState().gpuResidentBytes > 0) return;
+      if (adapter.workState().submittedBytes > 0) return;
     } else if (
       resourceState.status === "blocked" &&
       resourceState.domain === "renderer"
@@ -267,7 +290,10 @@ export const createPointCloudMember = (
     setConfig(kindConfig) {
       if (disposed) return;
       const next = kindConfig as PointCloudMemberConfig;
-      if (next.source !== config.source) controller.setSource(next.source);
+      if (next.source !== config.source) {
+        adapter.clearTiles();
+        controller.setSource(next.source);
+      }
       config = next;
       controller.setPresentation(config.presentation);
       controller.setRefinementCutoffPx(config.refinementCutoffPx ?? 1);
@@ -277,8 +303,8 @@ export const createPointCloudMember = (
     beginInteraction: controller.beginInteraction,
     endInteraction: controller.endInteraction,
     prepareFrame() {
-      const next = context.memory.stats().availabilityRevision;
-      const policy = context.memory.stats().revision;
+      const next = context.memory.availability();
+      const policy = context.memory.policyRevision();
       const policyChanged = policy !== lastPolicy;
       lastPolicy = policy;
       if (
@@ -290,12 +316,13 @@ export const createPointCloudMember = (
         lastAvailability = next;
         setResourceState({ status: "ready" });
         controller.retryMemory();
-        lastAvailability = context.memory.stats().availabilityRevision;
+        lastAvailability = context.memory.availability();
       }
     },
 
     governorInputs(): GovernorInputs {
       const narrow = controller.governorInputs();
+      const renderer = adapter.workState();
       const full = fullCeiling(narrow.memoryCeilingPoints);
       return {
         // The controller reports root SSE in CSS pixels; the governor compares
@@ -311,18 +338,20 @@ export const createPointCloudMember = (
         work: {
           // Backoff remains one logical obligation even when physical counts
           // are temporarily zero.
-          operations: narrow.workPending
-            ? Math.max(
-                1,
-                narrow.physicalTileOperations +
-                  narrow.physicalHierarchyOperations,
-              )
-            : 0,
-          progressSerial: narrow.workRevision,
+          operations:
+            renderer.pendingJobs +
+            (narrow.workPending
+              ? Math.max(
+                  1,
+                  narrow.physicalTileOperations +
+                    narrow.physicalHierarchyOperations,
+                )
+              : 0),
+          progressSerial: narrow.workRevision + renderer.workRevision,
         },
         physicalTileOperations: narrow.physicalTileOperations,
         physicalHierarchyOperations: narrow.physicalHierarchyOperations,
-        residentBytes: adapter.workState().gpuResidentBytes,
+        residentBytes: renderer.gpuResidentBytes,
         memoryDemand: narrow.memoryDemand,
       };
     },

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createLoader } from "./loader";
-import type { RetryPolicy } from "../core/retryPolicy";
+import { createRequestAdmission, type RequestLane } from "./requestAdmission";
+import type { RetryPolicy } from "./retryPolicy";
 
 const POLICY: RetryPolicy = {
   attempts: 3,
@@ -33,14 +33,24 @@ const makeLoader = (
   const loads: Load[] = [];
   const loaded: string[] = [];
   const failed: string[] = [];
-  const loader = createLoader<string>({
-    load: (key, signal) =>
-      new Promise<string>((resolve, reject) => {
-        loads.push({ key, signal, resolve, reject });
-        if (options.honoursAbort) {
-          signal.addEventListener("abort", () => reject(abortError()));
-        }
-      }),
+  const loader = createRequestAdmission().createOwner<string>({
+    adoptCancelled: true,
+    keepUnwantedResults: true,
+    operation: (key) => ({
+      lane: "network",
+      start: (signal) =>
+        new Promise<{ value: string }>((resolve, reject) => {
+          loads.push({
+            key,
+            signal,
+            resolve: (value) => resolve({ value }),
+            reject,
+          });
+          if (options.honoursAbort) {
+            signal.addEventListener("abort", () => reject(abortError()));
+          }
+        }),
+    }),
     concurrency: options.concurrency ?? 2,
     retry: POLICY,
     cancelGraceMs: options.cancelGraceMs ?? 0,
@@ -257,5 +267,183 @@ describe("createLoader", () => {
     await settle();
     expect(failed).toEqual(["a", "a"]);
     expect(loader.resting("a")).toBe(false);
+  });
+});
+
+describe("page request admission", () => {
+  it("honors live key priorities and rotates between owners at settlement", async () => {
+    const admission = createRequestAdmission(1);
+    const starts: string[] = [];
+    const finish = new Map<string, () => void>();
+    const owner = (name: string) =>
+      admission.createOwner<void>({
+        concurrency: 1,
+        operation: (key) => ({
+          lane: "network",
+          start: () =>
+            new Promise((resolve) => {
+              const id = `${name}:${key}`;
+              starts.push(id);
+              finish.set(id, () => resolve({ value: undefined }));
+            }),
+        }),
+        onLoaded() {},
+        onFailed: (key) => {
+          throw new Error(`Unexpected failure: ${key}`);
+        },
+      });
+    const points = owner("COPC");
+    const tiles = owner("3D Tiles");
+
+    points.want(["root", "near", "far"]);
+    tiles.want(["other", "visible"]);
+    tiles.want(["visible", "other"]);
+    points.want(["root", "far", "near"]);
+    expect(starts).toEqual(["COPC:root"]);
+    finish.get("COPC:root")!();
+    await settle();
+    expect(starts).toEqual(["COPC:root", "3D Tiles:visible"]);
+    finish.get("3D Tiles:visible")!();
+    await settle();
+    expect(starts).toEqual(["COPC:root", "3D Tiles:visible", "COPC:far"]);
+    finish.get("COPC:far")!();
+    await settle();
+    expect(starts.at(-1)).toBe("3D Tiles:other");
+    points.dispose();
+    tiles.dispose();
+    finish.get("3D Tiles:other")!();
+    await settle();
+    expect(admission.queuedOperations()).toBe(0);
+  });
+
+  const controlledStages = (parallel: number) => {
+    const admission = createRequestAdmission(parallel);
+    const starts: string[] = [];
+    const finish = new Map<string, () => void>();
+    const run = (
+      lane: RequestLane,
+      key: string,
+      controller = new AbortController(),
+    ) =>
+      admission.run({
+        signal: controller.signal,
+        stage: {
+          lane,
+          start: () =>
+            new Promise<{ value: string }>((resolve) => {
+              starts.push(key);
+              finish.set(key, () => resolve({ value: key }));
+            }),
+        },
+      });
+    return {
+      admission,
+      starts,
+      run,
+      finish: (key: string) => finish.get(key)!(),
+    };
+  };
+
+  it("caps overlapping work of different lanes and owners, including canceled work", async () => {
+    const { admission, starts, run, finish } = controlledStages(2);
+    const controller = new AbortController();
+    const network = run("network", "fetch", controller);
+    const cancelled = expect(network).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    const compute = run("compute", "decode");
+    const sort = run("sort", "sort");
+    const next = run("network", "next");
+    controller.abort();
+    await cancelled;
+
+    expect(starts).toEqual(["fetch", "decode"]);
+    expect(admission.activeOperations()).toBe(2);
+    finish("fetch");
+    await settle();
+    expect(starts).toEqual(["fetch", "decode", "sort"]);
+    expect(admission.activeOperations()).toBe(2);
+
+    finish("decode");
+    await compute;
+    expect(starts.at(-1)).toBe("next");
+    finish("sort");
+    finish("next");
+    await Promise.all([sort, next]);
+    expect(admission.activeOperations()).toBe(0);
+  });
+
+  it("pipelines decode without making an interactive sort wait for network", async () => {
+    const { admission, starts, run, finish } = controlledStages(3);
+    const releaseCapacity = admission.reserveSortCapacity();
+    const network = run("network", "fetch");
+    const second = run("network", "second");
+    const next = run("network", "next");
+    expect(starts).toEqual(["fetch", "second"]);
+    const compute = run("compute", "decode");
+    const sort = run("sort", "sort");
+    expect(starts).toEqual(["fetch", "second", "decode"]);
+    expect(admission.activeOperations()).toBe(3);
+    finish("decode");
+    await compute;
+    expect(starts.at(-1)).toBe("sort");
+    finish("sort");
+    await sort;
+    expect(starts.at(-1)).toBe("sort");
+
+    releaseCapacity();
+    await settle();
+    expect(starts.at(-1)).toBe("next");
+    for (const key of ["fetch", "second", "next"]) finish(key);
+    await Promise.all([network, second, next]);
+  });
+
+  it("alternates ready sort and background stages with one grant", async () => {
+    const { admission, starts, run, finish } = controlledStages(1);
+    const releaseCapacity = admission.reserveSortCapacity();
+    const network = run("network", "fetch");
+    const decode = run("compute", "decode");
+    const firstSort = run("sort", "sort 1");
+    const secondSort = run("sort", "sort 2");
+    expect(starts).toEqual(["fetch"]);
+    for (const [current, expected] of [
+      ["fetch", "sort 1"],
+      ["sort 1", "decode"],
+      ["decode", "sort 2"],
+    ] as const) {
+      finish(current);
+      await settle();
+      expect(starts.at(-1)).toBe(expected);
+      expect(admission.activeOperations()).toBe(1);
+    }
+    finish("sort 2");
+    await Promise.all([network, decode, firstSort, secondSort]);
+    releaseCapacity();
+    expect(admission.activeOperations()).toBe(0);
+  });
+
+  it("reclaims idle persistent workers while keeping separate sort headroom", () => {
+    const admission = createRequestAdmission(1);
+    let retired = false;
+    const idle = admission.acquireWorker("decode", {
+      idle: () => true,
+      retire: () => {
+        idle?.();
+        retired = true;
+      },
+    });
+    const active = Array.from({ length: 3 }, () =>
+      admission.acquireWorker("decode"),
+    );
+    expect(active.every(Boolean)).toBe(true);
+    expect(admission.canAcquireWorker("decode", false)).toBe(false);
+    expect(admission.canAcquireWorker("decode")).toBe(true);
+    const replacement = admission.acquireWorker("decode");
+    expect(retired).toBe(true);
+    expect(replacement).toBeTypeOf("function");
+    expect(admission.canAcquireWorker("decode")).toBe(false);
+    const sort = admission.acquireWorker("sort");
+    expect(sort).toBeTypeOf("function");
+    for (const release of [...active, replacement, sort]) release?.();
   });
 });

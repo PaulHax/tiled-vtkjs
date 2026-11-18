@@ -9,6 +9,7 @@
 
 import type { VoxelKey } from "./octree";
 import type { Bounds, Vec3 } from "../core/geometry";
+import type { RequestAdmission, RequestLane } from "../core/requestAdmission";
 import type { MemoryWork } from "../core/memoryResources";
 
 export type TileSourceMetadata = {
@@ -47,7 +48,7 @@ export type NodeInfo = {
   readonly pageRef?: boolean;
 };
 
-/** Decoded payload of one octree node. */
+/** Read-only decoded payload of one octree node, potentially shared across views. */
 export type TileData = {
   /** World-space origin the tile-local positions are relative to. */
   readonly origin: Vec3;
@@ -86,6 +87,11 @@ export type LoadOptions = {
 
 /** A source of octree point-cloud tiles. */
 export type TileSource = {
+  readonly admission?: RequestAdmission;
+  readonly hierarchyLane?: RequestLane;
+  readonly tileLane?: RequestLane;
+  canRead?(kind: "hierarchy" | "tile", key: VoxelKey): boolean;
+
   /** Dataset metadata, resolved when the source was created. */
   metadata(): TileSourceMetadata;
   /**
@@ -103,3 +109,9 @@ export type TileSource = {
   /** Release source-owned resources such as a decoding worker. The host owns this lifetime. */
   dispose?(): void;
 };
+
+/** Compatibility established by the built-in readers for immutable results. */
+export const immutablePointSources = new WeakMap<
+  TileSource,
+  { readonly scope: object; readonly key: string }
+>();

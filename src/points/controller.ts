@@ -23,6 +23,7 @@ import {
 } from "../core/camera";
 import {
   resourcePolicyError,
+  reuseMemoryResult,
   type MemoryOwner,
   type MemoryLease,
   type ResourcePolicyError,
@@ -34,7 +35,11 @@ import {
   samePrefixes,
   type DrawPlan,
 } from "./drawPlan";
-import { createLoader, type LoaderCounts } from "./loader";
+import {
+  createRequestAdmission,
+  type LoaderCounts,
+  type RequestShare,
+} from "../core/requestAdmission";
 import { sameMatrix, transformPoint, type Mat16 } from "../core/mat4";
 import { scenePoint } from "../core/frames";
 import {
@@ -71,6 +76,7 @@ import {
 import { pointCapacity } from "./pointQuality";
 import type { RetryPolicy } from "../core/retryPolicy";
 import {
+  immutablePointSources,
   tileBytes,
   type NodeInfo,
   type TileData,
@@ -82,6 +88,12 @@ export type TileDrawPlan = {
     readonly key: VoxelKey;
     readonly pointCount: number;
   }[];
+};
+
+export type PresentedPointTile = {
+  readonly keyString: string;
+  readonly tile: TileData;
+  readonly pointCount: number;
 };
 
 /**
@@ -96,6 +108,8 @@ export type LodControllerOptions = {
   onTiles: (batch: TileBatch) => void;
   /** Receives per-tile progressive prefixes without changing tile residency. */
   onDrawPlan?: (plan: TileDrawPlan) => void;
+  /** For consumers that publish asynchronously, read their accepted draw prefixes. */
+  presentedTiles?: () => Iterable<PresentedPointTile>;
   /**
    * Coalescing render request — called once per applied batch, never once per
    * tile. Must not render synchronously more than once per event loop turn.
@@ -342,6 +356,8 @@ export type LodDrawPlanStats = {
  * Construction is where an invalid number is fatal.
  */
 export type LodController = {
+  /** Report a failed realization of the exact payload sent to the consumer. */
+  failRealization(key: VoxelKey, tile: TileData): void;
   /**
    * Update the camera; selection reruns debounced (leading edge immediate).
    * A view with any non-finite number is ignored. With a model matrix set,
@@ -509,6 +525,33 @@ export const createLodController = (
     0,
   );
   let source = options.source;
+  const admission =
+    options.memory?.admission ??
+    source.admission ??
+    createRequestAdmission(fetchConcurrency + hierarchyConcurrency);
+  const ownerGroup = options.memory ?? {};
+  const admissionOptions = {
+    group: ownerGroup,
+    availability: options.memory?.availability,
+    canRetry: options.memory?.canRetry,
+    retry: POINT_RETRY_POLICY,
+    adoptCancelled: true,
+    keepUnwantedResults: true,
+  };
+  const sharePointRequest = <T extends { memory?: MemoryLease }>(
+    kind: "hierarchy" | "tile",
+    key: string,
+  ): RequestShare<T> | undefined => {
+    const identity = immutablePointSources.get(source);
+    return (
+      identity && {
+        scope:
+          options.memory?.scopeForSharing(identity.scope) ?? identity.scope,
+        key: JSON.stringify([identity.key, kind, key]),
+        reuse: reuseMemoryResult,
+      }
+    );
+  };
   let pointBudget = wholeAtLeast(
     "pointBudget",
     options.pointBudget ?? 2_000_000,
@@ -645,6 +688,13 @@ export const createLodController = (
   const drawnPointsOf = (keyString: string, tile: TileData): number =>
     Math.min(tile.pointCount, plan.prefixes.get(keyString) ?? 0);
 
+  const presentedTiles =
+    options.presentedTiles ??
+    function* () {
+      for (const [keyString, tile] of residency.submitted())
+        yield { keyString, tile, pointCount: drawnPointsOf(keyString, tile) };
+    };
+
   /** Hand the consumer the residency delta once per microtask burst. */
   let flushScheduled = false;
   const scheduleFlush = (): void => {
@@ -661,28 +711,34 @@ export const createLodController = (
     });
   };
 
-  const pages = createLoader<{
+  const pages = admission.createOwner<{
     infos: readonly NodeInfo[];
     memory?: MemoryLease;
   }>({
-    load: async (keyString, signal) => {
-      const work = options.memory
-        ? await options.memory.work(signal, 0)
-        : undefined;
-      try {
-        signal.throwIfAborted();
-        const infos = await source.nodes(keyFromString(keyString), {
-          signal,
-          memory: work,
-        });
-        work?.resize(Math.max(work.bytes(), infos.length * 320));
-        return { infos, memory: work?.commit([], infos.length * 160) };
-      } finally {
-        work?.release();
-      }
-    },
+    ...admissionOptions,
+    operation: (keyString) => ({
+      lane: source.hierarchyLane ?? "network",
+      share: sharePointRequest("hierarchy", keyString),
+      ready: () =>
+        source.canRead?.("hierarchy", keyFromString(keyString)) ?? true,
+      async start(signal) {
+        const work = options.memory?.work(signal);
+        try {
+          signal.throwIfAborted();
+          const infos = await source.nodes(keyFromString(keyString), {
+            signal,
+            memory: work,
+          });
+          work?.resize(Math.max(work.bytes(), infos.length * 320));
+          return {
+            value: { infos, memory: work?.commit([], infos.length * 160) },
+          };
+        } finally {
+          work?.release();
+        }
+      },
+    }),
     concurrency: hierarchyConcurrency,
-    retry: POINT_RETRY_POLICY,
     // A page survives deactivation in the hierarchy, so cancelling one would
     // only buy a refetch of the same bytes.
     cancelGraceMs: Number.POSITIVE_INFINITY,
@@ -717,75 +773,88 @@ export const createLodController = (
     onChange: markWork,
   });
 
-  const tiles = createLoader<{ tile: TileData; memory?: MemoryLease }>({
-    load: async (keyString, signal) => {
-      const work = options.memory
-        ? await options.memory.work(signal, 0)
-        : undefined;
-      try {
-        signal.throwIfAborted();
-        const estimate = nodes.get(keyString);
-        if (estimate) work?.resize(nodePayloadBytes(estimate) * 3);
-        const tile = await source.loadTile(keyFromString(keyString), {
-          signal,
-          memory: work,
-        });
-        work?.resize(Math.max(work.bytes(), tileBytes(tile) * 3));
-        return {
-          tile,
-          memory: work?.commit([
-            tile.positions.buffer as ArrayBuffer,
-            ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
-          ]),
-        };
-      } finally {
-        work?.release();
-      }
-    },
-    concurrency: fetchConcurrency,
-    retry: POINT_RETRY_POLICY,
-    // One selection interval, in which an orbit or pan crossing back over a
-    // recent tile adopts its read instead of cancelling and refetching it.
-    cancelGraceMs: selectionDelayMs,
-    onLoaded: (keyString, { tile, memory }) => {
-      try {
-        const entry = nodes.get(keyString);
-        const bytes = tileBytes(tile);
-        const exceedsEstimate =
-          entry !== undefined && bytes > nodePayloadBytes(entry);
-        if (entry !== undefined)
-          nodes.set(keyString, { ...entry, tileBytes: bytes });
-        // A source may decode more points than its hierarchy advertised. Learn
-        // that cost before admitting the payload, and keep it after cache
-        // eviction so another selection cannot refetch the same oversized tile.
-        if (exceedsEstimate && selection.target.has(keyString)) {
-          runSelection(undefined, { keyString, tile });
-          return;
+  const tiles = admission.createOwner<{ tile: TileData; memory?: MemoryLease }>(
+    {
+      ...admissionOptions,
+      priority: 1,
+      operation: (keyString) => ({
+        lane: source.tileLane ?? "network",
+        share: sharePointRequest("tile", keyString),
+        ready: () => source.canRead?.("tile", keyFromString(keyString)) ?? true,
+        async start(signal) {
+          const estimate = nodes.get(keyString);
+          const work = options.memory?.work(
+            signal,
+            estimate ? nodePayloadBytes(estimate) * 3 : 0,
+          );
+          try {
+            signal.throwIfAborted();
+            const tile = await source.loadTile(keyFromString(keyString), {
+              signal,
+              memory: work,
+            });
+            work?.resize(Math.max(work.bytes(), tileBytes(tile) * 3));
+            return {
+              value: {
+                tile,
+                memory: work?.commit(
+                  [
+                    tile.positions.buffer as ArrayBuffer,
+                    ...(tile.rgb ? [tile.rgb.buffer as ArrayBuffer] : []),
+                  ],
+                  64,
+                ),
+              },
+            };
+          } finally {
+            work?.release();
+          }
+        },
+      }),
+      concurrency: fetchConcurrency,
+      // One selection interval, in which an orbit or pan crossing back over a
+      // recent tile adopts its read instead of cancelling and refetching it.
+      cancelGraceMs: selectionDelayMs,
+      onLoaded: (keyString, { tile, memory }) => {
+        try {
+          const entry = nodes.get(keyString);
+          const bytes = tileBytes(tile);
+          const exceedsEstimate =
+            entry !== undefined && bytes > nodePayloadBytes(entry);
+          if (entry !== undefined)
+            nodes.set(keyString, { ...entry, tileBytes: bytes });
+          // A source may decode more points than its hierarchy advertised. Learn
+          // that cost before admitting the payload, and keep it after cache
+          // eviction so another selection cannot refetch the same oversized tile.
+          if (exceedsEstimate && selection.target.has(keyString)) {
+            runSelection(undefined, { keyString, tile, memory });
+            return;
+          }
+          // Cancellation is advisory, so a cancelled read can still deliver. If
+          // the key was reselected while it ran, this payload is exactly what the
+          // selection is waiting for.
+          if (
+            selection.target.has(keyString) &&
+            !residency.isResident(keyString)
+          ) {
+            residency.hold(keyString, tile, memory);
+            scheduleFlush();
+          } else {
+            residency.park(keyString, tile, memory);
+          }
+        } finally {
+          memory?.release();
         }
-        // Cancellation is advisory, so a cancelled read can still deliver. If
-        // the key was reselected while it ran, this payload is exactly what the
-        // selection is waiting for.
-        if (
-          selection.target.has(keyString) &&
-          !residency.isResident(keyString)
-        ) {
-          residency.hold(keyString, tile);
-          scheduleFlush();
-        } else {
-          residency.park(keyString, tile);
-        }
-      } finally {
-        memory?.release();
-      }
+      },
+      onDiscarded: ({ memory }) => memory?.release(),
+      onFailed: (_keyString, error) => {
+        const refusal = resourcePolicyError(error);
+        if (refusal) options.onPolicyRefusal?.(refusal);
+        else onError(error);
+      },
+      onChange: markWork,
     },
-    onDiscarded: ({ memory }) => memory?.release(),
-    onFailed: (_keyString, error) => {
-      const refusal = resourcePolicyError(error);
-      if (refusal) options.onPolicyRefusal?.(refusal);
-      else onError(error);
-    },
-    onChange: markWork,
-  });
+  );
 
   /** Ask for the pages selection needs, highest priority first. */
   const queuePages = (keyStrings: readonly string[]): void =>
@@ -839,7 +908,11 @@ export const createLodController = (
 
   const runSelection = (
     seed?: ReadonlySet<string>,
-    arrival?: { readonly keyString: string; readonly tile: TileData },
+    arrival?: {
+      readonly keyString: string;
+      readonly tile: TileData;
+      readonly memory?: MemoryLease;
+    },
   ): void => {
     if (disposed || !active || view === null) return;
     const previous = selection.target;
@@ -884,9 +957,9 @@ export const createLodController = (
         target.has(arrival.keyString) &&
         !residency.isResident(arrival.keyString)
       ) {
-        residency.hold(arrival.keyString, arrival.tile);
+        residency.hold(arrival.keyString, arrival.tile, arrival.memory);
       } else {
-        residency.park(arrival.keyString, arrival.tile);
+        residency.park(arrival.keyString, arrival.tile, arrival.memory);
       }
     }
 
@@ -990,6 +1063,12 @@ export const createLodController = (
   };
 
   return {
+    failRealization(key, tile) {
+      if (disposed || !residency.failRealization(keyToString(key), tile))
+        return;
+      scheduleFlush();
+      markWork();
+    },
     retryMemory() {
       residency.retryBlocked();
       tiles.retryBlocked();
@@ -1163,9 +1242,7 @@ export const createLodController = (
         }
       }
       let drawnPoints = 0;
-      for (const [keyString, tile] of residency.submitted()) {
-        drawnPoints += drawnPointsOf(keyString, tile);
-      }
+      for (const { pointCount } of presentedTiles()) drawnPoints += pointCount;
       return {
         active,
         residentTiles: totals.residentTiles,
@@ -1229,8 +1306,7 @@ export const createLodController = (
         ? viewInModelFrame(pickView, modelFrame)
         : pickView;
       const pickTiles: PickTile[] = [];
-      for (const [keyString, tile] of residency.submitted()) {
-        const pointCount = drawnPointsOf(keyString, tile);
+      for (const { keyString, tile, pointCount } of presentedTiles()) {
         if (pointCount === 0) continue;
         pickTiles.push({
           origin: tile.origin,

@@ -126,12 +126,18 @@ describe("Gaussian tiles in the main dataset explorer", () => {
 
       await sse.focus();
       await sse.press("Home");
-      await Promise.all([left.ready, right.ready]);
+      const first = await Promise.race([
+        left.ready.then(() => left),
+        right.ready.then(() => right),
+      ]);
+      const second = first === left ? right : left;
       await hasColor("red");
-      left.release();
+      first.release();
+      await second.ready;
       await hasColor("red");
       await noColor("blue");
-      right.release();
+      await noColor("green");
+      second.release();
       await hasColor("blue");
       await hasColor("green");
       await noColor("red");

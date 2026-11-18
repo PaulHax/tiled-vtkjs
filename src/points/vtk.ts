@@ -11,5 +11,6 @@ export {
   DEFAULT_MIN_POINT_BUDGET,
   type PointCloudAdaptiveOptions,
   type PointCloudMemberConfig,
+  type PointCloudMemberServices,
   type PointCloudMemberStats,
 } from "./pointCloudMember";

@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { perspectiveView } from "../../test/helpers";
 import { IDENTITY } from "../core/mat4";
 import { createMemoryPool } from "../core/memoryPool";
+import { ResourcePolicyError } from "../core/memoryResources";
+import { createStreamedSceneCoordinator } from "../core/streamedSceneCoordinator";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import type { StreamedMemberContext } from "../core/streamedMember";
 import {
@@ -12,6 +14,7 @@ import {
   type DecodedMeshTileContent,
 } from "./decode";
 import { createTiles3dMember } from "./member";
+import { createMeshContentAdapter } from "./meshContentAdapter";
 import type {
   Tiles3dMemberConfig,
   Tiles3dMemberStats,
@@ -76,9 +79,21 @@ const decoded = (z = 0): DecodedMeshTileContent => ({
   byteEstimate: { geometry: 42, textures: 0 },
 });
 
+const meshCellBytes = 4 * Uint32Array.BYTES_PER_ELEMENT;
+
 const settle = async (): Promise<void> => {
   for (let index = 0; index < 6; index += 1) await Promise.resolve();
   await new Promise((resolve) => setTimeout(resolve, 0));
+};
+
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+const defer = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 };
 
 const harness = (withChildren = false, schedulerBytes = 1024) => {
@@ -154,6 +169,243 @@ const harness = (withChildren = false, schedulerBytes = 1024) => {
 
 describe("createTiles3dMember", () => {
   beforeEach(resetStubs);
+
+  it.each([
+    "compatible",
+    "capabilities",
+    "revision",
+    "placement",
+    "custom-reader",
+    "memory-pool",
+  ] as const)(
+    "shares content only for compatible views (%s)",
+    async (profile) => {
+      const h = harness();
+      const fetch = vi.fn(async (url: string) =>
+        url.endsWith("tileset.json")
+          ? Response.json(document())
+          : new Response(new ArrayBuffer(8)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const config = {
+        ...h.config,
+        fetchTileset: undefined,
+        fetchContent: profile === "custom-reader" ? fetch : undefined,
+        cacheBytes: 0,
+      };
+      const textureCapabilities =
+        profile === "capabilities"
+          ? { capabilityKey: "rgba", compressedFormats: [] }
+          : h.services.textureCapabilities;
+      const secondMemory =
+        profile === "memory-pool"
+          ? createMemoryPool({
+              totalBytes: 4096,
+              admission: h.memory.admission,
+            })
+          : h.memory;
+      const pools = [...new Set([h.memory, secondMemory])];
+      const retainedBytes = () =>
+        pools.reduce((sum, pool) => sum + pool.stats().cpuRetainedBytes, 0);
+      const placement = [...IDENTITY];
+      if (profile === "placement") placement[12] = 0.125;
+      const members = [
+        createTiles3dMember(h.context, config, h.services),
+        createTiles3dMember(
+          {
+            ...h.context,
+            memory: secondMemory,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...config,
+            revision: profile === "revision" ? "r2" : "r1",
+            tilesetToScene: placement,
+          },
+          { ...h.services, textureCapabilities },
+        ),
+      ];
+      try {
+        for (const member of members) {
+          member.applyAllocation({
+            qualityFraction: 1,
+            memoryBudgetBytes: 4096,
+            regime: "stationary",
+          });
+          member.setCamera(view);
+        }
+        await flush();
+        h.submissions.prepareFrame();
+        for (const member of members)
+          expect(member.pick(view, 50, 50)?.status).toBe("hit");
+        const expected = profile === "compatible" ? 1 : 2;
+        expect(
+          fetch.mock.calls.filter(([url]) => url.endsWith("root.glb")),
+        ).toHaveLength(expected);
+        expect(h.decodedRequests).toHaveLength(expected);
+        expect(retainedBytes()).toBe(
+          expected * decoded().byteEstimate.geometry + 2 * meshCellBytes,
+        );
+        members[0]!.dispose();
+        expect(members[1]!.pick(view, 50, 50)?.status).toBe("hit");
+        expect(retainedBytes()).toBe(
+          decoded().byteEstimate.geometry + meshCellBytes,
+        );
+      } finally {
+        for (const member of members) member.dispose();
+        vi.unstubAllGlobals();
+      }
+      for (const pool of pools)
+        expect(pool.stats()).toMatchObject({
+          activeOperations: 0,
+          cpuRetainedBytes: 0,
+          rendererBytes: 0,
+        });
+    },
+  );
+
+  it.each([false, true])(
+    "keeps shared stages charged while demand withdraws (last=%s)",
+    async (last) => {
+      const h = harness();
+      const network = defer<Response>();
+      const decode = defer<DecodedMeshTileContent>();
+      const cancel = vi.fn();
+      const signals: AbortSignal[] = [];
+      const fetch = vi.fn(
+        async (url: string, { signal }: { signal: AbortSignal }) => {
+          if (url.endsWith("tileset.json")) return Response.json(document());
+          signals.push(signal);
+          return network.promise;
+        },
+      );
+      vi.stubGlobal("fetch", fetch);
+      h.services.workers.decode = vi.fn(() => ({
+        promise: decode.promise,
+        cancel,
+      }));
+      const make = () => {
+        const member = createTiles3dMember(
+          {
+            ...h.context,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...h.config,
+            fetchTileset: undefined,
+            fetchContent: undefined,
+            cacheBytes: 0,
+          },
+          h.services,
+        );
+        member.applyAllocation({
+          qualityFraction: 1,
+          memoryBudgetBytes: 4096,
+          regime: "stationary",
+        });
+        member.setCamera(view);
+        return member;
+      };
+      const a = make();
+      const b = make();
+      try {
+        await flush();
+        expect(signals).toHaveLength(1);
+        expect(h.memory.stats().activeOperations).toBe(1);
+        a.dispose();
+        expect(signals[0]?.aborted).toBe(false);
+        network.resolve(new Response(new ArrayBuffer(8)));
+        await flush();
+        expect(h.services.workers.decode).toHaveBeenCalledOnce();
+        expect(cancel).not.toHaveBeenCalled();
+        if (last) {
+          b.dispose();
+          expect(cancel).toHaveBeenCalledOnce();
+          expect(h.memory.stats()).toMatchObject({
+            activeOperations: 1,
+            workReservedBytes: 8,
+          });
+        }
+        decode.resolve(decoded());
+        await flush();
+        h.submissions.prepareFrame();
+        if (!last) {
+          expect(b.pick(view, 50, 50)?.status).toBe("hit");
+          expect(h.memory.stats()).toMatchObject({
+            activeOperations: 0,
+            workReservedBytes: 0,
+            cpuRetainedBytes: decoded().byteEstimate.geometry + meshCellBytes,
+          });
+        }
+      } finally {
+        a.dispose();
+        b.dispose();
+        vi.unstubAllGlobals();
+      }
+      expect(h.memory.stats()).toMatchObject({
+        activeOperations: 0,
+        workReservedBytes: 0,
+        cpuRetainedBytes: 0,
+        rendererBytes: 0,
+      });
+    },
+  );
+
+  it.each([0, 1024])(
+    "joins a finished tile only while its complete decode is retained (cache=%s)",
+    async (cacheBytes) => {
+      const h = harness();
+      const fetch = vi.fn(async (url: string) =>
+        url.endsWith("tileset.json")
+          ? Response.json(document())
+          : new Response(new ArrayBuffer(8)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const members: ReturnType<typeof createTiles3dMember>[] = [];
+      const open = async () => {
+        const member = createTiles3dMember(
+          {
+            ...h.context,
+            renderer: { addActor: vi.fn(), removeActor: vi.fn() },
+          },
+          {
+            ...h.config,
+            fetchTileset: undefined,
+            fetchContent: undefined,
+            cacheBytes,
+          },
+          h.services,
+        );
+        members.push(member);
+        member.applyAllocation({
+          qualityFraction: 1,
+          memoryBudgetBytes: 4096,
+          regime: "stationary",
+        });
+        member.setCamera(view);
+        await flush();
+        h.submissions.prepareFrame();
+        expect(member.pick(view, 50, 50)?.status).toBe("hit");
+        return member;
+      };
+      try {
+        const first = await open();
+        expect(h.decodedRequests).toHaveLength(1);
+        const second = await open();
+        const expected = cacheBytes > 0 ? 1 : 2;
+        expect(h.decodedRequests).toHaveLength(expected);
+        first.dispose();
+        expect(second.pick(view, 50, 50)?.status).toBe("hit");
+        second.dispose();
+        expect(h.memory.stats().cpuRetainedBytes).toBe(0);
+        await open();
+        expect(h.decodedRequests).toHaveLength(expected + 1);
+      } finally {
+        for (const member of members) member.dispose();
+        vi.unstubAllGlobals();
+      }
+    },
+  );
 
   it.each([104, 110])(
     "recovers mixed pooled and GPU-evicted children within a %i-byte budget",
@@ -825,9 +1077,136 @@ describe("createTiles3dMember", () => {
     expect(member.stats()).toMatchObject({
       errorCount: 1,
       lastError: expect.stringContaining("unsupported required glTF extension"),
+      resourceState: { status: "unsupported" },
       queue: { failed: 1, workPending: false },
     });
     member.dispose();
+  });
+
+  it("recovers a deferred realization when another owner releases headroom", async () => {
+    const h = harness();
+    const other = h.memory.createOwner();
+    const occupied = other.reserveRenderer(4096);
+    const member = createTiles3dMember(
+      h.context,
+      { ...h.config, cacheBytes: 0 },
+      h.services,
+    );
+    member.applyAllocation({
+      qualityFraction: 1,
+      memoryBudgetBytes: 4096,
+      regime: "stationary",
+    });
+    member.setCamera(view);
+    await settle();
+    expect(member.stats()).toMatchObject({
+      resourceState: {
+        status: "blocked",
+        domain: "renderer",
+        reason: "contention",
+        wake: "availability",
+      },
+      renderer: { drawnTileIds: [] },
+    });
+
+    occupied.release();
+    member.prepareFrame();
+    while (h.submissions.hasPending()) h.submissions.prepareFrame();
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "ready" },
+      renderer: { drawnTileIds: ["root"] },
+    });
+    expect(h.contentRequests).toEqual(["/tiles/root.glb"]);
+    member.dispose();
+    other.close();
+  });
+
+  it("retries decoded content after a deferred refusal and release in the same preparation", async () => {
+    const h = harness();
+    const other = h.memory.createOwner();
+    const occupied = other.reserveRenderer(4096);
+    const schedulePreparation = vi.fn();
+    const scheduleRender = vi.fn();
+    const coordinator = createStreamedSceneCoordinator({
+      memory: h.memory,
+      scheduleRender,
+      schedulePreparation,
+    });
+    let attempts = 0;
+    let queued = false;
+    const member = createTiles3dMember(
+      coordinator.context(h.renderer),
+      { ...h.config, cacheBytes: 0 },
+      {
+        ...h.services,
+        createContentAdapter(options) {
+          const adapter = createMeshContentAdapter(options);
+          return {
+            ...adapter,
+            requiredBytes: () => Math.max(58, adapter.requiredBytes()),
+            tileState: (id) => (queued ? "queued" : adapter.tileState(id)),
+            submitTile(id, content, onSubmitted, replacements) {
+              attempts++;
+              if (attempts > 1)
+                return adapter.submitTile(
+                  id,
+                  content,
+                  onSubmitted,
+                  replacements,
+                );
+              queued = true;
+              options.submissions.enqueue({
+                bytes: 0,
+                run() {
+                  queued = false;
+                  options.onAdmissionRefusal?.(
+                    [id],
+                    new ResourcePolicyError("renderer", 4154, 4096, true),
+                  );
+                  occupied.release();
+                },
+              });
+              return "queued";
+            },
+          };
+        },
+      },
+    );
+    const registration = coordinator.register(member);
+    registration.setCamera(view);
+    coordinator.prepareWork(1);
+    await settle();
+    expect(attempts).toBe(1);
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(2);
+    await settle();
+    expect(schedulePreparation).toHaveBeenCalledOnce();
+    expect(attempts).toBe(1);
+
+    schedulePreparation.mockClear();
+    scheduleRender.mockClear();
+    coordinator.prepareWork(3);
+    expect(attempts).toBe(2);
+    for (
+      let frame = 4;
+      frame < 10 && !scheduleRender.mock.calls.length;
+      frame++
+    ) {
+      expect(schedulePreparation).toHaveBeenCalled();
+      schedulePreparation.mockClear();
+      coordinator.prepareWork(frame);
+    }
+    expect(scheduleRender).toHaveBeenCalled();
+    coordinator.prepareFrame(1, 10);
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "ready" },
+      renderer: { drawnTileIds: ["root"] },
+    });
+    expect(h.contentRequests).toEqual(["/tiles/root.glb"]);
+    await settle();
+    coordinator.dispose();
+    other.close();
   });
 
   it.each([1024, 0])(
@@ -861,8 +1240,13 @@ describe("createTiles3dMember", () => {
       // whole view's adaptive quality freezes behind one over-budget tileset.
       expect(member.governorInputs().work.operations).toBe(0);
       expect(member.stats()).toMatchObject({
-        memoryConstrained: true,
         irreducibleBudget: true,
+        resourceState: {
+          status: "blocked",
+          domain: "renderer",
+          reason: "configured-limit",
+          wake: "policy",
+        },
         renderer: { residentBytes: 0 },
       });
       const refusedFetches = h.contentRequests.length;
@@ -1115,7 +1499,7 @@ describe("createTiles3dMember", () => {
       expect(member.governorInputs().work.operations).toBe(0);
       expect(
         h.contentRequests.filter((url) => url.endsWith("/child-0.glb")),
-      ).toHaveLength(evict ? 2 : 1);
+      ).toHaveLength(1);
       expect(
         h.contentRequests.filter((url) => url.endsWith("/child-1.glb")),
       ).toHaveLength(1);
@@ -1224,7 +1608,7 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
-  it("retries a memory-constrained member when the camera changes its desired frontier", async () => {
+  it("retries a refused replacement group when the camera changes its desired frontier", async () => {
     const h = harness(true, 128);
     const member = createTiles3dMember(h.context, h.config, h.services);
     member.applyAllocation({
@@ -1239,7 +1623,6 @@ describe("createTiles3dMember", () => {
       await settle();
     }
     expect(member.stats()).toMatchObject({
-      memoryConstrained: true,
       renderer: { drawnTiles: 1, residentBytes: 52 },
     });
 
@@ -1488,7 +1871,7 @@ describe("createTiles3dMember", () => {
     expect((member.stats() as Tiles3dMemberStats).renderer.pendingTiles).toBe(
       0,
     );
-    expect(h.decodedRequests.length).toBeGreaterThan(1);
+    expect(h.decodedRequests).toHaveLength(1);
     member.applyAllocation({
       qualityFraction: 1,
       memoryBudgetBytes: 4096,
@@ -1602,6 +1985,60 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
+  it("serves visible descendants even when the coarsest representation is unaffordable", async () => {
+    const h = harness();
+    h.services.workers.decode = (request) => {
+      const content = decoded();
+      if (request.contentUrl.endsWith("/root.glb"))
+        content.primitives.push(
+          ...Array.from({ length: 9 }, () =>
+            structuredClone(content.primitives[0]!),
+          ),
+        );
+      return { promise: Promise.resolve(content), cancel: vi.fn() };
+    };
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maximumScreenSpaceErrorPx: Number.MAX_VALUE,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            ...document(),
+            root: tile("root.glb", 8, [
+              tile("left.glb", 0),
+              tile("right.glb", 0),
+            ]),
+          }),
+        }),
+      },
+      h.services,
+    );
+    try {
+      member.applyAllocation({
+        qualityFraction: 1,
+        memoryBudgetBytes: 104,
+        regime: "stationary",
+      });
+      member.setCamera(view);
+      for (let i = 0; i < 8; i++) {
+        await settle();
+        while (h.submissions.hasPending()) h.submissions.prepareFrame();
+      }
+      expect(member.governorInputs().memoryDemand?.minimumBytes).toBe(0);
+      expect(member.governorInputs().work.operations).toBe(0);
+      expect(member.stats()).toMatchObject({
+        renderer: { drawnTileIds: ["root/0", "root/1"], residentBytes: 104 },
+        irreducibleBudget: false,
+      });
+    } finally {
+      member.dispose();
+    }
+  });
+
   it("keeps affordable detail when an unresident branch must coarsen", async () => {
     const h = harness();
     const releases = new Map<string, () => void>();
@@ -1670,6 +2107,7 @@ describe("createTiles3dMember", () => {
       "root/0/0",
       "root/1",
     ]);
+    expect(member.governorInputs().memoryDemand?.minimumBytes).toBe(0);
     expect(stats.memoryConstrained).toBe(false);
     member.dispose();
   });
@@ -1756,20 +2194,9 @@ describe("createTiles3dMember", () => {
       const stats = member.stats() as Tiles3dMemberStats;
       expect(stats.renderer.residentBytes).toBeLessThanOrEqual(budget);
       expect([...stats.renderer.drawnTileIds].sort()).toEqual(
-        budget === 208 && cacheBytes >= 84
-          ? ["root/0", "root/1", "root/2", "root/3"]
-          : ["root"],
+        budget === 208 ? ["root/0", "root/1", "root/2", "root/3"] : ["root"],
       );
-      if (budget === 208 && cacheBytes < 84) {
-        member.setConfig({ ...h.config, concurrency: 5, cacheBytes: 1024 });
-        await drain();
-        expect(member.governorInputs().work.operations).toBe(0);
-        expect(
-          [
-            ...(member.stats() as Tiles3dMemberStats).renderer.drawnTileIds,
-          ].sort(),
-        ).toEqual(["root/0", "root/1", "root/2", "root/3"]);
-      }
+      expect(new Set(h.contentRequests).size).toBe(h.contentRequests.length);
       member.dispose();
     },
   );
@@ -2024,11 +2451,7 @@ describe("createTiles3dMember", () => {
 
     const stats = member.stats() as Tiles3dMemberStats;
     expect(stats).toMatchObject({
-      // The unaffordable pair is a fact about one branch, not about the
-      // member: falling back to the root here would throw away the right
-      // branch's detail, which is affordable and already drawn.
       memoryConstrained: false,
-      blockedGroups: 1,
     });
     // The left branch holds at its own content; the right branch is refined
     // to its leaves, which a collapse to the root would have thrown away.

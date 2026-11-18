@@ -447,6 +447,7 @@ export const createCopcTileSource = async (
   const decodeState: CopcDecodeState = { copc, rgbShift };
 
   return {
+    tileLane: "compute",
     metadata: () => metadata,
     decodeState,
     entry: (key) => nodeMap.get(keyToString(key)),

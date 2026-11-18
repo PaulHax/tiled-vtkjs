@@ -1,6 +1,7 @@
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkGenericRenderWindow from "@kitware/vtk.js/Rendering/Misc/GenericRenderWindow";
 import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
+import { withPointTextureUploads } from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
 import vtkPolyData from "@kitware/vtk.js/Common/DataModel/PolyData";
 import vtkActor from "@kitware/vtk.js/Rendering/Core/Actor";
 import vtkMapper from "@kitware/vtk.js/Rendering/Core/Mapper";
@@ -17,6 +18,41 @@ import { createGaussianDistanceSorter } from "../../src/tiles3d/gaussianSort";
 import { createTiles3dMember } from "../../src/tiles3d/member";
 
 const mode = new URLSearchParams(location.search).get("mode") ?? "shared";
+const measureUploads = mode === "budgeted-uploads";
+let uploads = [];
+let phase = "prepare";
+let uploadStateReads = 0;
+let probePaints = 0;
+let probePixel = [0, 0, 0, 0];
+let externalTexture;
+if (measureUploads) {
+  const prototype = WebGL2RenderingContext.prototype;
+  const getParameter = prototype.getParameter;
+  prototype.getParameter = function (parameter) {
+    if (phase === "prepare" && parameter === this.PIXEL_UNPACK_BUFFER_BINDING)
+      uploadStateReads++;
+    return getParameter.call(this, parameter);
+  };
+  const texSubImage = prototype.texSubImage2D;
+  prototype.texSubImage2D = function (...args) {
+    if (ArrayBuffer.isView(args[8]))
+      uploads.push({
+        phase,
+        kind: args[6] === this.RED_INTEGER ? "order" : "attributes",
+        x: args[2],
+        y: args[3],
+        count: args[4] * args[5],
+        bytes: args[8].byteLength,
+      });
+    return texSubImage.apply(this, args);
+  };
+  const bufferData = prototype.bufferData;
+  prototype.bufferData = function (...args) {
+    if (ArrayBuffer.isView(args[1]))
+      uploads.push({ phase, kind: "mesh", bytes: args[1].byteLength });
+    return bufferData.apply(this, args);
+  };
+}
 const generic = vtkGenericRenderWindow.newInstance({ background: [0, 0, 0] });
 generic.setContainer(document.querySelector("#view"));
 generic.resize();
@@ -36,9 +72,23 @@ camera.setViewUp(0, 1, 0);
 camera.setParallelProjection(true);
 camera.setParallelScale(1.2);
 camera.setClippingRange(0.1, 100);
+let frameQueued = false;
+let suspendSubmissions = mode === "member-recovery";
+const paintChannel = new MessageChannel();
+paintChannel.port1.onmessage = () => {
+  frameQueued = false;
+  if (suspendSubmissions) return;
+  scheduler.prepareFrame();
+  renderWindow.render();
+};
+const scheduleFrame = () => {
+  if (frameQueued || measureUploads || suspendSubmissions) return;
+  frameQueued = true;
+  paintChannel.port2.postMessage(null);
+};
 const scheduler = createSubmissionScheduler({
-  scheduleRender() {},
-  maxBytesPerFrame: 1_000_000,
+  scheduleRender: scheduleFrame,
+  maxBytesPerFrame: measureUploads ? 1024 : 1_000_000,
   now: () => 0,
 });
 const errors = [];
@@ -56,10 +106,12 @@ const distanceSorter = createGaussianDistanceSorter();
 let hold = false;
 const pending = [];
 const blockedWork = [];
+let releaseSortLane;
 const blockingOwner = memoryPool.createOwner();
 const factory = createGaussianContentAdapterFactory({
   resourceBudgetBytes: mode === "budget" ? 1600 : 131072,
   maximumVisibleSplats: 100,
+  ...(measureUploads ? { getOpenGLRenderWindow: () => openGL } : {}),
   createSortBackend: () => ({
     sort(job) {
       if (hold)
@@ -260,6 +312,8 @@ if (
     ],
     [],
   );
+} else if (mode === "budgeted-uploads") {
+  // The test supplies both frontiers and controls each paint.
 } else if (mode === "mesh-blend" || mode === "blend-before-gaussian") {
   adapters[1].submitTile("field", translucentMesh);
   if (mode === "blend-before-gaussian")
@@ -295,6 +349,7 @@ const setCamera = (position) => {
   for (const adapter of adapters) adapter.setCamera(view());
 };
 const settle = async () => {
+  suspendSubmissions = mode === "member-recovery";
   while (scheduler.hasPending()) scheduler.prepareFrame();
   await factory.whenIdle(renderer);
   renderWindow.render();
@@ -307,6 +362,109 @@ let recoveryMember;
 let recoveryConfig;
 const recoveryFetches = [];
 globalThis.gaussianFixture = {
+  stageMixedProbe(id, count, triangleCount, replacement = []) {
+    const parts = (Array.isArray(count) ? count : [count]).map((length) =>
+      field(
+        Array.from({ length }, () => (id === "parent" ? red : blue)),
+        id === "parent" ? 0 : 1,
+      ),
+    );
+    const content = {
+      ...parts[0],
+      primitives: parts.flatMap(({ primitives }) => primitives),
+      byteEstimate: {
+        geometry: parts.reduce(
+          (sum, part) => sum + part.byteEstimate.geometry,
+          0,
+        ),
+        textures: 0,
+      },
+    };
+    const patch = triangle(-1, [0, 1, 0, 1], "OPAQUE");
+    patch.positions = Float32Array.from(
+      Array.from({ length: triangleCount }, () => [...patch.positions]).flat(),
+    );
+    content.primitives.push(patch);
+    return adapters[0].submitTile(
+      id,
+      content,
+      () => {
+        adapters[0].setDrawnTiles([id]);
+        for (const old of replacement) adapters[0].retireTile(old);
+      },
+      replacement,
+    );
+  },
+  addInvisibleProbe(id) {
+    return adapters[0].submitTile(id, field([blue]));
+  },
+  stepMixedProbe(painting = true) {
+    uploads = [];
+    uploadStateReads = 0;
+    const gl = openGL.getContext();
+    phase = "prepare";
+    const active = gl.getParameter(gl.ACTIVE_TEXTURE);
+    const bound = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const alignment = gl.getParameter(gl.UNPACK_ALIGNMENT);
+    if (!externalTexture || !gl.isTexture(externalTexture)) {
+      externalTexture = gl.createTexture();
+    }
+    gl.bindTexture(gl.TEXTURE_2D, externalTexture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 8);
+    factory.noteContext(renderer);
+    withPointTextureUploads(openGL, () =>
+      scheduler.prepareFrame(undefined, painting),
+    );
+    const stateRestored =
+      gl.getParameter(gl.UNPACK_ALIGNMENT) === 8 &&
+      gl.getParameter(gl.ACTIVE_TEXTURE) === active &&
+      gl.getParameter(gl.TEXTURE_BINDING_2D) === externalTexture;
+    gl.bindTexture(gl.TEXTURE_2D, bound && gl.isTexture(bound) ? bound : null);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, alignment);
+    if (painting) {
+      phase = "draw";
+      renderWindow.render();
+      const pixel = new Uint8Array(4);
+      gl.readPixels(128, 128, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+      probePixel = [...pixel];
+      probePaints++;
+    }
+    return {
+      pixel: probePixel,
+      paints: probePaints,
+      uploads,
+      uploadStateReads,
+      stateRestored,
+      stats: factory.stats(renderer),
+      picks: adapters[0].pickableMeshTiles().map(({ id }) => id),
+      queued: scheduler.hasPending(),
+    };
+  },
+  async restoreMixedProbeContext() {
+    const canvas = openGL.getCanvas();
+    const extension = openGL.getContext().getExtension("WEBGL_lose_context");
+    if (!extension)
+      throw new Error("WebGL context loss simulation is unavailable");
+    const before = openGL.getGraphicsResourceGeneration();
+    const lost = new Promise((resolve) =>
+      canvas.addEventListener("webglcontextlost", resolve, { once: true }),
+    );
+    extension.loseContext();
+    await lost;
+    factory.noteContext(renderer);
+    // Dispatch must complete before the loss extension allows restoration.
+    await new Promise(requestAnimationFrame);
+    const restored = new Promise((resolve) =>
+      canvas.addEventListener("webglcontextrestored", resolve, { once: true }),
+    );
+    extension.restoreContext();
+    await restored;
+    return { before, after: openGL.getGraphicsResourceGeneration() };
+  },
+  cancelMixedProbe(id) {
+    adapters[0].retireTile(id);
+    adapters[0].setDrawnTiles(["parent"]);
+  },
   async showCachedMeshParent() {
     adapters[0].setVisible(true);
     const outcome = adapters[0].submitTile(
@@ -527,6 +685,7 @@ globalThis.gaussianFixture = {
   },
   stats: () => factory.stats(renderer),
   submitWithoutCamera(prepared) {
+    suspendSubmissions = true;
     const content = field([red]);
     content.primitives.push(triangle(-1, [0, 0, 1, 1], "OPAQUE"));
     const outcome = adapters[0].submitTile("unplaced", content);
@@ -597,6 +756,7 @@ globalThis.gaussianFixture = {
     await settle();
   },
   queueDemand(gaussian) {
+    suspendSubmissions = true;
     let ready = 0;
     const entries = ["left", "right"].map((id) => {
       const content = gaussian
@@ -723,6 +883,7 @@ globalThis.gaussianFixture = {
     while (scheduler.hasPending()) scheduler.prepareFrame();
   },
   stageGrowth(id, count, restoreWork = false) {
+    suspendSubmissions = true;
     if (restoreWork) {
       memoryPool.configure({ workBytes: 1048576 });
       for (const adapter of adapters) adapter.clearRequiredBytes();
@@ -754,22 +915,38 @@ globalThis.gaussianFixture = {
   },
   errors: () => errors,
   pending: () => pending.length,
-  async blockWork(kind = "slots") {
+  blockWork(kind = "slots") {
     if (kind !== "slots") {
       memoryPool.configure({ workBytes: 2112 });
       blockedWork.push(
-        await blockingOwner.work(undefined, kind === "bytes" ? 1584 : 1056),
+        blockingOwner.work(undefined, kind === "bytes" ? 1584 : 1056),
       );
-      if (kind === "growth") blockedWork.push(await blockingOwner.work());
-    } else {
-      blockedWork.push(await blockingOwner.work(), await blockingOwner.work());
+    }
+    if (kind !== "bytes") {
+      void memoryPool.admission.run({
+        signal: new AbortController().signal,
+        stage: {
+          lane: "sort",
+          start: (signal) => {
+            const work = blockingOwner.work(signal);
+            return new Promise((resolve) => {
+              releaseSortLane = () => {
+                work.release();
+                resolve({ value: undefined });
+              };
+            });
+          },
+        },
+      });
     }
   },
   releaseWork() {
     for (const work of blockedWork.splice(0)) work.release();
+    globalThis.gaussianFixture.releaseWorkSlot();
   },
   releaseWorkSlot() {
-    blockedWork.pop().release();
+    releaseSortLane?.();
+    releaseSortLane = undefined;
   },
   releaseNext() {
     const entry = pending.shift();
@@ -817,8 +994,10 @@ globalThis.gaussianFixture = {
     recoveryMember?.dispose();
     for (const adapter of adapters) adapter.dispose();
     scheduler.dispose();
+    paintChannel.port1.close();
+    paintChannel.port2.close();
     for (const memory of memoryOwners) memory.close();
-    for (const work of blockedWork.splice(0)) work.release();
+    globalThis.gaussianFixture.releaseWork();
     blockingOwner.close();
     generic.delete();
   },

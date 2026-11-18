@@ -40,6 +40,14 @@ export type GaussianSortBackend = {
   dispose(): void;
 };
 
+/** The backend must be replaced before another job can use it. */
+export class GaussianSortWorkerError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GaussianSortWorkerError";
+  }
+}
+
 const checkCamera = (camera: GaussianCameraPosition): void => {
   if (camera.length !== 3 || !camera.every(Number.isFinite)) {
     throw new TypeError(
@@ -159,18 +167,25 @@ const sameCamera = (
   b: GaussianCameraPosition,
 ): boolean => a.every((value, axis) => value === b[axis]);
 
-/** One running job and one latest request; only a current result is presented. */
+/** One running job and one latest request. Compatible results publish in dispatch order. */
 export const createGaussianSortController = ({
   backend,
   schedule = (run) => run(),
+  canPresent,
   onOrder,
   onError,
+  onWorkerError,
+  onIdle,
 }: {
   backend: GaussianSortBackend;
   /** Invoke once work is admitted; queued scene and camera changes coalesce. */
   schedule?: (run: () => Promise<void>) => Promise<void>;
+  /** Check hard scene validity. The job may have an older camera or scene revision. */
+  canPresent?(job: GaussianSortJob): boolean;
   onOrder(presentation: GaussianSortPresentation): void;
   onError(error: unknown): void;
+  onWorkerError?(error: GaussianSortWorkerError): "retry" | "stop";
+  onIdle?(): void;
 }) => {
   let sceneRevision = 0;
   let ranges: readonly GaussianSortRange[] = [];
@@ -179,11 +194,13 @@ export const createGaussianSortController = ({
   let running = false;
   let completed: GaussianSortJob | null = null;
   let disposed = false;
+  let stopped = false;
   const idleWaiters = new Set<() => void>();
 
   const settleIdle = (): void => {
     for (const resolve of idleWaiters) resolve();
     idleWaiters.clear();
+    if (!disposed) safeCall(onIdle);
   };
 
   const current = (job: GaussianSortJob): boolean =>
@@ -193,6 +210,10 @@ export const createGaussianSortController = ({
 
   const start = (): void => {
     if (disposed || running || !camera) return;
+    if (stopped) {
+      settleIdle();
+      return;
+    }
     if (completed && current(completed)) {
       settleIdle();
       return;
@@ -212,24 +233,34 @@ export const createGaussianSortController = ({
           job = dispatched;
           const jobIdentities = identities;
           const order = await backend.sort(dispatched);
-          if (!disposed && current(dispatched)) {
+          if (!disposed) {
             completed = dispatched;
-            safeCall(() =>
-              onOrder({
-                sceneRevision: dispatched.sceneRevision,
-                cameraPosition: dispatched.cameraPosition,
-                ranges: jobIdentities,
-                order,
-              }),
-            );
+            if (
+              canPresent?.(dispatched) ??
+              dispatched.sceneRevision === sceneRevision
+            )
+              safeCall(() =>
+                onOrder({
+                  sceneRevision: dispatched.sceneRevision,
+                  cameraPosition: dispatched.cameraPosition,
+                  ranges: jobIdentities,
+                  order,
+                }),
+              );
           }
         });
       })
       .catch((error: unknown) => {
-        if (!disposed && camera && (!job || current(job))) {
-          completed = job ?? { sceneRevision, ranges, cameraPosition: camera };
-          safeCall(() => onError(error));
-        }
+        if (disposed || !camera) return;
+        const failed = job ?? { sceneRevision, ranges, cameraPosition: camera };
+        completed = failed;
+        if (error instanceof GaussianSortWorkerError && onWorkerError)
+          safeCall(() => {
+            const action = onWorkerError(error);
+            if (action === "retry") completed = null;
+            else stopped = true;
+          });
+        else if (current(failed)) safeCall(() => onError(error));
       })
       .finally(() => {
         running = false;
@@ -272,7 +303,7 @@ export const createGaussianSortController = ({
       start();
     },
     whenIdle(): Promise<void> {
-      return disposed || !running
+      return !running
         ? Promise.resolve()
         : new Promise((resolve) => {
             idleWaiters.add(resolve);
@@ -285,11 +316,7 @@ export const createGaussianSortController = ({
       identities = [];
       camera = null;
       completed = null;
-      try {
-        backend.dispose();
-      } finally {
-        settleIdle();
-      }
+      backend.dispose();
     },
   };
 };
@@ -297,6 +324,7 @@ export const createGaussianSortController = ({
 export type GaussianSortWorkerLike = {
   onmessage: ((event: MessageEvent) => void) | null;
   onerror: ((event: ErrorEvent) => void) | null;
+  onmessageerror?: ((event: MessageEvent) => void) | null;
   postMessage(message: unknown): void;
   terminate(): void;
 };
@@ -321,6 +349,7 @@ export type GaussianSortWorkerResponse =
 /** Owns and terminates one worker. Scene attributes are cloned once per revision. */
 export const createGaussianSortWorkerBackend = (
   worker: GaussianSortWorkerLike,
+  onIdleFailure?: (error: GaussianSortWorkerError) => void,
 ): GaussianSortBackend => {
   let disposed = false;
   let revision: number | null = null;
@@ -336,6 +365,19 @@ export const createGaussianSortWorkerBackend = (
     const active = pending;
     pending = null;
     active?.reject(error);
+  };
+  const terminate = (
+    error: GaussianSortWorkerError,
+    reportIdle = true,
+  ): void => {
+    if (disposed) return;
+    disposed = true;
+    worker.onmessage = null;
+    worker.onerror = null;
+    worker.onmessageerror = null;
+    worker.terminate();
+    if (pending) fail(error);
+    else if (reportIdle) safeCall(() => onIdleFailure?.(error));
   };
   worker.onmessage = ({ data }: MessageEvent<unknown>) => {
     if (disposed || !pending || !data || typeof data !== "object") return;
@@ -357,22 +399,32 @@ export const createGaussianSortWorkerBackend = (
       pending = null;
       active.resolve(reply.order);
     } else {
-      fail(new Error("Gaussian sort worker returned an invalid response"));
+      terminate(
+        new GaussianSortWorkerError(
+          "Gaussian sort worker returned an invalid response",
+        ),
+      );
     }
   };
-  worker.onerror = (event) => {
-    if (disposed) return;
-    disposed = true;
-    worker.onmessage = null;
-    worker.onerror = null;
-    worker.terminate();
-    fail(new Error(event.message || "Gaussian sort worker failed"));
-  };
+  worker.onerror = (event) =>
+    terminate(
+      new GaussianSortWorkerError(
+        event.message || "Gaussian sort worker failed",
+      ),
+    );
+  worker.onmessageerror = () =>
+    terminate(
+      new GaussianSortWorkerError(
+        "Gaussian sort worker response could not be read",
+      ),
+    );
 
   return {
     sort(job) {
       if (disposed)
-        return Promise.reject(new Error("Gaussian sort worker is disposed"));
+        return Promise.reject(
+          new GaussianSortWorkerError("Gaussian sort worker is disposed"),
+        );
       if (pending)
         return Promise.reject(new Error("Gaussian sort worker is busy"));
       return new Promise((resolve, reject) => {
@@ -402,17 +454,19 @@ export const createGaussianSortWorkerBackend = (
             cameraPosition: job.cameraPosition,
           } satisfies GaussianSortWorkerRequest);
         } catch (error) {
-          fail(error instanceof Error ? error : new Error(String(error)));
+          terminate(
+            new GaussianSortWorkerError("Could not send Gaussian sort work", {
+              cause: error,
+            }),
+          );
         }
       });
     },
     dispose() {
-      if (disposed) return;
-      disposed = true;
-      worker.onmessage = null;
-      worker.onerror = null;
-      worker.terminate();
-      fail(new Error("Gaussian sort worker is disposed"));
+      terminate(
+        new GaussianSortWorkerError("Gaussian sort worker is disposed"),
+        false,
+      );
     },
   };
 };

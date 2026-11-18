@@ -426,11 +426,12 @@ streamed on demand from the [New York Times tileset](https://int.nyt.com/data/3d
 
 ### Supported 3D Tiles profile
 
-The mesh member deliberately accepts a narrow, typed 3D Tiles 1.1 profile:
+The tiles member implements the following 3D Tiles 1.1 profile.
 
 - `REPLACE` refinement, affine transforms, oriented `box` bounding volumes,
   and one glTF/GLB content per tile;
-- explicit trees, including contentless structural ancestors;
+- explicit trees, including contentless structural ancestors. Traversal uses
+  each authored tile's `boundingVolume`. Optional per-content bounds are ignored.
 - implicit `QUADTREE` roots with four subtree levels, 1 to 31 available levels, relative same-root URI
   templates containing exactly one `{level}`, `{x}`, and `{y}` placeholder;
 - binary subtree version 1 with inline availability bitstreams and one
@@ -440,7 +441,9 @@ The mesh member deliberately accepts a narrow, typed 3D Tiles 1.1 profile:
 - glTF required extensions `KHR_draco_mesh_compression`, `KHR_texture_basisu`,
   `KHR_materials_unlit`, `KHR_mesh_quantization`, and `EXT_meshopt_compression`. Other required extensions
   fail as `TileUnsupportedExtensionError` with tile URI and decode stage.
-- glTF `TRIANGLES` and `TRIANGLE_STRIP` primitive modes; other primitive modes fail explicitly.
+- glTF `TRIANGLES` and `TRIANGLE_STRIP` primitive modes with the default mesh
+  adapter. The optional Gaussian adapter adds supported `POINTS` content.
+  See [Gaussian reconstruction profiles](./docs/gaussian-splats.md#decoded-content).
 
 Retired mesh resources stay attached but invisible while pooled, preserving vtk
 render nodes and GPU buffers/textures across reuse. They are excluded from draws

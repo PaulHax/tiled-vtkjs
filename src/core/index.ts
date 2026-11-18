@@ -95,3 +95,9 @@ export {
   type ViewGovernorOptions,
   type ViewGovernorStats,
 } from "./viewGovernor";
+
+export {
+  createRequestAdmission,
+  getPageRequestAdmission,
+  type RequestAdmission,
+} from "./requestAdmission";

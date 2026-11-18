@@ -3,15 +3,27 @@ import { describe, expect, it, vi } from "vitest";
 import { perspectiveView } from "../../test/helpers";
 import { createMemoryPool } from "../core/memoryPool";
 import { ROOT_KEY } from "./octree";
+import { createHttpTileSource, PCT1_HEADER_BYTES } from "./httpTileSource";
 import {
   createPointCloudMember,
   type PointCloudMemberConfig,
+  type PointCloudMemberServices,
   type PointCloudMemberStats,
 } from "./pointCloudMember";
 import { createStreamedSceneCoordinator } from "../core/streamedSceneCoordinator";
-import { createSubmissionScheduler } from "../core/submissionScheduler";
+import {
+  createSubmissionFrameBudget,
+  createSubmissionScheduler,
+} from "../core/submissionScheduler";
+import { createMeshAdapter } from "../tiles3d/meshAdapter";
+import type { DecodedMeshTileContent } from "../tiles3d/decode";
 import type { StreamedMemberContext } from "../core/streamedMember";
 import type { TileSource } from "./tileSource";
+import type {
+  StubActor,
+  StubMapper,
+  StubPolyData,
+} from "../../test/stubs/vtkStub";
 
 const settle = async (): Promise<void> => {
   await Promise.resolve();
@@ -72,7 +84,420 @@ const config = (
   ...overrides,
 });
 
+const preparationView = (
+  memory = createMemoryPool({ totalBytes: 16_000 }),
+  budget = createSubmissionFrameBudget(160, 100),
+) => {
+  const { context, renderer } = makeContext(memory);
+  let requestPreparation!: () => void;
+  const prepare = new Promise<void>((resolve) => {
+    requestPreparation = resolve;
+  });
+  const paint = vi.fn();
+  const submissions = createSubmissionScheduler({
+    budget,
+    schedulePreparation: requestPreparation,
+    scheduleRender: paint,
+    now: () => 0,
+  });
+  let queueSize = 0;
+  let resolveQueue: (() => void) | undefined;
+  const onWorkChange = (): void => {
+    if (submissions.stats().queuedJobs >= queueSize) resolveQueue?.();
+  };
+  const whenQueued = (count: number): Promise<void> => {
+    if (submissions.stats().queuedJobs >= count) return Promise.resolve();
+    queueSize = count;
+    return new Promise((resolve) => {
+      resolveQueue = resolve;
+    });
+  };
+  const release = vi.fn();
+  const view = {
+    getContext: () =>
+      ({ isContextLost: () => false }) as WebGL2RenderingContext,
+    preparePolygonalGeometry: vi.fn((owner: unknown, actor: unknown) => {
+      expect(owner).toBe(renderer);
+      const { visibility, mapper } = actor as StubActor;
+      expect(visibility).toBe(false);
+      const { points } = (mapper as StubMapper).inputData as StubPolyData;
+      return { bytes: (points as Float32Array).byteLength, release };
+    }),
+  };
+  const services: PointCloudMemberServices = {
+    getOpenGLRenderWindow: () => view,
+  };
+  const createPoint = (
+    sourceConfig = config({ source: source(1), pointCount: 1 }),
+  ) => {
+    const point = createPointCloudMember(
+      { ...context, submissions, scheduleRender: paint, onWorkChange },
+      sourceConfig,
+      services,
+    );
+    point.applyAllocation({
+      qualityFraction: 1,
+      memoryBudgetBytes: 1024,
+      regime: "stationary",
+    });
+    point.setCamera(VIEW);
+    return point;
+  };
+  return {
+    prepare,
+    paint,
+    submissions,
+    renderer,
+    view,
+    release,
+    createPoint,
+    whenQueued,
+  };
+};
+
+const meshContent: DecodedMeshTileContent = {
+  origin: [0, 0, 0],
+  primitives: [
+    {
+      kind: "mesh",
+      positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+      normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+      material: {
+        baseColorFactor: [1, 1, 1, 1],
+        raw: {
+          version: 1,
+          kind: "gltf-material",
+          alphaMode: "OPAQUE",
+          alphaCutoff: 0.5,
+          doubleSided: false,
+          unlit: false,
+          metallicFactor: 0,
+          roughnessFactor: 1,
+          emissiveFactor: [0, 0, 0],
+        },
+      },
+    },
+  ],
+  byteEstimate: { geometry: 72, textures: 0 },
+};
+
 describe("createPointCloudMember", () => {
+  it.each([false, true])(
+    "shares revision-scoped HTTP payloads across independent views (late=%s)",
+    async (late) => {
+      const memory = createMemoryPool({ totalBytes: 16_000 });
+      const first = preparationView(memory);
+      const second = preparationView(memory);
+      const buffer = new ArrayBuffer(PCT1_HEADER_BYTES + 12);
+      const header = new DataView(buffer);
+      header.setUint32(0, 0x31544350, true);
+      header.setUint32(4, 1, true);
+      const fetch = vi.fn(async (input: string) =>
+        input.endsWith(".json")
+          ? Response.json({
+              nodes: {
+                "0-0-0-0": {
+                  pointCount: 1,
+                  bounds: { min: [-1, -1, -0.5], max: [1, 1, 0.5] },
+                  spacing: 1,
+                  children: [],
+                },
+              },
+            })
+          : new Response(buffer.slice(0)),
+      );
+      vi.stubGlobal("fetch", fetch);
+      const makeSource = () =>
+        createHttpTileSource({
+          endpoint: "/points/r1",
+          metadata: { pointCount: 1 },
+        });
+      const pointConfig = () => config({ source: makeSource(), pointCount: 1 });
+      const draw = async (view: ReturnType<typeof preparationView>) => {
+        await view.whenQueued(1);
+        view.submissions.prepareFrame(1, false);
+        view.submissions.prepareFrame(1, true);
+      };
+      const a = first.createPoint(pointConfig());
+      let b: ReturnType<typeof createPointCloudMember> | undefined;
+      try {
+        const firstDrawn = draw(first);
+        if (late) await firstDrawn;
+        b = second.createPoint(pointConfig());
+        await firstDrawn;
+        await draw(second);
+        expect(a.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(b.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+          "/points/r1/hierarchy/0-0-0-0.json",
+          "/points/r1/tile/0-0-0-0.bin",
+        ]);
+        expect(memory.stats().cpuRetainedBytes).toBe(buffer.byteLength);
+        a.dispose();
+        expect(first.release).toHaveBeenCalledOnce();
+        expect(second.release).not.toHaveBeenCalled();
+        expect(b.pick(VIEW, 50, 50)?.status).toBe("hit");
+        expect(memory.stats().cpuRetainedBytes).toBe(buffer.byteLength);
+      } finally {
+        a.dispose();
+        b?.dispose();
+        first.submissions.dispose();
+        second.submissions.dispose();
+        vi.unstubAllGlobals();
+      }
+      expect(memory.stats()).toMatchObject({
+        activeOperations: 0,
+        cpuRetainedBytes: 0,
+        cpuReservedBytes: 0,
+        rendererBytes: 0,
+      });
+    },
+  );
+
+  it("shares preparation with mesh and another view, publishing picks only at paint", async () => {
+    const memory = createMemoryPool({ totalBytes: 16_000 });
+    const budget = createSubmissionFrameBudget(96, 100);
+    const first = preparationView(memory, budget);
+    const second = preparationView(memory, budget);
+    const mesh = createMeshAdapter({
+      renderer: first.renderer,
+      scheduleRender: () => {},
+      submissions: first.submissions,
+    });
+    expect(
+      mesh.submitTile("mesh", meshContent, () => mesh.setDrawnTiles(["mesh"])),
+    ).toBe("queued");
+    const a = first.createPoint(config({ source: source(5), pointCount: 5 }));
+    const b = second.createPoint(config({ source: source(5), pointCount: 5 }));
+    // Both decoders have supplied their payloads before the first shared slice.
+    await Promise.all([first.whenQueued(2), second.whenQueued(1)]);
+    try {
+      first.submissions.prepareFrame(1, false);
+      second.submissions.prepareFrame(1, false);
+      expect(mesh.stats().drawnTileIds).toEqual(["mesh"]);
+      expect(first.view.preparePolygonalGeometry).not.toHaveBeenCalled();
+      expect(second.view.preparePolygonalGeometry).not.toHaveBeenCalled();
+      expect(a.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+      expect(b.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+
+      first.submissions.prepareFrame(2, false);
+      second.submissions.prepareFrame(2, false);
+      expect(first.view.preparePolygonalGeometry).not.toHaveBeenCalled();
+      expect(second.view.preparePolygonalGeometry).toHaveBeenCalledOnce();
+      expect(b.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+      expect((b.stats() as PointCloudMemberStats).renderer).toMatchObject({
+        drawnPoints: 0,
+        gpuGeometryUploadBytes: 60,
+      });
+      expect(second.paint).toHaveBeenCalledOnce();
+      second.submissions.prepareFrame(2, true);
+      expect(second.paint).toHaveBeenCalledOnce();
+      expect(b.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1,
+      });
+      expect(a.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+
+      first.submissions.prepareFrame(3, false);
+      first.submissions.prepareFrame(3, true);
+      expect(first.view.preparePolygonalGeometry).toHaveBeenCalledOnce();
+      expect(a.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1,
+      });
+      a.dispose();
+      expect(first.release).toHaveBeenCalledOnce();
+      expect(second.release).not.toHaveBeenCalled();
+      expect(b.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1,
+      });
+    } finally {
+      a.dispose();
+      b.dispose();
+      mesh.dispose();
+      first.submissions.dispose();
+      second.submissions.dispose();
+    }
+    expect(memory.stats()).toMatchObject({
+      owners: 0,
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+    });
+  });
+
+  it("discards hidden uploads on deactivation before they are pickable", async () => {
+    const memory = createMemoryPool({ totalBytes: 16_000 });
+    const view = preparationView(memory);
+    const point = view.createPoint();
+    try {
+      await view.prepare;
+      view.submissions.prepareFrame(1, false);
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledOnce();
+      expect(point.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+
+      point.setActive(false);
+      await Promise.resolve();
+      view.submissions.prepareFrame(1, true);
+      expect(point.pick(VIEW, 50, 50)).toBeNull();
+      expect(view.release).toHaveBeenCalledOnce();
+      expect(view.renderer.removeActor).toHaveBeenCalledOnce();
+      expect(
+        (point.stats() as PointCloudMemberStats).renderer.drawnPoints,
+      ).toBe(0);
+      expect(memory.stats().rendererBytes).toBe(0);
+    } finally {
+      point.dispose();
+      view.submissions.dispose();
+    }
+    expect(memory.stats()).toMatchObject({
+      owners: 0,
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+    });
+  });
+
+  it("invalidates a prepared actor synchronously when the source is replaced", async () => {
+    const view = preparationView();
+    const point = view.createPoint();
+    try {
+      await view.prepare;
+      view.submissions.prepareFrame(1, false);
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledOnce();
+      point.setConfig(config({ source: source(2), pointCount: 2 }));
+      expect(view.release).toHaveBeenCalledOnce();
+      view.submissions.prepareFrame(1, true);
+      expect(
+        (point.stats() as PointCloudMemberStats).renderer.drawnPoints,
+      ).toBe(0);
+      expect(point.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+    } finally {
+      point.dispose();
+      view.submissions.dispose();
+    }
+  });
+
+  it("uploads an oversized root in bounded spans and publishes its original progressive prefix", async () => {
+    const memory = createMemoryPool({ totalBytes: 16_000 });
+    const view = preparationView(memory, createSubmissionFrameBudget(24, 100));
+    const count = 7;
+    const positions = new Float32Array(count * 3);
+    for (let index = 0; index < count; index++)
+      positions[index * 3 + 2] = (count - index) / 16;
+    const point = view.createPoint(
+      config({
+        pointCount: count,
+        source: {
+          ...source(count),
+          loadTile: async () => ({
+            origin: [0, 0, 0],
+            pointCount: count,
+            positions,
+          }),
+        },
+      }),
+    );
+    try {
+      await view.prepare;
+      for (let frame = 1; frame <= 3; frame++) {
+        view.submissions.prepareFrame(frame, false);
+        expect(view.submissions.stats().lastFrameAdmittedBytes).toBe(24);
+        expect(view.view.preparePolygonalGeometry).toHaveBeenCalledTimes(frame);
+        expect(view.paint).not.toHaveBeenCalled();
+        expect(point.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+      }
+      view.submissions.prepareFrame(4, false);
+      expect(view.submissions.stats().lastFrameAdmittedBytes).toBe(12);
+      expect(point.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+      view.submissions.prepareFrame(4, true);
+      expect(point.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1.0625,
+      });
+
+      const actors = view.view.preparePolygonalGeometry.mock.calls.map(
+        ([, actor]) => actor as StubActor,
+      );
+      const mappers = actors.map(({ mapper }) => mapper as StubMapper);
+      const spans = mappers.map(
+        ({ inputData }) => (inputData as StubPolyData).points as Float32Array,
+      );
+      expect(spans.map(({ length }) => length / 3)).toEqual([2, 2, 2, 1]);
+      expect(spans.every(({ buffer }) => buffer === positions.buffer)).toBe(
+        true,
+      );
+      const assembled = spans.flatMap((span) => [...span]);
+      expect(assembled).toEqual([...positions]);
+      point.applyAllocation({
+        qualityFraction: 0.5,
+        memoryBudgetBytes: 1024,
+        regime: "moving",
+      });
+      expect(point.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1.0625,
+      });
+      view.submissions.prepareFrame(5, true);
+      expect(mappers.map(({ maximumPointCount }) => maximumPointCount)).toEqual(
+        [2, 1, 0, 0],
+      );
+      expect(point.pick(VIEW, 50, 50)).toMatchObject({
+        status: "hit",
+        rayDepth: 1.3125,
+      });
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledTimes(4);
+
+      point.setActive(false);
+      await Promise.resolve();
+      view.submissions.prepareFrame(6, true);
+      expect(actors.every(({ visibility }) => !visibility)).toBe(true);
+      point.setActive(true);
+      await Promise.resolve();
+      view.submissions.prepareFrame(7, true);
+      expect(point.pick(VIEW, 50, 50)).toMatchObject({ status: "hit" });
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledTimes(4);
+    } finally {
+      point.dispose();
+      view.submissions.dispose();
+    }
+    expect(view.release).toHaveBeenCalledTimes(4);
+    expect(memory.stats()).toMatchObject({
+      owners: 0,
+      rendererBytes: 0,
+      cpuRetainedBytes: 0,
+    });
+  });
+
+  it("releases previously uploaded spans and the reservation after a later upload fails", async () => {
+    const memory = createMemoryPool({ totalBytes: 16_000 });
+    const view = preparationView(memory, createSubmissionFrameBudget(24, 100));
+    const onError = vi.fn();
+    const point = view.createPoint(
+      config({ source: source(5), pointCount: 5, onError }),
+    );
+    try {
+      await view.prepare;
+      view.submissions.prepareFrame(1, false);
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledOnce();
+      expect(memory.stats().rendererBytes).toBeGreaterThan(0);
+      view.view.preparePolygonalGeometry.mockImplementationOnce(() => {
+        throw new RangeError("buffer allocation failed");
+      });
+      view.submissions.prepareFrame(2, false);
+      await Promise.resolve();
+      expect(view.release).toHaveBeenCalledOnce();
+      expect(view.renderer.removeActor).toHaveBeenCalledTimes(2);
+      expect(view.view.preparePolygonalGeometry).toHaveBeenCalledTimes(2);
+      expect(onError).toHaveBeenCalledOnce();
+      expect(point.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+      expect(memory.stats().rendererBytes).toBe(0);
+      expect(view.submissions.hasPending()).toBe(false);
+    } finally {
+      point.dispose();
+      view.submissions.dispose();
+    }
+  });
+
   it("maps configured maximum and normalized quality to point budget", () => {
     const { context } = makeContext();
     const member = createPointCloudMember(context, config());
@@ -196,6 +621,7 @@ describe("createPointCloudMember", () => {
 
       failing = false;
       await vi.advanceTimersByTimeAsync(1_000);
+      context.submissions.prepareFrame();
       expect(member.governorInputs().work.operations).toBe(0);
       member.dispose();
     } finally {
@@ -263,6 +689,8 @@ describe("createPointCloudMember", () => {
     });
     member.setCamera(VIEW);
     await settle();
+    expect(member.pick(VIEW, 50, 50)).toEqual({ status: "miss" });
+    context.submissions.prepareFrame();
     const pick = member.pick(VIEW, 50, 50);
     expect(pick).toMatchObject({ status: "hit", rayDepth: 1 });
     expect(member.occlusionDepth(VIEW, 50, 50)).toEqual({

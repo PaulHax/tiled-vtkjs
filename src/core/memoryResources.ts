@@ -1,7 +1,15 @@
 import { finiteAtLeast, integerAtLeast } from "./numeric";
 import { safeCall } from "./observers";
+import type { RequestAdmission } from "./requestAdmission";
 
 export type MemoryDomain = "cpu" | "renderer" | "work";
+
+export type MemoryRefusalEstimate = {
+  readonly reason: "configured-limit" | "contention" | "transition-unavailable";
+  readonly finalBytes: number;
+  readonly peakBytes: number;
+  readonly wake: "policy" | "availability" | "presentation";
+};
 
 /** A configured accounting refusal, independent of allocation or decode failure. */
 export class ResourcePolicyError extends Error {
@@ -9,12 +17,16 @@ export class ResourcePolicyError extends Error {
   readonly requestedBytes: number;
   readonly limitBytes: number;
   readonly retryable: boolean;
+  readonly operationBytes?: number;
+  readonly estimate: MemoryRefusalEstimate;
 
   constructor(
     domain: MemoryDomain,
     requestedBytes: number,
     limitBytes: number,
     retryable = false,
+    operationBytes?: number,
+    estimate?: MemoryRefusalEstimate,
   ) {
     super(
       `${domain} memory requires ${requestedBytes} bytes; configured limit is ${limitBytes} bytes`,
@@ -24,6 +36,13 @@ export class ResourcePolicyError extends Error {
     this.requestedBytes = requestedBytes;
     this.limitBytes = limitBytes;
     this.retryable = retryable;
+    this.operationBytes = operationBytes;
+    this.estimate = estimate ?? {
+      reason: retryable ? "contention" : "configured-limit",
+      finalBytes: requestedBytes,
+      peakBytes: requestedBytes,
+      wake: retryable ? "availability" : "policy",
+    };
   }
 }
 
@@ -42,6 +61,8 @@ export const resourcePolicyError = (
 
 export type MemoryLease = {
   share(): MemoryLease;
+  /** Acquire another reference while any holder keeps this allocation alive. */
+  reacquireWhileHeld(onLastRelease: () => void): () => MemoryLease | undefined;
   /** Replace realized CPU ownership and the still-unrealized CPU reservation atomically. */
   setCpu(buffers: Iterable<ArrayBuffer>, reservedBytes?: number): void;
   /** Only reduces a renderer reservation, for retiring part of a replacement group. */
@@ -49,11 +70,26 @@ export type MemoryLease = {
   release(): void;
 };
 
+/** Index a completed immutable payload for exactly as long as consumers own it. */
+export const reuseMemoryResult = <T extends { memory?: MemoryLease }>(
+  value: T,
+  onLastRelease: () => void,
+): (() => T | undefined) | undefined => {
+  const acquire = value.memory?.reacquireWhileHeld(onLastRelease);
+  return (
+    acquire &&
+    (() => {
+      const memory = acquire();
+      return memory && { ...value, memory };
+    })
+  );
+};
+
 export type MemoryWork = {
   /** Grow or shrink the estimate for all overlapping allocations in this operation. */
   resize(bytes: number): void;
   bytes(): number;
-  /** Transfer finished output into retained ownership and relinquish the work slot. */
+  /** Transfer finished output into retained ownership and relinquish reserved work bytes. */
   commit(buffers: Iterable<ArrayBuffer>, estimatedBytes?: number): MemoryLease;
   /** Call only once the physical operation has settled, including after cancellation. */
   release(): void;
@@ -80,7 +116,14 @@ export type MemoryOwner = {
     }[],
     replacing?: readonly MemoryLease[],
   ): MemoryLease[];
-  work(signal?: AbortSignal, estimatedBytes?: number): Promise<MemoryWork>;
+  readonly admission: RequestAdmission;
+  /** Scope result reuse to owners backed by this allocation ledger. */
+  scopeForSharing(source: object): object;
+  availability(): number;
+  canRetry(error: ResourcePolicyError): boolean;
+  canReserveWork(bytes: number): boolean;
+  /** Reserve immediately or throw a policy refusal. The request service handles deferral. */
+  work(signal?: AbortSignal, estimatedBytes?: number): MemoryWork;
   /** Stop accepting work. Existing leases and physical work keep their charges. */
   close(): void;
 };
@@ -98,6 +141,7 @@ export type MemoryResourceStats = MemoryResourceOptions & {
   readonly cpuReservedBytes: number;
   readonly rendererBytes: number;
   readonly workReservedBytes: number;
+  /** Physical stages running under the shared page admission limit. */
   readonly activeOperations: number;
   readonly queuedOperations: number;
   readonly owners: number;
@@ -108,7 +152,7 @@ export type MemoryResourceStats = MemoryResourceOptions & {
 type OwnerEntry = {
   closed: boolean;
   readonly leases: Set<LeaseEntry>;
-  readonly operations: Set<WorkEntry>;
+  readonly reservations: Set<WorkEntry>;
   readonly reclaim?: (domain: MemoryDomain) => void;
 };
 
@@ -119,6 +163,7 @@ type LeaseEntry = {
   renderer: number;
   released: boolean;
   references: number;
+  onLastRelease?: Set<() => void>;
   readonly replaces: readonly LeaseEntry[];
 };
 
@@ -127,15 +172,6 @@ type WorkEntry = {
   bytes: number;
   released: boolean;
 };
-type WaitingWork = {
-  readonly owner: OwnerEntry;
-  readonly signal?: AbortSignal;
-  readonly bytes: number;
-  readonly resolve: (work: MemoryWork) => void;
-  readonly reject: (error: unknown) => void;
-  readonly abort: () => void;
-};
-
 const abortError = (): DOMException =>
   new DOMException("Memory operation cancelled", "AbortError");
 const bytesValue = (name: string, value: number): number =>
@@ -145,6 +181,7 @@ const bytesValue = (name: string, value: number): number =>
 export const createMemoryResources = (
   initial: MemoryResourceOptions,
   changed: () => void,
+  admission: RequestAdmission,
 ) => {
   let limits = initial;
   let revision = 0;
@@ -153,17 +190,27 @@ export const createMemoryResources = (
   let cpuReserved = 0;
   let renderer = 0;
   let workReserved = 0;
-  let operations = 0;
   let reclaiming = false;
-  let pumping = false;
   const owners = new Set<OwnerEntry>();
   const buffers = new Map<ArrayBuffer, { references: number; bytes: number }>();
   const leases = new WeakMap<MemoryLease, LeaseEntry>();
   const claimedReplacements = new Map<LeaseEntry, number>();
-  const waiting: WaitingWork[] = [];
+  const sharingScopes = new WeakMap<object, object>();
+  const scopeForSharing = (source: object): object => {
+    let scope = sharingScopes.get(source);
+    if (!scope) {
+      scope = {};
+      sharingScopes.set(source, scope);
+    }
+    return scope;
+  };
 
   const retireOwner = (owner: OwnerEntry): void => {
-    if (owner.closed && owner.leases.size === 0 && owner.operations.size === 0)
+    if (
+      owner.closed &&
+      owner.leases.size === 0 &&
+      owner.reservations.size === 0
+    )
       owners.delete(owner);
   };
   const reclaim = (domain: MemoryDomain): void => {
@@ -199,7 +246,6 @@ export const createMemoryResources = (
     entry.buffers = next;
   };
 
-  let pump: () => void;
   const makeLease = (
     owner: OwnerEntry,
     cpuBytes: number,
@@ -229,12 +275,20 @@ export const createMemoryResources = (
             throw new Error("allocation already released");
           return handle();
         },
+        reacquireWhileHeld(onLastRelease) {
+          if (released || entry.released)
+            throw new Error("allocation already released");
+          (entry.onLastRelease ??= new Set()).add(onLastRelease);
+          return () => (entry.released ? undefined : handle());
+        },
         setCpu(values, reservedBytes = 0) {
           if (released || entry.released) return;
           const reserved = bytesValue("reserved CPU bytes", reservedBytes);
+          const before = cpuRetained + cpuReserved;
           replaceBuffers(entry, new Set(values));
           cpuReserved += reserved - entry.cpuReserved;
           entry.cpuReserved = reserved;
+          if (cpuRetained + cpuReserved < before) availabilityRevision += 1;
           changed();
         },
         shrinkRenderer(bytes) {
@@ -242,6 +296,7 @@ export const createMemoryResources = (
           const next = bytesValue("renderer bytes", bytes);
           if (next > entry.renderer)
             throw new RangeError("renderer reservations may only shrink");
+          if (entry.renderer === next) return;
           renderer -= entry.renderer - next;
           entry.renderer = next;
           availabilityRevision += 1;
@@ -253,19 +308,29 @@ export const createMemoryResources = (
           entry.references -= 1;
           if (entry.references > 0) return;
           entry.released = true;
+          const previousBytes = cpuRetained + cpuReserved + renderer;
+          let releasedCredit = false;
           replaceBuffers(entry, new Set());
           cpuReserved -= entry.cpuReserved;
           renderer -= entry.renderer;
           for (const old of entry.replaces) {
             const remaining = claimedReplacements.get(old)! - 1;
-            if (remaining === 0) claimedReplacements.delete(old);
-            else claimedReplacements.set(old, remaining);
+            if (remaining === 0) {
+              claimedReplacements.delete(old);
+              releasedCredit ||= !old.released;
+            } else claimedReplacements.set(old, remaining);
           }
           owner.leases.delete(entry);
           retireOwner(owner);
-          availabilityRevision += 1;
+          const listeners = entry.onLastRelease;
+          entry.onLastRelease = undefined;
+          listeners?.forEach(safeCall);
+          if (
+            releasedCredit ||
+            cpuRetained + cpuReserved + renderer < previousBytes
+          )
+            availabilityRevision += 1;
           changed();
-          pump();
         },
       };
       leases.set(api, entry);
@@ -285,6 +350,7 @@ export const createMemoryResources = (
         cpuRetained + cpuReserved + added,
         limits.cpuBytes,
         added <= limits.cpuBytes,
+        added,
       );
     }
   };
@@ -309,19 +375,17 @@ export const createMemoryResources = (
 
   const startWork = (owner: OwnerEntry, bytes: number): MemoryWork => {
     const entry: WorkEntry = { owner, bytes, released: false };
-    owner.operations.add(entry);
-    operations += 1;
+    owner.reservations.add(entry);
     workReserved += bytes;
+    changed();
     const release = (): void => {
       if (entry.released) return;
       entry.released = true;
-      operations -= 1;
       workReserved -= entry.bytes;
-      owner.operations.delete(entry);
-      availabilityRevision += 1;
+      owner.reservations.delete(entry);
+      if (entry.bytes > 0) availabilityRevision += 1;
       retireOwner(owner);
       changed();
-      pump();
     };
     return {
       resize(value) {
@@ -334,7 +398,9 @@ export const createMemoryResources = (
             requested,
             limits.workBytes,
             next <= limits.workBytes,
+            next,
           );
+        if (next < entry.bytes) availabilityRevision += 1;
         workReserved = requested;
         entry.bytes = next;
         changed();
@@ -401,54 +467,37 @@ export const createMemoryResources = (
         finalBytes,
         limits.totalBytes,
         amount <= limits.totalBytes,
+        undefined,
+        {
+          reason:
+            amount <= limits.totalBytes ? "contention" : "configured-limit",
+          finalBytes,
+          peakBytes: renderer + amount,
+          wake: amount <= limits.totalBytes ? "availability" : "policy",
+        },
       );
-    if (renderer + amount > ceiling)
+    if (renderer + amount > ceiling) {
+      const canFitWithCredit = credit() + amount <= ceiling;
       throw new ResourcePolicyError(
         "renderer",
         renderer + amount,
         ceiling,
-        amount <= limits.totalBytes,
+        canFitWithCredit,
+        undefined,
+        {
+          reason: "transition-unavailable",
+          finalBytes,
+          peakBytes: renderer + amount,
+          wake: canFitWithCredit ? "availability" : "policy",
+        },
       );
+    }
     checkCpu(cpu);
     const result = normalized.map((item) =>
       makeLease(owner, item.cpuBytes, item.rendererBytes, old),
     );
     changed();
     return result;
-  };
-
-  pump = (): void => {
-    if (pumping || reclaiming) return;
-    pumping = true;
-    try {
-      while (
-        waiting.length > 0 &&
-        operations < limits.maxConcurrentOperations
-      ) {
-        const next = waiting[0]!;
-        if (next.owner.closed || next.signal?.aborted) {
-          waiting.shift();
-          next.signal?.removeEventListener("abort", next.abort);
-          next.reject(abortError());
-          continue;
-        }
-        if (next.bytes > limits.workBytes) {
-          waiting.shift();
-          next.signal?.removeEventListener("abort", next.abort);
-          next.reject(
-            new ResourcePolicyError("work", next.bytes, limits.workBytes),
-          );
-          continue;
-        }
-        if (workReserved + next.bytes > limits.workBytes) break;
-        waiting.shift();
-        next.signal?.removeEventListener("abort", next.abort);
-        next.resolve(startWork(next.owner, next.bytes));
-      }
-    } finally {
-      pumping = false;
-    }
-    changed();
   };
 
   return {
@@ -458,7 +507,7 @@ export const createMemoryResources = (
       const owner: OwnerEntry = {
         closed: false,
         leases: new Set(),
-        operations: new Set(),
+        reservations: new Set(),
         reclaim: options.reclaim,
       };
       owners.add(owner);
@@ -489,37 +538,38 @@ export const createMemoryResources = (
           assertOpen();
           return reserveRendererGroup(owner, amounts, replacing);
         },
+        admission,
+        scopeForSharing,
+        availability: () => availabilityRevision,
+        canRetry(error) {
+          if (error.operationBytes === undefined) return true;
+          if (error.domain === "work")
+            return workReserved + error.operationBytes <= limits.workBytes;
+          if (error.domain === "cpu")
+            return (
+              cpuRetained + cpuReserved + error.operationBytes <=
+              limits.cpuBytes
+            );
+          return true;
+        },
+        canReserveWork: (bytes) => workReserved + bytes <= limits.workBytes,
         work(signal, estimate = 0) {
           assertOpen();
-          if (signal?.aborted) return Promise.reject(abortError());
+          signal?.throwIfAborted();
           const bytes = bytesValue("estimated work bytes", estimate);
-          return new Promise((resolve, reject) => {
-            const item: WaitingWork = {
-              owner,
-              signal,
+          if (workReserved + bytes > limits.workBytes)
+            throw new ResourcePolicyError(
+              "work",
+              workReserved + bytes,
+              limits.workBytes,
+              bytes <= limits.workBytes,
               bytes,
-              resolve,
-              reject,
-              abort: () => {
-                const index = waiting.indexOf(item);
-                if (index < 0) return;
-                waiting.splice(index, 1);
-                reject(abortError());
-                pump();
-              },
-            };
-            waiting.push(item);
-            signal?.addEventListener("abort", item.abort, { once: true });
-            pump();
-          });
+            );
+          return startWork(owner, bytes);
         },
         close() {
           if (owner.closed) return;
           owner.closed = true;
-          // Removing one queued operation mutates the waiting list.
-          // oxlint-disable-next-line unicorn/no-useless-spread
-          for (const item of [...waiting])
-            if (item.owner === owner) item.abort();
           retireOwner(owner);
           changed();
         },
@@ -535,17 +585,20 @@ export const createMemoryResources = (
       availabilityRevision += 1;
       reclaim("renderer");
       reclaim("cpu");
-      pump();
+      changed();
     },
+    availability: () => availabilityRevision,
+    policyRevision: () => revision,
     stats(): MemoryResourceStats {
       return {
         ...limits,
+        maxConcurrentOperations: admission.capacity(),
         cpuRetainedBytes: cpuRetained,
         cpuReservedBytes: cpuReserved,
         rendererBytes: renderer,
         workReservedBytes: workReserved,
-        activeOperations: operations,
-        queuedOperations: waiting.length,
+        activeOperations: admission.activeOperations(),
+        queuedOperations: admission.queuedOperations(),
         owners: owners.size,
         revision,
         availabilityRevision,

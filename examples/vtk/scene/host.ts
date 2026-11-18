@@ -17,6 +17,7 @@
 
 import "@kitware/vtk.js/Rendering/Profiles/Geometry";
 import vtkFullScreenRenderWindow from "@kitware/vtk.js/Rendering/Misc/FullScreenRenderWindow";
+import { withPointTextureUploads } from "@kitware/vtk.js/Rendering/OpenGL/PointGaussianMapper/dataTextures";
 import type vtkOpenGLRenderWindow from "@kitware/vtk.js/Rendering/OpenGL/RenderWindow";
 import vtkForwardPass from "@kitware/vtk.js/Rendering/OpenGL/ForwardPass";
 import type { vtkRenderPass } from "@kitware/vtk.js/Rendering/SceneGraph/RenderPass";
@@ -84,11 +85,13 @@ export type SceneHost = {
   readonly rendererName: string;
   /** The live WebGL context, for callers that report on the machine drawing. */
   glContext(): WebGL2RenderingContext | null;
+  openGLRenderWindow: vtkOpenGLRenderWindow;
   setTranslucentPass(pass: object | null): void;
   /** Coalesced repaint request; the only way anything here paints. */
   scheduleRender(): void;
   cameraView(): CameraView;
   /** Notified immediately before member preparation for the frame. */
+  onBeforePaint(listener: () => void): void;
   onBeforeFrame(
     listener: (view: CameraView, devicePixelRatio: number) => void,
   ): void;
@@ -174,15 +177,7 @@ export const createSceneHost = (
   });
   const renderer = fullScreen.getRenderer();
   const openGlRenderWindow =
-    fullScreen.getApiSpecificRenderWindow() as ReturnType<
-      typeof fullScreen.getApiSpecificRenderWindow
-    > &
-      Pick<
-        vtkOpenGLRenderWindow,
-        "getCanvas" | "getRenderPasses" | "setRenderPasses"
-      > & {
-        getContext(): WebGL2RenderingContext | null;
-      };
+    fullScreen.getApiSpecificRenderWindow() as unknown as vtkOpenGLRenderWindow;
   const defaultRenderPasses = openGlRenderWindow.getRenderPasses();
   let customForwardPass: ReturnType<typeof vtkForwardPass.newInstance> | null =
     null;
@@ -242,6 +237,7 @@ export const createSceneHost = (
   let pendingQueryIds: number[] = [];
   const frameListeners: ((view: CameraView) => void)[] = [];
   const presentationListeners: ((presentedAt: number) => void)[] = [];
+  const beforePaintListeners: (() => void)[] = [];
   const beforeFrameListeners: ((
     view: CameraView,
     devicePixelRatio: number,
@@ -352,7 +348,10 @@ export const createSceneHost = (
       const view = cameraView();
       for (const listener of beforeFrameListeners)
         listener(view, currentDevicePixelRatio);
-      coordinator.prepareFrame(++frameSerial);
+      withPointTextureUploads(openGlRenderWindow, () =>
+        coordinator.prepareFrame(++frameSerial),
+      );
+      for (const listener of beforePaintListeners) listener();
       refreshClippingRange();
       beginPaint();
       interactor.render();
@@ -360,7 +359,7 @@ export const createSceneHost = (
   };
 
   const tiles3dServices: Tiles3dMemberServices = {
-    workers: createDecodeWorkers(),
+    workers: createDecodeWorkers(memory.admission),
     textureCapabilities: capabilities,
   };
 
@@ -483,7 +482,10 @@ export const createSceneHost = (
     const view = cameraView();
     for (const listener of beforeFrameListeners)
       listener(view, currentDevicePixelRatio);
-    coordinator.prepareFrame(++frameSerial);
+    withPointTextureUploads(openGlRenderWindow, () =>
+      coordinator.prepareFrame(++frameSerial),
+    );
+    for (const listener of beforePaintListeners) listener();
     refreshClippingRange();
     beginPaint();
   });
@@ -504,7 +506,9 @@ export const createSceneHost = (
     camera,
     tiles3dServices,
     rendererName,
-    glContext: () => openGlRenderWindow.getContext(),
+    glContext: () =>
+      openGlRenderWindow.getContext() as WebGL2RenderingContext | null,
+    openGLRenderWindow: openGlRenderWindow,
     setTranslucentPass(pass) {
       if (pass === null) {
         openGlRenderWindow.setRenderPasses(defaultRenderPasses);
@@ -522,6 +526,7 @@ export const createSceneHost = (
     },
     scheduleRender,
     cameraView,
+    onBeforePaint: (listener) => beforePaintListeners.push(listener),
     onBeforeFrame: (listener) => beforeFrameListeners.push(listener),
     onFrame: (listener) => frameListeners.push(listener),
     onPresentation: (listener) => presentationListeners.push(listener),
@@ -604,6 +609,7 @@ export const createSceneHost = (
       if (disposed) return;
       disposed = true;
       window.removeEventListener("resize", onResize);
+      beforePaintListeners.length = 0;
       beforeFrameListeners.length = 0;
       frameListeners.length = 0;
       presentationListeners.length = 0;

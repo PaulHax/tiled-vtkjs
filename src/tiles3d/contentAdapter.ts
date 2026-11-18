@@ -4,23 +4,37 @@ import type { MemoryPool } from "../core/memoryPool";
 import type { ResourcePolicyError } from "../core/memoryResources";
 import type { Mat16 } from "../core/mat4";
 import type { CameraView } from "../core/camera";
-import type { DecodedTileContent } from "./decode";
+import type { DecodedTileContent, GaussianAppearanceProfile } from "./decode";
 import type {
   MeshAdapter,
   MeshAdapterOptions,
   MeshAdapterStats,
-  MeshSubmitOutcome,
 } from "./meshAdapter";
 import type { SubmittedMeshTile } from "./meshPicking";
 
+export type TileCountLimit = {
+  readonly domain: "count";
+  readonly finalCount: number;
+  readonly peakCount: number;
+  readonly limitCount: number;
+  readonly reason: "count-limit";
+  readonly wake: "selection";
+};
+
+export type TileSubmissionRefusal = ResourcePolicyError | TileCountLimit;
+export type TileSubmissionOutcome =
+  | "queued"
+  | "failed"
+  | { readonly status: "blocked"; readonly refusal: TileSubmissionRefusal };
+
 export type TileContentAdapterOptions = MeshAdapterOptions & {
-  /** Physical renderer shared by realizations behind per-layer mesh wrappers. */
-  readonly realizationRenderer?: MeshAdapterOptions["renderer"];
   readonly memoryPool?: MemoryPool;
   readonly onPresentationChange?: () => void;
+  readonly onWorkChange?: () => void;
+  readonly onPolicyRefusal?: (refusal: TileSubmissionRefusal) => void;
   readonly onAdmissionRefusal?: (
     ids: readonly string[],
-    error: ResourcePolicyError,
+    error: TileSubmissionRefusal,
   ) => void;
 };
 export type TileContentAdapterStats = MeshAdapterStats;
@@ -29,6 +43,7 @@ export type TileContentAdapterStats = MeshAdapterStats;
  * A submitted tile is ready to participate in a coherent presentation.
  * Implementations retain the last complete presentation while asynchronous
  * uploads or draw-order jobs are pending. Only triangles enter the pick set.
+ * Decoded content and its buffers are read-only and can be shared across views.
  */
 export type TileContentAdapter = Omit<
   MeshAdapter,
@@ -39,6 +54,8 @@ export type TileContentAdapter = Omit<
   | "submitTileGroup"
   | "submittedTiles"
 > & {
+  /** Gaussian reconstruction color spaces this adapter can present. */
+  readonly gaussianColorSpaces?: readonly GaussianAppearanceProfile["colorSpace"][];
   presentationMatrix(): Mat16;
   estimateTileBytes(content: DecodedTileContent): number;
   setCamera(view: CameraView): void;
@@ -47,7 +64,7 @@ export type TileContentAdapter = Omit<
     content: DecodedTileContent,
     onSubmitted?: () => void,
     replacementIds?: readonly string[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
   submitTileGroup(
     entries: readonly {
       readonly id: string;
@@ -55,7 +72,9 @@ export type TileContentAdapter = Omit<
       readonly onSubmitted?: () => void;
     }[],
     replacementIds: readonly string[],
-  ): MeshSubmitOutcome;
+  ): TileSubmissionOutcome;
+  /** Published coverage when preparation and presentation are asynchronous. */
+  presentedTileIds?(): readonly string[];
   pickableMeshTiles(): readonly SubmittedMeshTile[];
 };
 
@@ -64,7 +83,9 @@ export type TileContentAdapterFactory = (
 ) => TileContentAdapter;
 
 /** The selected renderer cannot realize this decoded content profile. */
-export class TileContentRealizationError extends Error {
+export class TileRenderingProfileError extends Error {}
+
+export class TileContentRealizationError extends TileRenderingProfileError {
   readonly tileId: string;
   readonly primitiveKind: string;
 

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { createMemoryPool } from "../core/memoryPool";
 
 import {
   createContentQueue,
@@ -24,11 +25,7 @@ const deferred = <T>() => {
   return { promise, resolve, reject };
 };
 
-const flush = async () => {
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-};
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const ok = (bytes = new Uint8Array([1])) => ({
   ok: true,
@@ -48,7 +45,9 @@ const makeQueue = (
     maxConcurrency: 2,
     maxDecodedBytes: 100,
     fetch: vi.fn(async (url) => ok(new TextEncoder().encode(String(url)))),
-    decode: async (_bytes, item) => ({ id: item.id, bytes: 10 }),
+    prepareDecode: (item) => ({
+      decode: () => ({ id: item.id, bytes: 10 }),
+    }),
     decodedByteLength: (value) => value.bytes,
     onContent: (item) => decoded.push(item.id),
     ...overrides,
@@ -95,6 +94,104 @@ describe("content queue", () => {
       "b",
       "c",
     ]);
+  });
+
+  it("releases the network lane before decode while charging retained input until it is discarded", async () => {
+    const pool = createMemoryPool({
+      totalBytes: 100,
+      maxConcurrentOperations: 1,
+    });
+    const memory = pool.createOwner();
+    const lateNetwork = deferred<ReturnType<typeof ok>>();
+    const decode = vi.fn((_bytes, item: TileContentRequest) => ({
+      id: item.id,
+      bytes: 10,
+    }));
+    const starts: string[] = [];
+    const { queue, decoded } = makeQueue({
+      memory,
+      fetch: (url) => {
+        starts.push(url);
+        return url.endsWith("a.glb")
+          ? Promise.resolve(ok(new Uint8Array(14)))
+          : lateNetwork.promise;
+      },
+      prepareDecode: (item) => ({ decode: (bytes) => decode(bytes, item) }),
+      decodeReady: () => decoderReady,
+    });
+    let decoderReady = false;
+    queue.setSelection([request("a"), request("b")]);
+    await flush();
+
+    expect(starts).toEqual(["/tiles/a.glb", "/tiles/b.glb"]);
+    expect(decode).not.toHaveBeenCalled();
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 14,
+      activeOperations: 1,
+    });
+    queue.setSelection([request("b")]);
+    expect(pool.stats().workReservedBytes).toBe(0);
+    lateNetwork.resolve(ok(new Uint8Array(20)));
+    await flush();
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 20,
+      activeOperations: 0,
+    });
+    decoderReady = true;
+    pool.admission.wake();
+    await flush();
+
+    expect(decoded).toEqual(["b"]);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 0,
+      activeOperations: 0,
+    });
+    queue.dispose();
+    memory.close();
+  });
+
+  it("shares remaining capacity with another owner when a decode fills its own limit", async () => {
+    const pool = createMemoryPool({
+      totalBytes: 100,
+      maxConcurrentOperations: 2,
+    });
+    const first = pool.createOwner();
+    const second = pool.createOwner();
+    const decode = deferred<Decoded>();
+    const fetchFirst = vi.fn(async () => ok());
+    const fetchSecond = vi.fn(async () => ok());
+    const firstQueue = makeQueue({
+      memory: first,
+      maxConcurrency: 1,
+      fetch: fetchFirst,
+      prepareDecode: (item) => ({
+        decode: () =>
+          item.id === "a" ? decode.promise : { id: item.id, bytes: 10 },
+      }),
+    }).queue;
+    const secondQueue = makeQueue({ memory: second, fetch: fetchSecond }).queue;
+    firstQueue.setSelection([request("a"), request("b")]);
+    await flush();
+    expect(fetchFirst).toHaveBeenCalledOnce();
+    expect(pool.stats().activeOperations).toBe(1);
+    secondQueue.setSelection([request("c")]);
+    await flush();
+    expect(fetchSecond).toHaveBeenCalledOnce();
+    expect(secondQueue.snapshot().ready).toBe(1);
+    expect(fetchFirst).toHaveBeenCalledOnce();
+
+    decode.resolve({ id: "a", bytes: 10 });
+    await flush();
+    expect(fetchFirst).toHaveBeenCalledTimes(2);
+    expect(firstQueue.snapshot().ready).toBe(2);
+    expect(pool.stats()).toMatchObject({
+      workReservedBytes: 0,
+      activeOperations: 0,
+    });
+    firstQueue.dispose();
+    secondQueue.dispose();
+    first.close();
+    second.close();
   });
 
   it("aborts active deselected work and never reports it to the consumer", async () => {
@@ -339,7 +436,12 @@ describe("content queue", () => {
       .fn()
       .mockRejectedValueOnce(new Error("malformed"))
       .mockResolvedValueOnce({ id: "a", bytes: 10 });
-    const { queue } = makeQueue({ clock, decode, maxAttempts: 2, onError });
+    const { queue } = makeQueue({
+      clock,
+      prepareDecode: () => ({ decode }),
+      maxAttempts: 2,
+      onError,
+    });
 
     queue.setSelection([request("a")]);
     await flush();
@@ -373,9 +475,11 @@ describe("content queue", () => {
       "EXT_meshopt_compression",
     );
     const { queue } = makeQueue({
-      decode: async () => {
-        throw typed;
-      },
+      prepareDecode: () => ({
+        decode: () => {
+          throw typed;
+        },
+      }),
       maxAttempts: 1,
       onError,
     });
@@ -418,10 +522,8 @@ describe("content queue", () => {
   });
 
   it("accounts decoded bytes and evicts least-recently-used content deterministically", async () => {
-    const evicted: string[] = [];
     const { queue } = makeQueue({
       maxDecodedBytes: 20,
-      onEvict: (item) => evicted.push(item.id),
     });
     queue.setSelection([request("a"), request("b")]);
     await flush();
@@ -430,52 +532,86 @@ describe("content queue", () => {
     queue.setSelection([request("a"), request("b"), request("c")]);
     await flush();
     expect(queue.snapshot()).toMatchObject({ decodedBytes: 20, cached: 2 });
-    expect(evicted).toEqual(["b"]);
+    // Eviction drops reuse ownership while the current consumer can still
+    // finish using its decode. Withdrawing that demand releases the payload.
+    expect(queue.get("b")?.id).toBe("b");
+    queue.setSelection([request("a"), request("c")]);
     expect([...queue.contents().keys()]).toEqual(["a", "c"]);
     expect(queue.get("b")).toBeUndefined();
     expect(queue.get("a")?.id).toBe("a");
     expect(queue.get("c")?.id).toBe("c");
   });
 
-  it("reopens an evicted delivery without cancelling unrelated work", async () => {
+  it("releases uncached generations on withdrawal and reuses live decodes", async () => {
     const waiting = deferred<ReturnType<typeof ok>>();
     const fetcher = vi.fn(async (url: string) =>
       url.endsWith("/c.glb") ? waiting.promise : ok(),
     );
     const { queue, decoded } = makeQueue({
-      maxDecodedBytes: 10,
+      maxDecodedBytes: 0,
       fetch: fetcher,
     });
-    queue.setSelection([request("a")]);
-    await flush();
-    queue.setSelection([request("a"), request("b")]);
-    await flush();
-    expect(queue.get("a")).toBeUndefined();
     queue.setSelection([request("a"), request("b"), request("c")]);
     await flush();
-    expect(fetcher).toHaveBeenCalledTimes(3);
-    queue.setSelection([request("a"), request("b"), request("c")], {
-      requeueUncached: new Set(["a", "b", "c"]),
-    });
-    await flush();
-    expect(fetcher).toHaveBeenCalledTimes(4);
-    expect(decoded).toEqual(["a", "b", "a"]);
+    queue.trimCache(0);
+    expect(queue.get("a")?.id).toBe("a");
+    expect(queue.get("b")?.id).toBe("b");
+    queue.setSelection([request("b"), request("c")]);
+    expect(queue.get("a")).toBeUndefined();
+    queue.setSelection([request("a"), request("b"), request("c")]);
     waiting.resolve(ok());
     await flush();
+    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(decoded.filter((id) => id === "a")).toHaveLength(2);
+    expect(decoded.filter((id) => id === "b")).toHaveLength(1);
     expect(queue.snapshot()).toMatchObject({ active: 0, queued: 0, ready: 3 });
     queue.dispose();
+  });
+
+  it("charges a shared decoded buffer until both views release their ownership", async () => {
+    const pool = createMemoryPool({ totalBytes: 256 });
+    const buffer = new ArrayBuffer(42);
+    const makeView = (cacheBytes: number) => {
+      const owner = pool.createOwner();
+      const { queue } = makeQueue({
+        memory: owner,
+        maxDecodedBytes: cacheBytes,
+        decodedBuffers: () => [buffer],
+        decodedByteLength: () => buffer.byteLength,
+      });
+      queue.setSelection([request("a")]);
+      return { owner, queue };
+    };
+    const first = makeView(0);
+    const second = makeView(42);
+    await flush();
+    expect(pool.stats().cpuRetainedBytes).toBe(42);
+    expect(first.queue.get("a")?.id).toBe("a");
+    expect(second.queue.get("a")?.id).toBe("a");
+
+    second.queue.trimCache(0);
+    first.queue.dispose();
+    first.owner.close();
+    expect(second.queue.get("a")?.id).toBe("a");
+    expect(pool.stats().cpuRetainedBytes).toBe(42);
+    second.queue.setSelection([]);
+    expect(second.queue.get("a")).toBeUndefined();
+    expect(pool.stats().cpuRetainedBytes).toBe(0);
+    second.queue.dispose();
+    second.owner.close();
   });
 
   it("delivers oversize content without caching or evicting retained entries", async () => {
     const events: string[] = [];
     const { queue } = makeQueue({
       maxDecodedBytes: 10,
-      decode: async (_bytes, item) => ({
-        id: item.id,
-        bytes: item.id === "oversize" ? 20 : 5,
+      prepareDecode: (item) => ({
+        decode: () => ({
+          id: item.id,
+          bytes: item.id === "oversize" ? 20 : 5,
+        }),
       }),
       onContent: (item) => events.push(`content:${item.id}`),
-      onEvict: (item) => events.push(`evict:${item.id}`),
     });
     queue.setSelection([request("small")]);
     await flush();
@@ -485,6 +621,8 @@ describe("content queue", () => {
     expect(events).toEqual(["content:small", "content:oversize"]);
     expect(queue.snapshot()).toMatchObject({ cached: 1, decodedBytes: 5 });
     expect(queue.get("small")?.id).toBe("small");
+    expect(queue.get("oversize")?.id).toBe("oversize");
+    queue.setSelection([request("small")]);
     expect(queue.get("oversize")).toBeUndefined();
   });
 

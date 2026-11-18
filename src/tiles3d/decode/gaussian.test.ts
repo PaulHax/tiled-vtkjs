@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   gaussianGlb,
@@ -64,6 +64,51 @@ describe("Gaussian glTF content decoding", () => {
       return bytes;
     };
     expect(await reserve(true)).toBe(await reserve(false));
+  });
+
+  it("refuses an unsupported display color space before reserving decode output", async () => {
+    const linear = request({ extension: { colorSpace: "lin_rec709_display" } });
+    const unrestricted = await decodeTileContent(linear);
+    expect(unrestricted.primitives[0]).toMatchObject({
+      profile: { colorSpace: "lin_rec709_display" },
+    });
+
+    const reserveMemory = vi.fn(async (_bytes: number) => {});
+    await expect(
+      decodeTileContent(
+        {
+          ...linear,
+          gaussianColorSpaces: ["srgb_rec709_display"],
+        },
+        { reserveMemory },
+      ),
+    ).rejects.toMatchObject({
+      name: "TileUnsupportedGaussianProfileError",
+      property: "colorSpace",
+      value: "lin_rec709_display",
+    });
+    expect(reserveMemory.mock.calls).toEqual([[0]]);
+  });
+
+  it("checks color-space capability only in the active scene", async () => {
+    const input = request({
+      mutate(json) {
+        const unused = structuredClone(json.meshes[0]!);
+        Object.assign(
+          unused.primitives[0]!.extensions!.KHR_gaussian_splatting!,
+          {
+            colorSpace: "lin_rec709_display",
+          },
+        );
+        json.meshes.push(unused);
+      },
+    });
+    await expect(
+      decodeTileContent({
+        ...input,
+        gaussianColorSpaces: ["srgb_rec709_display"],
+      }),
+    ).resolves.toMatchObject({ primitives: [{ kind: "gaussian" }] });
   });
 
   it("preserves local centers, XYZW, linear scale, unclamped harmonics and default profile", async () => {

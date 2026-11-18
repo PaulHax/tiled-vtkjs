@@ -2,6 +2,10 @@
 
 import { finiteAtLeast, integerAtLeast } from "./numeric";
 import {
+  createRequestAdmission,
+  type RequestAdmission,
+} from "./requestAdmission";
+import {
   createMemoryResources,
   type MemoryOwner,
   type MemoryDomain,
@@ -59,11 +63,15 @@ export type MemoryPoolOptions = {
   workBytes?: number;
   /** Extra renderer capacity usable only for a complete replacement transition. */
   transitionBytes?: number;
-  /** Shared fetch/decode operations, including queued worker inputs. Default 2. */
+  /** Aggregate page limit for physical network, decode, and sort work. Default 2. */
   maxConcurrentOperations?: number;
+  admission?: RequestAdmission;
 };
 
 export type MemoryPool = {
+  readonly admission: RequestAdmission;
+  availability(): number;
+  policyRevision(): number;
   /**
    * Join the pool. `onChange` fires whenever this member's share moves
    * because another member joined or left, but never during this `register`
@@ -110,12 +118,16 @@ export const createMemoryPool = (
       ),
       maxConcurrentOperations: integerAtLeast(
         "maxConcurrentOperations",
-        value.maxConcurrentOperations ?? 2,
+        value.maxConcurrentOperations ?? options.admission?.capacity() ?? 2,
         1,
       ),
     };
   };
   let limits = normalize(options);
+  const admission =
+    options.admission ?? createRequestAdmission(limits.maxConcurrentOperations);
+  if (options.admission && options.maxConcurrentOperations !== undefined)
+    admission.configure(limits.maxConcurrentOperations);
   type Entry = { onChange?: () => void; demand: MemoryDemand; grant: number };
   const members = new Set<Entry>();
 
@@ -172,17 +184,26 @@ export const createMemoryPool = (
     });
   };
   let notificationQueued = false;
+  let availability = 0;
   const resourceChanged = (): void => {
     if (notificationQueued) return;
     notificationQueued = true;
     queueMicrotask(() => {
       notificationQueued = false;
+      const next = resources.availability();
+      if (availability !== next) {
+        availability = next;
+        admission.wake();
+      }
       notify();
     });
   };
-  const resources = createMemoryResources(limits, resourceChanged);
+  const resources = createMemoryResources(limits, resourceChanged, admission);
 
   return {
+    admission,
+    availability: resources.availability,
+    policyRevision: resources.policyRevision,
     register(onChange) {
       const entry: Entry = {
         onChange,
@@ -227,6 +248,7 @@ export const createMemoryPool = (
     configure(next) {
       limits = normalize({ ...limits, ...next });
       resources.configure(limits);
+      admission.configure(limits.maxConcurrentOperations);
       allocate();
     },
     memberCount: () => members.size,

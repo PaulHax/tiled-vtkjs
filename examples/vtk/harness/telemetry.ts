@@ -77,8 +77,7 @@ const contaminationOf = (members: readonly SceneMemberSnapshot[]): string[] => {
     if ((stats.queue?.active ?? 0) > 0) reasons.push(`${id}:fetching`);
     if ((stats.queue?.queued ?? 0) + (stats.queue?.retrying ?? 0) > 0)
       reasons.push(`${id}:queued`);
-    if ((stats.decode?.activeJobs ?? 0) + (stats.decode?.queuedJobs ?? 0) > 0)
-      reasons.push(`${id}:decoding`);
+    if ((stats.decode?.activeJobs ?? 0) > 0) reasons.push(`${id}:decoding`);
     if (stats.submissions.queuedJobs > 0 || stats.renderer.pendingJobs > 0)
       reasons.push(`${id}:submitting`);
   }
@@ -154,7 +153,6 @@ const memberSnapshot = (
             cacheHits: stats.queue.cacheHits,
             cacheMisses: stats.queue.cacheMisses,
             cacheEvictions: stats.queue.cacheEvictions,
-            cacheRevisits: stats.queue.cacheRevisits,
             workPending: stats.queue.workPending,
           },
     decode: stats.decode ?? null,

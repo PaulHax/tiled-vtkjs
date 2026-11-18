@@ -6,26 +6,29 @@ import type {
   TextureCapabilities,
 } from "./decode";
 import type { Allocation } from "../core/streamedMember";
-import type { MemoryDomain } from "../core/memoryResources";
+import type {
+  MemoryDomain,
+  MemoryRefusalEstimate,
+} from "../core/memoryResources";
 
 export type Tiles3dResourceState =
   | { readonly status: "ready" }
-  | {
+  | ({
       readonly status: "blocked";
       readonly domain: MemoryDomain;
       readonly requestedBytes: number;
       readonly limitBytes: number;
-      readonly reason: "configured-limit" | "transition-unavailable";
       readonly retryable: boolean;
-    }
+    } & MemoryRefusalEstimate)
+  | ({ readonly status: "blocked" } & TileCountLimit)
   | {
-      readonly status: "error";
+      readonly status: "error" | "unsupported";
       readonly errorName: string;
       readonly message: string;
-    }
-  | { readonly status: "stalled"; readonly message: string };
+    };
 import type {
   TileContentAdapterFactory,
+  TileCountLimit,
   TileContentAdapterStats,
 } from "./contentAdapter";
 
@@ -50,7 +53,6 @@ export type ContentQueueStats = {
   readonly cacheHits: number;
   readonly cacheMisses: number;
   readonly cacheEvictions: number;
-  readonly cacheRevisits: number;
   readonly entries: readonly {
     readonly id: string;
     readonly url: string;
@@ -95,6 +97,8 @@ export type Tiles3dMemberConfig = {
   readonly fetchTileset?: TilesetFetch;
   readonly fetchContent?: ContentQueueFetch;
   readonly fetchSubtree?: ContentQueueFetch;
+  /** Opt custom readers into sharing with the same immutable source and trust configuration. */
+  readonly contentSourceIdentity?: object;
   readonly onError?: (error: unknown) => void;
   readonly onResourceState?: (state: Tiles3dResourceState) => void;
 };

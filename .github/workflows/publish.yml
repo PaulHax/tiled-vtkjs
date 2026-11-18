@@ -55,6 +55,7 @@ jobs:
         run: npm run commitlint -- --from "$BASE_SHA" --to "$HEAD_SHA" --verbose
       - run: npm run lint
       - run: npm run format:check
+      - uses: ./.github/actions/setup-vtk
       - run: npm test
       - uses: actions/setup-python@v5
         if: inputs.terrane_producer_ref != ''

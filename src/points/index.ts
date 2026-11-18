@@ -56,5 +56,6 @@ export {
 
 export {
   createCopcWorkerTileSource,
+  CopcWorkerCapacityError,
   type CopcWorkerTileSourceOptions,
 } from "./copcWorkerTileSource";

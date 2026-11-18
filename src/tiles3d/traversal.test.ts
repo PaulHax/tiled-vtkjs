@@ -147,6 +147,43 @@ describe("traverseTileset", () => {
     ).toEqual(["root", "root/2", "root/0", "root/1"]);
   });
 
+  it("restores uncovered regions and then refines the highest-error presented region", () => {
+    const root = makeTile("root", 8, [
+      makeTile("root/0", 1, [makeTile("root/0/0", 0)], matrix(-2)),
+      makeTile("root/1", 4, [
+        makeTile(
+          "root/1/0",
+          1,
+          [makeTile("root/1/0/0", 0), makeTile("root/1/0/1", 0)],
+          matrix(0, 0, 6),
+        ),
+      ]),
+      makeTile("root/2", 0, [], matrix(2)),
+    ]);
+    const presented = new Set(["root/0", "root/1/0"]);
+    const submitted: Record<string, TileReadiness> = {
+      root: "submitted",
+      "root/0": "submitted",
+      "root/1": "submitted",
+      "root/1/0": "submitted",
+    };
+    const camera = view(
+      [0, 0, 10],
+      multiply(perspective(Math.PI / 2, 1, 0.1, 100), matrix(0, 0, -10)),
+    );
+    const result = select(root, submitted, {
+      camera,
+      presented: (id) => presented.has(id),
+    });
+    expect(result.requestedTileIds.filter((id) => !submitted[id])).toEqual([
+      "root/2",
+      "root/1/0/0",
+      "root/1/0/1",
+      "root/0/0",
+    ]);
+    expect(result.drawnTileIds).toEqual(["root"]);
+  });
+
   it("reuses hierarchy across camera changes and invalidates replaced or evicted subtrees", () => {
     const root = implicitRoot();
     const parsed = parseSubtree(
@@ -259,7 +296,9 @@ describe("traverseTileset", () => {
       },
     );
 
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/fixture/subtrees/0/0/0.subtree" },
+    ]);
     expect(result.desiredTileIds).toEqual([
       "root/0",
       "root/1",
@@ -342,7 +381,9 @@ describe("traverseTileset", () => {
       "root/2",
       "root/3",
     ]);
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/tiles/subtrees/0/0/0.subtree" },
+    ]);
     expect(result.tileById.get("root/3")).toMatchObject({
       geometricError: 8,
       contentUri: "content/1/1/1.glb",
@@ -429,7 +470,10 @@ describe("traverseTileset", () => {
       },
     );
 
-    expect(result.neededSubtreeRequests).toEqual([]);
+    expect(result.neededSubtreeRequests).toEqual([
+      { id: "subtree/0/0/0", url: "/tiles/subtrees/0/0/0.subtree" },
+      { id: "subtree/2/0/0", url: "/tiles/subtrees/2/0/0.subtree" },
+    ]);
     expect(result.desiredTileIds).toContain("root/0/0");
     expect(result.desiredTileIds).not.toContain("root/0");
     expect(result.requestedTileIds).toContain("root/0/0");
@@ -533,6 +577,34 @@ describe("traverseTileset", () => {
     expect(result.desiredTileIds).toEqual(["root"]);
     expect(result.requestedTileIds).toEqual(["root", "root/0", "root/1"]);
     expect(result.drawnTileIds).toEqual(["root/0", "root/1"]);
+  });
+
+  it("restores broad published coverage before refining an asynchronously admitted region", () => {
+    const root = makeTile("root", 16, [
+      makeTile("root/0", 0),
+      makeTile("root/1", 0),
+    ]);
+    const options: TilesetTraversalOptions = {
+      root,
+      camera: view([0, 0, -4]),
+      maximumScreenSpaceErrorPx: 2,
+      readiness: () => "submitted",
+    };
+    const rebuilding = traverseTileset({
+      ...options,
+      presented: (id) => id === "root/0",
+    });
+    expect(rebuilding.desiredTileIds).toEqual(["root/0", "root/1"]);
+    expect(rebuilding.requestedTileIds).toContain("root");
+    expect(rebuilding.drawnTileIds).toEqual(["root"]);
+    expect(rebuilding.recoveringCoverage).toBe(true);
+
+    const recovered = traverseTileset({
+      ...options,
+      presented: (id) => id === "root",
+    });
+    expect(recovered.drawnTileIds).toEqual(["root/0", "root/1"]);
+    expect(recovered.recoveringCoverage).toBe(false);
   });
 
   it("keeps the nearest submitted fallback through nested failure and admission", () => {

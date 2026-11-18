@@ -180,37 +180,28 @@ describe("createMemoryPool", () => {
     expect(pool.stats()).toMatchObject({ rendererBytes: 0, owners: 0 });
   });
 
-  it("retains canceled physical slots and removes aborted waiting operations", async () => {
-    const pool = createMemoryPool({
-      totalBytes: 100,
-      workBytes: 100,
-      maxConcurrentOperations: 1,
-    });
+  it("retains reserved work bytes independently of admission and owner closure", () => {
+    const pool = createMemoryPool({ totalBytes: 100, workBytes: 100 });
     const a = pool.createOwner();
     const b = pool.createOwner();
     const signal = new AbortController();
-    const operation = await a.work(signal.signal, 80);
-    const queuedAbort = new AbortController();
-    const queued = b.work(queuedAbort.signal, 40);
-    const rejected = expect(queued).rejects.toMatchObject({
-      name: "AbortError",
-    });
-    queuedAbort.abort();
-    await rejected;
+    const operation = a.work(signal.signal, 80);
+    expect(() => b.work(undefined, 40)).toThrow(ResourcePolicyError);
     signal.abort();
     a.close();
     expect(pool.stats()).toMatchObject({
-      activeOperations: 1,
+      activeOperations: 0,
       queuedOperations: 0,
       workReservedBytes: 80,
       owners: 2,
     });
-    const next = b.work(undefined, 40);
-    expect(pool.stats().queuedOperations).toBe(1);
+    expect(() => b.work(signal.signal, 10)).toThrow(/aborted/i);
+    const before = pool.availability();
     operation.release();
-    const resumed = await next;
+    expect(pool.availability()).toBeGreaterThan(before);
+    const resumed = b.work(undefined, 40);
     expect(pool.stats()).toMatchObject({
-      activeOperations: 1,
+      activeOperations: 0,
       workReservedBytes: 40,
       owners: 1,
     });
@@ -237,34 +228,6 @@ describe("createMemoryPool", () => {
       cpuReservedBytes: 0,
     });
     owner.close();
-  });
-
-  it("rejects every queued operation of a closing owner before admitting any of them", async () => {
-    const pool = createMemoryPool({
-      totalBytes: 100,
-      workBytes: 100,
-      maxConcurrentOperations: 3,
-    });
-    const active = pool.createOwner();
-    const closing = pool.createOwner();
-    const operation = await active.work(undefined, 80);
-    const large = closing.work(undefined, 90);
-    const small = closing.work(undefined, 10);
-    const rejected = Promise.all([
-      expect(large).rejects.toMatchObject({ name: "AbortError" }),
-      expect(small).rejects.toMatchObject({ name: "AbortError" }),
-    ]);
-    closing.close();
-    await rejected;
-    expect(pool.stats()).toMatchObject({
-      activeOperations: 1,
-      workReservedBytes: 80,
-      queuedOperations: 0,
-      owners: 1,
-    });
-    operation.release();
-    active.close();
-    expect(pool.stats().owners).toBe(0);
   });
 
   it("counts replacement allocation identity once when multiple handles share it", () => {

@@ -18,11 +18,13 @@ coefficients remain floating point without color clamping. `modelToScene` is the
 composed Float64 node, glTF axis, tile and scene transform; Gaussian consumers
 must not add the mesh `content.origin` to it.
 
-The accepted appearance properties are `ellipse`, `perspective`,
-`cameraDistance`, and either `srgb_rec709_display` or `lin_rec709_display`.
-Accepting both color spaces for decoding does not establish a policy for blending
-them together. Unsupported required extensions and appearance properties produce
-named errors, including across the decode worker boundary.
+The uncompressed decoder accepts the `ellipse` kernel, `perspective` projection,
+`cameraDistance` sorting and both Rec.709 display color spaces. The Gaussian
+adapter advertises only `srgb_rec709_display`, and the mesh adapter advertises
+an empty list. The streamed member passes this capability to the decoder, which
+checks Gaussian primitives in the active scene before reserving decoded output
+or loading glTF dependencies. Unsupported required extensions and appearance
+properties produce named errors across the decode worker boundary.
 
 The uncompressed accessor profile is non-indexed POINTS with non-sparse
 attributes. Skinning and morph targets are rejected. The selected city's draft
@@ -50,11 +52,13 @@ all supplied ranges, including ranges from different tilesets. It uses Float64
 camera-distance keys and subtracts camera translation before adding local
 offsets. The order indexes the concatenation of the input ranges.
 
-`createGaussianSortController` coalesces camera changes behind one running job.
-Changing scene membership or placement through `setScene` advances its revision;
-obsolete results are discarded. Repeating a camera position does not sort again.
-Rotation alone is not a sorting input. The last published presentation remains
-the consumer's responsibility until the next one is ready.
+`createGaussianSortController` keeps one running job and coalesces upcoming
+work to the current camera and scene. The shared renderer can publish a
+completed order while camera or desired coverage keeps changing. Tile
+generations, visibility, placement and live tuple ranges must still match.
+The renderer accepts snapshots in revision order. Repeated positions on an
+unchanged scene reuse the current order. Rotation alone leaves the distance
+keys unchanged.
 
 The shared renderer acquires a work slot before capturing the scene and camera
 for a sort. Changes while admission is queued coalesce into that job. Its latest
@@ -69,9 +73,11 @@ owns this retained order until its visible scene changes or the renderer is disp
 
 Use `createGaussianSortWorkerBackend` with a module worker resolved from
 `tiled-vtkjs/tiles3d/gaussian-sort-worker`. The backend owns and terminates that
-worker. Scene attributes are cloned once per scene revision; subsequent camera
-jobs send only the camera position. Position arrays are borrowed and must remain
-immutable until all jobs referring to them complete.
+worker. Scene attributes are cloned once per scene revision. Subsequent jobs
+for that scene send the camera position. Borrowed position arrays must remain
+immutable until every referring job completes. The renderer retries a failed
+worker dispatch once. If that attempt fails, it reports the error and preserves
+the last compatible presentation.
 
 ## Tile realization
 
@@ -86,36 +92,45 @@ passing the same `createGaussianContentAdapterFactory` to the members sharing a
 view. When the member renderer is wrapped for per-layer mesh appearance, set
 `TileContentAdapterOptions.realizationRenderer` to the canonical physical renderer.
 Meshes continue to use their layer renderer while Gaussian attachment and global
-ordering share the physical renderer. It supports sRGB reconstruction, complete SH degrees 0 through 3, affine
-covariance transformation and explicit XYZW-to-mapper quaternion conversion.
-The renderer rejects linear reconstruction color space until a corresponding
-resolve/composition policy is available. Gaussian picking remains disabled.
+ordering share the physical renderer. The adapter supports complete SH degrees
+0 through 3, affine covariance transformation and explicit XYZW-to-mapper
+quaternion conversion. Gaussian picking is unavailable.
 
 Install `createGaussianAlphaPass` as the host ForwardPass's translucent pass.
-Opaque geometry populates depth first; the shared Gaussian actor then uses
-premultiplied alpha and depth testing without depth writes. General translucent
-triangle interleaving is not supported by this pass.
+Opaque geometry populates depth first. The shared Gaussian actor uses
+premultiplied alpha and depth testing without depth writes. The pass preserves
+straight-alpha blending for other actors. It does not depth-sort those actors
+together with individual splats. The shared tile adapter rejects `BLEND`
+triangle content when it would coexist with Gaussians.
 
-Attributes occupy stable, reusable ranges in persistent capacity arrays and GPU
-textures. Tile admission and placement changes update affected ranges; camera
-movement changes only order for degree-zero content. Directional SH also updates
-color ranges. Capacity growth and context restoration require full uploads.
-Retired ranges become reusable only after a coherent presentation swap. Parent
-and child representations do not draw together during replacement.
+Attributes occupy stable, reusable ranges. The view's submission scheduler
+slices covariance reconstruction, order remapping, SH color evaluation and
+dirty-range texture transfers. With a live `getOpenGLRenderWindow` resolver,
+bind the context before draining work and call the factory's `noteContext` for
+that renderer. The adapter stages geometry in one texture bank per atlas and
+stages color and order for the next draw separately from the accepted draw.
+Degree-zero camera updates skip geometry and reuse colors already written to
+that draw bank. A new atlas or context requires writing every range in its
+first presentation. The VTK mapper handles texture updates during paint when
+the host omits the live window resolver.
 
-Reserved growth, allocated atlas arrays and the last published atlas have
-independent lifetimes. Cancelling growth restores the lease backing the current
-arrays. Superseded arrays remain charged while they are allocated or displayed;
-camera-only publications retain the lease for their actual backing arrays.
+A completed transfer publishes coverage, the order and mesh picking together
+at paint. A compatible region can advance while another region retains its
+predecessor. Overlapping parent and child coverage is never drawn together for
+a REPLACE transition. Tuple slots remain unavailable for reuse while an
+accepted draw or pending work still references them. Growth and required
+replacement compaction hold the old allocation until publication. Cancelling
+a transition releases its unpublished reservations and transfers.
 
-`maximumVisibleSplats` constrains complete representations. Members pass their
-shared `MemoryPool` through `TileContentAdapterOptions.memoryPool`; its ledger
-owns source buffers, storage capacity, overlapping presentations, worker copies
-and sort workspace. Per-member grants still constrain demand. The factory's
-`resourceBudgetBytes` configures its pool when used without an injected pool. The selector retains a coarser representation when a replacement
-cannot fit. Diagnostics separate source/staging attributes, GPU attributes,
-worker attributes, sort workspace and replacement storage. Texture row padding
-and runtime allocations can add overhead beyond logical payload estimates.
+`maximumVisibleSplats` bounds complete visible representations. Its count
+refusals are distinct from byte limits. Members pass their shared
+`MemoryPool` through `TileContentAdapterOptions.memoryPool`. The ledger
+charges source buffers, storage capacity, overlapping presentations, worker
+copies and sort workspace. Per-member grants constrain demand. The factory's
+`resourceBudgetBytes` configures its pool when used without an injected pool.
+Final residency and available transition headroom can require different
+coverage choices. The logical byte estimates exclude texture allocator and
+driver overhead.
 
 The sort endpoint is an ES module with shared module dependencies. Hosts bundling
 the library must stage its complete emitted module graph at the worker URL, or
@@ -138,7 +153,7 @@ A `?tiles=<tileset URL>` link opens a tileset directly, including on the root pa
 The city preset uses the example server's fixed same-origin proxy because its
 upstream redirect does not support browser CORS. Other URLs need a CORS-enabled
 endpoint. The preset derives its local ENU frame from the supplied ECEF root
-transform. Application bridge and map view integration remain separate work.
+transform.
 
 The tiny test GLB is synthetic and unlocated. It verifies standard attribute and
 worker handling, not independent geographic alignment or producer compatibility.
