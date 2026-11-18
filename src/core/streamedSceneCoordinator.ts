@@ -520,7 +520,6 @@ export const createStreamedSceneCoordinator = (
     if (disposed) return;
     const first =
       !options.schedulePreparation || lastPreparedPageFrame !== pageFrame;
-    if (!first && !painting) return;
     if (first) {
       lastPreparedPageFrame = pageFrame;
       for (const state of members) {
@@ -528,6 +527,8 @@ export const createStreamedSceneCoordinator = (
       }
       preparedAvailability = memory.availability();
     }
+    // A queued preparation callback can follow a paint in the same frame.
+    // Drain against the same allowance so any deferred work is scheduled again.
     submissions.prepareFrame(pageFrame, painting);
     const submitted = submissions.stats().lastFrameAdmittedJobs > 0;
     capacityWorkSinceLastReport ||= submitted;

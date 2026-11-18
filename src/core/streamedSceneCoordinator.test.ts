@@ -71,6 +71,41 @@ const makeMember = (overrides: Partial<GovernorInputs> = {}) => {
 };
 
 describe("createStreamedSceneCoordinator", () => {
+  it("requests another drain when preparation follows a budget-limited paint", () => {
+    let preparationPending = false;
+    const coordinator = makeCoordinator({
+      schedulePreparation: () => {
+        preparationPending = true;
+      },
+    });
+    const member = makeMember();
+    coordinator.register(member);
+    const { submissions } = coordinator.context({});
+    const painted = vi.fn();
+    const deferred = vi.fn();
+    submissions.enqueue({
+      bytes: submissions.stats().maxBytesPerFrame,
+      run: painted,
+    });
+    submissions.enqueue({ bytes: 1, run: deferred });
+    expect(preparationPending).toBe(true);
+
+    coordinator.prepareFrame(1, 10);
+    expect(painted).toHaveBeenCalledOnce();
+    expect(deferred).not.toHaveBeenCalled();
+    expect(preparationPending).toBe(true);
+
+    preparationPending = false;
+    coordinator.prepareWork(10);
+    expect(member.prepareFrame).toHaveBeenCalledOnce();
+    expect(deferred).not.toHaveBeenCalled();
+    expect(preparationPending).toBe(true);
+
+    coordinator.prepareWork(11);
+    expect(deferred).toHaveBeenCalledOnce();
+    coordinator.dispose();
+  });
+
   it.each(["hide", "release"])(
     "remeasures after an active peer is removed by %s",
     (action) => {
