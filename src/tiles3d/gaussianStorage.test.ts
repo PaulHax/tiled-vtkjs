@@ -48,7 +48,7 @@ it("plans the same coalesced growth ranges that allocation will use", () => {
   expect(projected).toBe(arena.capacity);
 });
 
-it("reports dirty texture ranges only after the reserved tuples are packed", () => {
+it("reports dirty texture ranges for packed live tuples", () => {
   const arena = createGaussianStorage();
   arena.grow(8);
   const parent = arena.allocate("parent", 3);
@@ -67,5 +67,13 @@ it("reports dirty texture ranges only after the reserved tuples are packed", () 
     child.offset,
     child.count,
   );
+  const retired = arena.allocate("retired", 2);
+  arena.markPacked(
+    retired.revision,
+    [0, 1, 0, 1, 0, 1],
+    retired.offset,
+    retired.count,
+  );
+  arena.retireExcept(new Set(["parent", "child"]));
   expect(arena.takePackedUpdates()).toEqual([[child.offset, child.count]]);
 });

@@ -18,7 +18,7 @@ export const createGaussianStorage = () => {
     { offset: number; count: number; revision: number }
   >();
   let free: { offset: number; count: number }[] = [];
-  let pending: [number, number][] = [];
+  const packedUpdates = new Map<number, [number, number]>();
   const packed = new Map<number, GaussianBounds>();
   const progress = new Map<number, { count: number; bounds: GaussianBounds }>();
 
@@ -34,7 +34,7 @@ export const createGaussianStorage = () => {
     coalesce();
     packed.clear();
     progress.clear();
-    pending = [];
+    packedUpdates.clear();
   };
 
   const coalesce = (): void => {
@@ -146,7 +146,7 @@ export const createGaussianStorage = () => {
     ): void {
       progress.delete(revision);
       packed.set(revision, bounds);
-      pending.push([offset, count]);
+      packedUpdates.set(revision, [offset, count]);
     },
     markPartial(revision: number, count: number, bounds: GaussianBounds): void {
       progress.set(revision, { count, bounds });
@@ -161,13 +161,14 @@ export const createGaussianStorage = () => {
           allocations.delete(key);
           packed.delete(allocation.revision);
           progress.delete(allocation.revision);
+          packedUpdates.delete(allocation.revision);
           free.push(allocation);
         }
       coalesce();
     },
     takePackedUpdates(): [number, number][] {
-      const ranges = pending;
-      pending = [];
+      const ranges = [...packedUpdates.values()];
+      packedUpdates.clear();
       return ranges;
     },
     clear(): void {
@@ -182,7 +183,7 @@ export const createGaussianStorage = () => {
       packed.clear();
       progress.clear();
       free = [];
-      pending = [];
+      packedUpdates.clear();
     },
   };
   return api;
