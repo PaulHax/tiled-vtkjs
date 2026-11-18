@@ -185,7 +185,7 @@ export type RequestAdmission = {
   configure(parallel: number): void;
   capacity(): number;
   activeOperations(): number;
-  /** Keep room for one interactive sort while a view has sortable content. */
+  /** Keep one grant free of network work while a view has sortable content. */
   reserveSortCapacity(): () => void;
   queuedOperations(): number;
   canAcquireWorker(kind: WorkerKind, reclaim?: boolean): boolean;
@@ -201,6 +201,7 @@ export type RequestAdmission = {
 export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let limit = integerAtLeast("parallel", parallel, 1);
   let active = 0;
+  let networking = 0;
   let sorting = 0;
   let sortReservations = 0;
   let preferSort = true;
@@ -212,6 +213,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     sort: new Set<{ reclaimable?: IdleWorker }>(),
   };
   const backgroundLanes = ["compute", "network"] as const;
+  const computeLane = ["compute"] as const;
   const sortLane = ["sort"] as const;
   const lastBackgroundGrant = new WeakMap<object, number>();
   const lastSortGrant = new WeakMap<object, number>();
@@ -221,6 +223,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
 
   const charge = (lane: RequestLane, delta: number): void => {
     active += delta;
+    if (lane === "network") networking += delta;
     if (lane === "sort") sorting += delta;
   };
 
@@ -258,12 +261,18 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     try {
       while (active < limit) {
         const sort = sorting === 0 ? offer(sortLane, lastSortGrant) : undefined;
-        const reserved = sortReservations > 0 && limit > 1 ? 1 : 0;
         const sortFirst = sort && (limit > 1 || preferSort);
-        const background =
-          !sortFirst && active - sorting < limit - reserved
-            ? offer(backgroundLanes, lastBackgroundGrant)
-            : undefined;
+        // A slow response can hold a grant for far longer than a ready
+        // decode. Pipeline a decode with a fetch without filling every
+        // grant with network work that a newly ready sort cannot displace.
+        const networkSaturated =
+          sortReservations > 0 && limit > 1 && networking >= limit - 1;
+        const background = sortFirst
+          ? undefined
+          : offer(
+              networkSaturated ? computeLane : backgroundLanes,
+              lastBackgroundGrant,
+            );
         const next = background ?? sort;
         if (!next) break;
         // With one grant, alternate ready classes. A waiting sort takes the

@@ -486,16 +486,19 @@ const traverseHierarchy = (
         hasSubmittedDescendant(child),
     );
 
-  // Where each visible tile sits in the request order: coarser levels first,
-  // so a view never waits on detail while it still has holes, then nearest
-  // the centre of the view, where the user is looking.
-  const requestOrder = new Map<string, readonly [number, number]>();
+  type Region = { readonly error: number; readonly offset: number };
+  type RequestOrder = {
+    readonly depth: number;
+    readonly offset: number;
+    readonly coveredRegion: Region | undefined;
+  };
+  const requestOrder = new Map<string, RequestOrder>();
 
   const visit = (
     tile: TilesetTile,
     parentTransform: readonly number[],
     depth: number,
-    ancestorPresented = false,
+    coveredRegion?: Region,
   ): VisitResult => {
     let placement = placements.get(tile);
     if (!placement) {
@@ -518,9 +521,10 @@ const traverseHierarchy = (
         drawn: [],
       };
     }
-    requestOrder.set(tile.id, [depth, view.centerRayOffset(bounds.center)]);
+    const offset = view.centerRayOffset(bounds.center);
+    requestOrder.set(tile.id, { depth, offset, coveredRegion });
     const ownPresented = options.presented?.(tile.id) ?? false;
-    const covered = ancestorPresented || ownPresented;
+    const covered = !!coveredRegion || ownPresented;
 
     const subtreeRequest = hierarchy.subtreeRequestByTileId.get(tile.id);
     if (subtreeRequest) neededSubtrees.set(subtreeRequest.id, subtreeRequest);
@@ -548,15 +552,18 @@ const traverseHierarchy = (
     // Their descendants remain reachable regardless of the node's own SSE, and
     // regardless of `refinable` — such a node has no content of its own to
     // stand as a frontier, so refusing to descend would draw nothing at all.
+    const error =
+      tile.children.length > 0 && (ownPresented || contentful)
+        ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
+        : 0;
+    const childRegion = ownPresented ? { error, offset } : coveredRegion;
     const refine =
       tile.children.length > 0 &&
       (!contentful ||
-        (screenSpaceError(tile, accumulated, bounds, view, errorScale) >
-          effective &&
-          (options.refinable?.(tile.id) ?? true)));
+        (error > effective && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
       ? tile.children.map((child) =>
-          visit(child, accumulated, depth + 1, covered),
+          visit(child, accumulated, depth + 1, childRegion),
         )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
@@ -586,7 +593,7 @@ const traverseHierarchy = (
       const fallbacks =
         !submitted && hasSubmittedDescendant(tile)
           ? tile.children.map((child) =>
-              visit(child, accumulated, depth + 1, covered),
+              visit(child, accumulated, depth + 1, childRegion),
             )
           : [];
       const visibleFallbacks = fallbacks.filter((child) => child.visible);
@@ -664,9 +671,17 @@ const traverseHierarchy = (
   const rootParent = options.modelMatrix ?? IDENTITY;
   const result = visit(hierarchy.root, rootParent, 0);
   const requested = [...result.requested].sort((left, right) => {
-    const [leftDepth, leftOffset] = requestOrder.get(left)!;
-    const [rightDepth, rightOffset] = requestOrder.get(right)!;
-    return leftDepth - rightDepth || leftOffset - rightOffset;
+    const a = requestOrder.get(left)!;
+    const b = requestOrder.get(right)!;
+    // First restore regions without coverage. Then let the highest-error
+    // visible fallback refine without waiting for a whole breadth level.
+    const aRegion = a.coveredRegion;
+    const bRegion = b.coveredRegion;
+    const coverageOrder =
+      aRegion && bRegion
+        ? bRegion.error - aRegion.error || aRegion.offset - bRegion.offset
+        : Number(!!aRegion) - Number(!!bRegion);
+    return coverageOrder || a.depth - b.depth || a.offset - b.offset;
   });
   const rootAccumulated = multiply(rootParent, hierarchy.root.transform);
   const rootSse = result.visible

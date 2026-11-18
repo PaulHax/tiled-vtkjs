@@ -147,6 +147,43 @@ describe("traverseTileset", () => {
     ).toEqual(["root", "root/2", "root/0", "root/1"]);
   });
 
+  it("restores uncovered regions and then refines the highest-error presented region", () => {
+    const root = makeTile("root", 8, [
+      makeTile("root/0", 1, [makeTile("root/0/0", 0)], matrix(-2)),
+      makeTile("root/1", 4, [
+        makeTile(
+          "root/1/0",
+          1,
+          [makeTile("root/1/0/0", 0), makeTile("root/1/0/1", 0)],
+          matrix(0, 0, 6),
+        ),
+      ]),
+      makeTile("root/2", 0, [], matrix(2)),
+    ]);
+    const presented = new Set(["root/0", "root/1/0"]);
+    const submitted: Record<string, TileReadiness> = {
+      root: "submitted",
+      "root/0": "submitted",
+      "root/1": "submitted",
+      "root/1/0": "submitted",
+    };
+    const camera = view(
+      [0, 0, 10],
+      multiply(perspective(Math.PI / 2, 1, 0.1, 100), matrix(0, 0, -10)),
+    );
+    const result = select(root, submitted, {
+      camera,
+      presented: (id) => presented.has(id),
+    });
+    expect(result.requestedTileIds.filter((id) => !submitted[id])).toEqual([
+      "root/2",
+      "root/1/0/0",
+      "root/1/0/1",
+      "root/0/0",
+    ]);
+    expect(result.drawnTileIds).toEqual(["root"]);
+  });
+
   it("reuses hierarchy across camera changes and invalidates replaced or evicted subtrees", () => {
     const root = implicitRoot();
     const parsed = parseSubtree(

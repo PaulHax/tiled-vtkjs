@@ -373,16 +373,20 @@ describe("page request admission", () => {
     expect(admission.activeOperations()).toBe(0);
   });
 
-  it("keeps one grant for an interactive sort while background work progresses", async () => {
+  it("pipelines decode without making an interactive sort wait for network", async () => {
     const { admission, starts, run, finish } = controlledStages(3);
     const releaseCapacity = admission.reserveSortCapacity();
     const network = run("network", "fetch");
-    const compute = run("compute", "decode");
+    const second = run("network", "second");
     const next = run("network", "next");
-    expect(starts).toEqual(["fetch", "decode"]);
+    expect(starts).toEqual(["fetch", "second"]);
+    const compute = run("compute", "decode");
     const sort = run("sort", "sort");
-    expect(starts).toEqual(["fetch", "decode", "sort"]);
+    expect(starts).toEqual(["fetch", "second", "decode"]);
     expect(admission.activeOperations()).toBe(3);
+    finish("decode");
+    await compute;
+    expect(starts.at(-1)).toBe("sort");
     finish("sort");
     await sort;
     expect(starts.at(-1)).toBe("sort");
@@ -390,8 +394,8 @@ describe("page request admission", () => {
     releaseCapacity();
     await settle();
     expect(starts.at(-1)).toBe("next");
-    for (const key of ["fetch", "decode", "next"]) finish(key);
-    await Promise.all([network, compute, next]);
+    for (const key of ["fetch", "second", "next"]) finish(key);
+    await Promise.all([network, second, next]);
   });
 
   it("alternates ready sort and background stages with one grant", async () => {

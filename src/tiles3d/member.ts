@@ -290,16 +290,24 @@ export const createTiles3dMember = (
     return retry;
   };
 
+  let prioritizedPresentation: readonly string[] = [];
   const onPresentationChange = (): void => {
     syncPickPresentation();
     if (realizationWakeQueued || !demand.size) return;
     realizationWakeQueued = true;
     queueMicrotask(() => {
       realizationWakeQueued = false;
+      const presented = adapter.presentedTileIds?.();
+      const prioritiesChanged =
+        presented &&
+        (presented.length !== prioritizedPresentation.length ||
+          presented.some((id, index) => id !== prioritizedPresentation[index]));
       if (
         !disposed &&
         active &&
-        (retryRealizations("presentation") || traversal?.recoveringCoverage)
+        (retryRealizations("presentation") ||
+          traversal?.recoveringCoverage ||
+          prioritiesChanged)
       )
         refreshSelection();
     });
@@ -764,6 +772,7 @@ export const createTiles3dMember = (
       }
       selectionPasses += 1;
       const next = select(traversalMaximumSse(), traversalQualityFraction());
+      prioritizedPresentation = adapter.presentedTileIds?.() ?? [];
       const previousDesired = traversal?.desiredTileIds;
       if (
         previousDesired?.length !== next.desiredTileIds.length ||
