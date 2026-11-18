@@ -363,6 +363,9 @@ export const createTiles3dMember = (
     memoryPool: context.memory,
     onPresentationChange,
     onAdmissionRefusal(ids, error) {
+      // The adapter can release the memory that blocked this admission while
+      // unwinding it, before the selection update below can run.
+      const availability = context.memory.availability();
       const affected = ids.map((id) => ({ id, tile: demand.get(id) }));
       queueMicrotask(() => {
         if (disposed || !active) return;
@@ -373,7 +376,8 @@ export const createTiles3dMember = (
         );
         if (!cancelled.length) return;
         policyRefused(error);
-        for (const id of cancelled) rememberRefusal([id], null, error);
+        for (const id of cancelled)
+          rememberRefusal([id], null, error, availability);
         refreshSelection();
       });
     },
@@ -584,12 +588,13 @@ export const createTiles3dMember = (
     ids: readonly string[],
     replacement: string | null,
     refusal: TileSubmissionRefusal,
+    availability = context.memory.availability(),
   ): void => {
     const blocked = {
       refusal,
       replacement,
       group: ids.length > 1,
-      availability: context.memory.availability(),
+      availability,
     };
     for (const id of ids) {
       const tile = demand.get(id);

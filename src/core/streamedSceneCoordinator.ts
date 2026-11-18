@@ -522,10 +522,12 @@ export const createStreamedSceneCoordinator = (
       !options.schedulePreparation || lastPreparedPageFrame !== pageFrame;
     if (first) {
       lastPreparedPageFrame = pageFrame;
+      // A member can free capacity during preparation after another member
+      // has already checked it. Leave that release visible to checkInputs.
+      preparedAvailability = memory.availability();
       for (const state of members) {
         if (state.active) state.member.prepareFrame();
       }
-      preparedAvailability = memory.availability();
     }
     // A queued preparation callback can follow a paint in the same frame.
     // Drain against the same allowance so any deferred work is scheduled again.

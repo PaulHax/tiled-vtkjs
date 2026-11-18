@@ -71,6 +71,38 @@ const makeMember = (overrides: Partial<GovernorInputs> = {}) => {
 };
 
 describe("createStreamedSceneCoordinator", () => {
+  it("wakes a member when a later member frees renderer capacity during preparation", async () => {
+    const memory = createMemoryPool({ totalBytes: 1000 });
+    const owner = memory.createOwner();
+    const retained = owner.reserveRenderer(500);
+    const schedulePreparation = vi.fn();
+    const coordinator = makeCoordinator({ memory, schedulePreparation });
+    const blocked = makeMember();
+    const releasing = makeMember();
+    let refined = false;
+    blocked.prepareFrame.mockImplementation(() => {
+      refined ||= memory.stats().rendererBytes === 0;
+    });
+    releasing.prepareFrame.mockImplementationOnce(() => retained.release());
+    coordinator.register(blocked);
+    coordinator.register(releasing);
+    await settle();
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(10);
+    expect(refined).toBe(false);
+    await settle();
+    expect(schedulePreparation).toHaveBeenCalledOnce();
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(11);
+    expect(refined).toBe(true);
+    await settle();
+    expect(schedulePreparation).not.toHaveBeenCalled();
+    coordinator.dispose();
+    owner.close();
+  });
+
   it("requests another drain when preparation follows a budget-limited paint", () => {
     let preparationPending = false;
     const coordinator = makeCoordinator({

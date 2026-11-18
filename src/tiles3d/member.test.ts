@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { perspectiveView } from "../../test/helpers";
 import { IDENTITY } from "../core/mat4";
 import { createMemoryPool } from "../core/memoryPool";
+import { ResourcePolicyError } from "../core/memoryResources";
+import { createStreamedSceneCoordinator } from "../core/streamedSceneCoordinator";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import type { StreamedMemberContext } from "../core/streamedMember";
 import {
@@ -12,6 +14,7 @@ import {
   type DecodedMeshTileContent,
 } from "./decode";
 import { createTiles3dMember } from "./member";
+import { createMeshContentAdapter } from "./meshContentAdapter";
 import type {
   Tiles3dMemberConfig,
   Tiles3dMemberStats,
@@ -1115,6 +1118,94 @@ describe("createTiles3dMember", () => {
     });
     expect(h.contentRequests).toEqual(["/tiles/root.glb"]);
     member.dispose();
+    other.close();
+  });
+
+  it("retries decoded content after a deferred refusal and release in the same preparation", async () => {
+    const h = harness();
+    const other = h.memory.createOwner();
+    const occupied = other.reserveRenderer(4096);
+    const schedulePreparation = vi.fn();
+    const scheduleRender = vi.fn();
+    const coordinator = createStreamedSceneCoordinator({
+      memory: h.memory,
+      scheduleRender,
+      schedulePreparation,
+    });
+    let attempts = 0;
+    let queued = false;
+    const member = createTiles3dMember(
+      coordinator.context(h.renderer),
+      { ...h.config, cacheBytes: 0 },
+      {
+        ...h.services,
+        createContentAdapter(options) {
+          const adapter = createMeshContentAdapter(options);
+          return {
+            ...adapter,
+            requiredBytes: () => Math.max(58, adapter.requiredBytes()),
+            tileState: (id) => (queued ? "queued" : adapter.tileState(id)),
+            submitTile(id, content, onSubmitted, replacements) {
+              attempts++;
+              if (attempts > 1)
+                return adapter.submitTile(
+                  id,
+                  content,
+                  onSubmitted,
+                  replacements,
+                );
+              queued = true;
+              options.submissions.enqueue({
+                bytes: 0,
+                run() {
+                  queued = false;
+                  options.onAdmissionRefusal?.(
+                    [id],
+                    new ResourcePolicyError("renderer", 4154, 4096, true),
+                  );
+                  occupied.release();
+                },
+              });
+              return "queued";
+            },
+          };
+        },
+      },
+    );
+    const registration = coordinator.register(member);
+    registration.setCamera(view);
+    coordinator.prepareWork(1);
+    await settle();
+    expect(attempts).toBe(1);
+
+    schedulePreparation.mockClear();
+    coordinator.prepareWork(2);
+    await settle();
+    expect(schedulePreparation).toHaveBeenCalledOnce();
+    expect(attempts).toBe(1);
+
+    schedulePreparation.mockClear();
+    scheduleRender.mockClear();
+    coordinator.prepareWork(3);
+    expect(attempts).toBe(2);
+    for (
+      let frame = 4;
+      frame < 10 && !scheduleRender.mock.calls.length;
+      frame++
+    ) {
+      expect(schedulePreparation).toHaveBeenCalled();
+      schedulePreparation.mockClear();
+      coordinator.prepareWork(frame);
+    }
+    expect(scheduleRender).toHaveBeenCalled();
+    coordinator.prepareFrame(1, 10);
+    expect(member.stats()).toMatchObject({
+      resourceState: { status: "ready" },
+      renderer: { drawnTileIds: ["root"] },
+    });
+    expect(h.contentRequests).toEqual(["/tiles/root.glb"]);
+    await settle();
+    coordinator.dispose();
     other.close();
   });
 
