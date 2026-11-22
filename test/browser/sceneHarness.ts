@@ -111,7 +111,7 @@ export type SceneSession = {
   close(): Promise<void>;
 };
 
-type SceneWindow = {
+export type SceneWindow = {
   pointCloudScene: {
     datasets(): { id: string; kind: string; label: string }[];
     stats(): SceneStats;
