@@ -660,7 +660,8 @@ const traverseHierarchy = (
       coverageSubmitted: submitted,
       coveragePresented,
       recoveringCoverage:
-        needsCoverage || visibleChildren.some((child) => child.recoveringCoverage),
+        needsCoverage ||
+        visibleChildren.some((child) => child.recoveringCoverage),
       coveragePossible:
         contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
