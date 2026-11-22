@@ -623,10 +623,19 @@ const traverseHierarchy = (
     const coveragePresented =
       covered || visibleChildren.every((child) => child.coveragePresented);
     const submitted = contentful && options.readiness(tile.id) === "submitted";
-    const recoveringCoverage = Boolean(
+    const needsCoverage = Boolean(
       options.presented && submitted && !coveragePresented,
     );
     if (visibleChildren.every((child) => child.coverageSubmitted)) {
+      // Keep an already displayed neighboring region when each gap has its
+      // own submitted fallback. Falling back again here discards useful detail
+      // across the entire ancestor while the same gaps are being repaired.
+      const recoveringCoverage =
+        needsCoverage &&
+        (!visibleChildren.some((child) => child.coveragePresented) ||
+          visibleChildren.some(
+            (child) => !child.coveragePresented && !child.recoveringCoverage,
+          ));
       return {
         visible: true,
         coverageSubmitted: true,
@@ -650,9 +659,8 @@ const traverseHierarchy = (
       visible: true,
       coverageSubmitted: submitted,
       coveragePresented,
-      recoveringCoverage: visibleChildren.some(
-        (child) => child.recoveringCoverage,
-      ),
+      recoveringCoverage:
+        needsCoverage || visibleChildren.some((child) => child.recoveringCoverage),
       coveragePossible:
         contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
