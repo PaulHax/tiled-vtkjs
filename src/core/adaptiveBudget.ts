@@ -213,6 +213,7 @@ const LATE_WITHOUT_QUANTUM = 1.5;
 type Track = {
   fraction: number;
   readonly samples: number[];
+  confirmingHoldFrames: number;
   readonly targetMs: number;
   readonly probeDwellMs: number;
   readonly lateFrameTolerance: number;
@@ -315,6 +316,7 @@ export const createAdaptiveQuality = (
   ): Track => ({
     fraction: initialFraction,
     samples: [],
+    confirmingHoldFrames: 0,
     targetMs,
     probeDwellMs,
     lateFrameTolerance,
@@ -407,11 +409,16 @@ export const createAdaptiveQuality = (
     };
   };
 
+  const clearWindow = (track: Track): void => {
+    track.samples.length = 0;
+    track.confirmingHoldFrames = 0;
+  };
+
   const change = (track: Track, next: number, now: number): void => {
     track.fraction = next;
     track.lastChangeAt = now;
     track.heldSince = now;
-    track.samples.length = 0;
+    clearWindow(track);
     track.probedFrom = null;
   };
 
@@ -426,6 +433,8 @@ export const createAdaptiveQuality = (
     const hold = (reason: QualityAdjustmentReason): void =>
       record(track, now, "none", reason, from, estimate, late);
 
+    if (late === 0 || late > track.lateFrameTolerance)
+      track.confirmingHoldFrames = 0;
     if (late > track.lateFrameTolerance) {
       if (now - track.lastChangeAt < cooldownMs) return hold("cooldown");
       // A probe that failed its first window goes back to the level a full
@@ -446,7 +455,21 @@ export const createAdaptiveQuality = (
     }
     if (track.samples.length >= windowSize) track.probedFrom = null;
     // A late frame inside tolerance is the equilibrium, not a reason to move.
-    if (late > 0) return hold("within-hysteresis");
+    if (late > 0) {
+      // A still view stops painting once it converges. Let the first mixed
+      // window age out at reduced quality, otherwise a single hitch can
+      // strand the visible tiles at this level indefinitely. Another mixed
+      // window confirms equilibrium without an unbounded idle render loop.
+      if (
+        track === stationary &&
+        from < MAX_VIEW_QUALITY_FRACTION &&
+        track.confirmingHoldFrames < windowSize
+      ) {
+        track.confirmingHoldFrames++;
+        return hold("insufficient-samples");
+      }
+      return hold("within-hysteresis");
+    }
     if (from >= MAX_VIEW_QUALITY_FRACTION) return hold("clamped");
     // Not converged: a still view renders only while this asks for frames,
     // and a probe needs the whole window.
@@ -517,7 +540,7 @@ export const createAdaptiveQuality = (
       // gesture would leave a track that can only ever fall.
       if (next !== from) {
         track.fraction = next;
-        track.samples.length = 0;
+        clearWindow(track);
         track.heldSince = now;
       }
       record(track, now, "none", "seeded", from);
@@ -526,13 +549,13 @@ export const createAdaptiveQuality = (
 
     clearSamples(interacting, now) {
       const track = trackFor(interacting);
-      track.samples.length = 0;
+      clearWindow(track);
       record(track, now, "none", "insufficient-samples", track.fraction);
     },
 
     invalidateCapacity(interacting, now) {
       const track = trackFor(interacting);
-      track.samples.length = 0;
+      clearWindow(track);
       track.failedLevel = null;
       record(track, now, "none", "insufficient-samples", track.fraction);
     },

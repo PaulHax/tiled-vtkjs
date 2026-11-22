@@ -124,9 +124,10 @@ describe("createAdaptiveQuality", () => {
     let now = frames(quality, 2 * REFRESH_MS, false, 6);
     now = frames(quality, 3 * REFRESH_MS, false, 4, now);
     expect(quality.fraction(false)).toBe(0.8);
-    expect(quality.stats().stationary.lastAdjustment?.reason).toBe(
-      "within-hysteresis",
-    );
+    expect(quality.stats().stationary.lastAdjustment).toMatchObject({
+      direction: "none",
+      lateFraction: 0.4,
+    });
     // Most frames missing still gives detail up.
     frames(quality, 3 * REFRESH_MS, false, 3, now);
     expect(quality.fraction(false)).toBeLessThan(0.8);

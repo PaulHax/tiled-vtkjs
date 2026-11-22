@@ -157,9 +157,11 @@ describe("createStreamedSceneCoordinator", () => {
       };
       frame(66);
       frame(66);
-      // The old workload settles at half quality, one late frame in ten.
-      for (let index = 0; index < 9; index += 1) frame(33);
-      frame(50);
+      // The old workload repeatedly misses one frame in ten at half quality.
+      for (let window = 0; window < 2; window += 1) {
+        for (let index = 0; index < 9; index += 1) frame(33);
+        frame(50);
+      }
       expect(coordinator.stats().viewQualityFraction).toBe(0.5);
       expect(coordinator.needsFrame()).toBe(false);
       scheduleRender.mockClear();

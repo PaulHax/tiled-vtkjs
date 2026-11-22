@@ -37,6 +37,33 @@ describe("createViewGovernor", () => {
     });
   });
 
+  it("continues stationary refinement after an isolated late frame following motion", () => {
+    const governor = createViewGovernor();
+    let now = 0;
+    const frame = (hostFrameMs: number) => {
+      now += hostFrameMs;
+      governor.recordHostFrame({ hostFrameMs, now });
+    };
+
+    // The previous view was expensive, and sustained motion reduces detail
+    // further. The final view has enough headroom to refine after stopping.
+    for (let index = 0; index < 10; index++) frame(80);
+    const previousQuality = governor.qualityFraction();
+    const drag = governor.beginMotion("explicit");
+    for (let index = 0; index < 40; index++) frame(50);
+    expect(governor.qualityFraction()).toBeLessThan(previousQuality);
+    drag.release();
+    expect(governor.qualityFraction()).toBe(previousQuality);
+
+    frame(50);
+    // A demand-driven host supplies no more samples once needsFrame is false.
+    for (let index = 0; index < 300 && governor.needsFrame(); index++)
+      frame(1000 / 60);
+    expect(governor.qualityFraction()).toBeGreaterThan(previousQuality);
+    expect(governor.needsFrame()).toBe(false);
+    governor.dispose();
+  });
+
   it("normalizes VTK and GPU spans against their host-frame share", () => {
     const governor = createViewGovernor({
       initialFraction: 0.8,
