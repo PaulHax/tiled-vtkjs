@@ -323,10 +323,14 @@ describe("page request admission", () => {
     const run = (
       lane: RequestLane,
       key: string,
-      controller = new AbortController(),
+      {
+        group,
+        signal = new AbortController().signal,
+      }: { group?: object; signal?: AbortSignal } = {},
     ) =>
       admission.run({
-        signal: controller.signal,
+        group,
+        signal,
         stage: {
           lane,
           start: () =>
@@ -347,7 +351,7 @@ describe("page request admission", () => {
   it("caps overlapping work of different lanes and owners, including canceled work", async () => {
     const { admission, starts, run, finish } = controlledStages(2);
     const controller = new AbortController();
-    const network = run("network", "fetch", controller);
+    const network = run("network", "fetch", { signal: controller.signal });
     const cancelled = expect(network).rejects.toMatchObject({
       name: "AbortError",
     });
@@ -396,6 +400,47 @@ describe("page request admission", () => {
     expect(starts.at(-1)).toBe("next");
     for (const key of ["fetch", "second", "next"]) finish(key);
     await Promise.all([network, second, next]);
+  });
+
+  it("serves other network groups behind a slow fetch while reserving the next grant for a ready sort", async () => {
+    const { admission, starts, run, finish } = controlledStages(2);
+    const releaseCapacity = admission.reserveSortCapacity();
+    const splats = {};
+    const delayed = run("network", "splat child", { group: splats });
+    const sibling = run("network", "splat sibling", { group: splats });
+    expect(starts).toEqual(["splat child"]);
+
+    const mesh = run("network", "mesh", { group: {} });
+    const points = run("network", "COPC", { group: {} });
+    expect(starts).toEqual(["splat child", "mesh"]);
+    expect(admission.activeOperations()).toBe(2);
+
+    const sort = run("sort", "resumed camera");
+    expect(starts.at(-1)).toBe("mesh");
+    finish("mesh");
+    await mesh;
+    expect(starts.at(-1)).toBe("resumed camera");
+    expect(admission.activeOperations()).toBe(2);
+
+    const decode = run("compute", "mesh decode", { group: {} });
+    finish("resumed camera");
+    await sort;
+    expect(starts.at(-1)).toBe("mesh decode");
+    finish("mesh decode");
+    await decode;
+    expect(starts.at(-1)).toBe("COPC");
+    finish("COPC");
+    await points;
+    expect(admission.activeOperations()).toBe(1);
+    expect(starts).not.toContain("splat sibling");
+
+    finish("splat child");
+    await delayed;
+    expect(starts.at(-1)).toBe("splat sibling");
+    finish("splat sibling");
+    await sibling;
+    releaseCapacity();
+    expect(admission.activeOperations()).toBe(0);
   });
 
   it("alternates ready sort and background stages with one grant", async () => {

@@ -106,8 +106,11 @@ admits retained CPU buffers and reserved realization arrays; shared backing
 buffers count once. `workBytes` admits conservative estimates of overlapping
 fetch, input buffers, decoder workspace and output. One keyed admission service
 chooses ready network, compute and sort work using current demand priorities and
-fairness across owners. It preserves sort headroom and keeps independent
-persistent-worker limits. Waiting for a memory charge or worker does not occupy
+fairness across owners. While a view has sortable content, its fetch backlog
+leaves a slot for sorting or decoding. A different member with no fetch in
+flight can use that slot when it would otherwise sit idle. A newly ready sort
+takes the next available slot after active work settles. Persistent workers
+have separate limits. Waiting for a memory charge or worker does not occupy
 a running slot. Cancelled work retains its charges until completion,
 acknowledgement or worker termination. Finished output transfers to retained
 ownership before renderer jobs release their references.

@@ -121,6 +121,8 @@ type Grant = {
 };
 
 type PendingOwner = {
+  /** Explicit member identity for lending network capacity across groups. */
+  readonly group?: object;
   offer(lane: RequestLane): Grant | undefined;
   queued(): number;
 };
@@ -185,7 +187,7 @@ export type RequestAdmission = {
   configure(parallel: number): void;
   capacity(): number;
   activeOperations(): number;
-  /** Keep one grant free of network work while a view has sortable content. */
+  /** Keep a grant available for sorting unless another member needs its first fetch. */
   reserveSortCapacity(): () => void;
   queuedOperations(): number;
   canAcquireWorker(kind: WorkerKind, reclaim?: boolean): boolean;
@@ -202,6 +204,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let limit = integerAtLeast("parallel", parallel, 1);
   let active = 0;
   let networking = 0;
+  const networkByGroup = new WeakMap<object, number>();
   let sorting = 0;
   let sortReservations = 0;
   let preferSort = true;
@@ -214,6 +217,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   };
   const backgroundLanes = ["compute", "network"] as const;
   const computeLane = ["compute"] as const;
+  const networkLane = ["network"] as const;
   const sortLane = ["sort"] as const;
   const lastBackgroundGrant = new WeakMap<object, number>();
   const lastSortGrant = new WeakMap<object, number>();
@@ -221,15 +225,19 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let pumping = false;
   let wakeQueued = false;
 
-  const charge = (lane: RequestLane, delta: number): void => {
+  const charge = (lane: RequestLane, group: object, delta: number): void => {
     active += delta;
-    if (lane === "network") networking += delta;
+    if (lane === "network") {
+      networking += delta;
+      networkByGroup.set(group, (networkByGroup.get(group) ?? 0) + delta);
+    }
     if (lane === "sort") sorting += delta;
   };
 
   const offer = (
     lanes: readonly RequestLane[],
     served: WeakMap<object, number>,
+    newNetworkGroupOnly = false,
   ): Grant | undefined => {
     let next: Grant | undefined;
     let nextAge = Infinity;
@@ -237,6 +245,11 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     // the same group, finish it before starting another fetch.
     for (const lane of lanes)
       for (const owner of owners) {
+        if (
+          newNetworkGroupOnly &&
+          (!owner.group || networkByGroup.get(owner.group))
+        )
+          continue;
         const candidate = owner.offer(lane);
         if (!candidate) continue;
         const age = served.get(candidate.group) ?? 0;
@@ -252,6 +265,18 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     return next;
   };
 
+  const offerBackground = (): Grant | undefined => {
+    if (sortReservations === 0 || limit === 1 || networking < limit - 1)
+      return offer(backgroundLanes, lastBackgroundGrant);
+    // A ready decode can free buffered input without waiting for another
+    // response. If the grant would otherwise sit idle, lend it to a member
+    // with no fetch in flight so a slow peer cannot block its first tile.
+    return (
+      offer(computeLane, lastBackgroundGrant) ??
+      offer(networkLane, lastBackgroundGrant, true)
+    );
+  };
+
   const pump = (): void => {
     if (pumping) {
       wake();
@@ -262,17 +287,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       while (active < limit) {
         const sort = sorting === 0 ? offer(sortLane, lastSortGrant) : undefined;
         const sortFirst = sort && (limit > 1 || preferSort);
-        // A slow response can hold a grant for far longer than a ready
-        // decode. Pipeline a decode with a fetch without filling every
-        // grant with network work that a newly ready sort cannot displace.
-        const networkSaturated =
-          sortReservations > 0 && limit > 1 && networking >= limit - 1;
-        const background = sortFirst
-          ? undefined
-          : offer(
-              networkSaturated ? computeLane : backgroundLanes,
-              lastBackgroundGrant,
-            );
+        const background = sortFirst ? undefined : offerBackground();
         const next = background ?? sort;
         if (!next) break;
         // With one grant, alternate ready classes. A waiting sort takes the
@@ -560,7 +575,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       outcome: OperationOutcome<T>,
     ): void => {
       running.delete(op.key);
-      charge(stage.lane, -1);
+      charge(stage.lane, group, -1);
       stage.release?.();
       if (shared) {
         const executorStillClaimed = shared.claims.has(op);
@@ -576,7 +591,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       const stage = shared?.stage ?? op.stage;
       const signal = (shared?.controller ?? op.controller).signal;
       running.set(op.key, op);
-      charge(stage.lane, 1);
+      charge(stage.lane, group, 1);
       if (shared) {
         shared.active = true;
         const claims = [...shared.claims.values()];
@@ -604,6 +619,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     };
 
     const owner: PendingOwner = {
+      group: options.group,
       offer(lane) {
         if (running.size >= concurrency) return undefined;
         for (const op of records.values()) {
