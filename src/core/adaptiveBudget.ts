@@ -147,6 +147,8 @@ export type AdaptiveQuality = {
   restartAt(interacting: boolean, fraction: number, now: number): number;
   /** Discard costs from an older frontier without changing quality or memory. */
   clearSamples(interacting: boolean, now: number): void;
+  /** Keep the old stationary ceiling as a hint until the new view can test it. */
+  noteCameraChange(): void;
   /** A new workload forgets both the window and any too-expensive level. */
   invalidateCapacity(interacting: boolean, now: number): void;
   /** Cut by `factor`, clamped to [0.5, 1], outside the sampling loop. */
@@ -228,7 +230,11 @@ type Track = {
    * probe that actually measures capacity.
    */
   emergencyCeiling: number | null;
-  failedLevel: { readonly fraction: number; readonly atMs: number } | null;
+  failedLevel: {
+    readonly fraction: number;
+    readonly atMs: number;
+    previousView: boolean;
+  } | null;
   /** The level a probe left, until the probe's first window judges it. */
   probedFrom: number | null;
 };
@@ -447,7 +453,7 @@ export const createAdaptiveQuality = (
             : ORDINARY_DECREASE;
       const next = clamp(from * Math.max(1 - maxDecreaseStep, factor));
       if (next === from) return hold("clamped");
-      track.failedLevel = { fraction: from, atMs: now };
+      track.failedLevel = { fraction: from, atMs: now, previousView: false };
       track.emergencyCeiling = null;
       change(track, next, now);
       record(track, now, "decrease", "above-target", from, estimate, late);
@@ -488,13 +494,24 @@ export const createAdaptiveQuality = (
       failed === null ? 2 * maxIncreaseStep : maxIncreaseStep,
       headroom * HEADROOM_SPENT - 1,
     );
-    const next = clamp(
-      Math.min(
-        from * (1 + step),
-        failed === null ? MAX_VIEW_QUALITY_FRACTION : (from + failed) / 2,
-      ),
-    );
-    if (next <= from * (1 + MIN_PROBE_STEP)) return hold("within-hysteresis");
+    const minimumProbe = from * (1 + MIN_PROBE_STEP);
+    let ceiling =
+      failed === null ? MAX_VIEW_QUALITY_FRACTION : (from + failed) / 2;
+    // A different camera can draw different tiles at the same fraction. Keep
+    // approaching its predecessor's known failure with bounded probes. When
+    // the next step would park the view there, test that old limit once.
+    const retest =
+      failed !== null &&
+      track.failedLevel?.previousView &&
+      ceiling <= minimumProbe;
+    if (retest) ceiling = failed > from ? failed : MAX_VIEW_QUALITY_FRACTION;
+    const next = clamp(Math.min(from * (1 + step), ceiling));
+    // Even the last few percent can select a different discrete tile level.
+    const completesDetail =
+      track === stationary && next === MAX_VIEW_QUALITY_FRACTION;
+    if (next <= from || (next <= minimumProbe && !retest && !completesDetail))
+      return hold("within-hysteresis");
+    if (retest) track.failedLevel = null;
     change(track, next, now);
     track.probedFrom = from;
     record(track, now, "increase", "below-target", from, estimate, late);
@@ -551,6 +568,10 @@ export const createAdaptiveQuality = (
       const track = trackFor(interacting);
       clearWindow(track);
       record(track, now, "none", "insufficient-samples", track.fraction);
+    },
+
+    noteCameraChange() {
+      if (stationary.failedLevel) stationary.failedLevel.previousView = true;
     },
 
     invalidateCapacity(interacting, now) {

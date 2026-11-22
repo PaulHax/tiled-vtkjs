@@ -234,6 +234,43 @@ describe("createAdaptiveQuality", () => {
     expect(quality.fraction(true)).toBeGreaterThan(0.75);
   });
 
+  it("takes the last small step to full stationary detail on a clean window", () => {
+    const quality = createAdaptiveQuality({
+      ...options,
+      initialFraction: 0.99,
+    });
+    frames(quality, REFRESH_MS, false, 10);
+    expect(quality.fraction(false)).toBe(1);
+  });
+
+  it("retests a previous view's limit once and rolls back an expensive probe", () => {
+    const quality = createAdaptiveQuality({
+      ...options,
+      initialFraction: 0.8,
+      failedLevelMemoryMs: 60_000,
+    });
+    let now = frames(quality, 80, false, 5);
+    quality.noteCameraChange();
+    const failed = 0.8;
+    let previous = quality.fraction(false);
+    for (
+      let count = 0;
+      count < 20 && quality.fraction(false) < failed;
+      count++
+    ) {
+      previous = quality.fraction(false);
+      now = frames(quality, REFRESH_MS, false, 10, now);
+    }
+    expect(quality.fraction(false)).toBe(failed);
+    now = frames(quality, 80, false, 5, now);
+    expect(quality.fraction(false)).toBeCloseTo(previous);
+    for (let count = 0; count < 5; count++) {
+      now = frames(quality, REFRESH_MS, false, 10, now);
+    }
+    expect(quality.fraction(false)).toBeCloseTo(previous);
+    expect(quality.lastAdjustment(false)?.reason).toBe("within-hysteresis");
+  });
+
   it("keeps interaction and stationary learning independent", () => {
     const quality = createAdaptiveQuality(options, () => REFRESH_MS);
     frames(quality, 3 * REFRESH_MS, true, 5);

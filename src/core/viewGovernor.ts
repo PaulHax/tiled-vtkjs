@@ -419,6 +419,7 @@ export const createViewGovernor = (
   const markCameraChanged = (): void => {
     if (disposed) return;
     const wasInteracting = interacting();
+    if (cameraStable) quality.noteCameraChange();
     cameraStable = false;
     clearCameraStabilityTimer();
     cameraStabilityTimer = setTimeout(() => {

@@ -38,6 +38,7 @@ describe("createViewGovernor", () => {
   });
 
   it("continues stationary refinement after an isolated late frame following motion", () => {
+    vi.useFakeTimers();
     const governor = createViewGovernor();
     let now = 0;
     const frame = (hostFrameMs: number) => {
@@ -49,17 +50,25 @@ describe("createViewGovernor", () => {
     // further. The final view has enough headroom to refine after stopping.
     for (let index = 0; index < 10; index++) frame(80);
     const previousQuality = governor.qualityFraction();
+    governor.noteRenderedCameras(new Map([["view", VIEW]]));
     const drag = governor.beginMotion("explicit");
-    for (let index = 0; index < 40; index++) frame(50);
+    for (let index = 0; index < 40; index++) {
+      governor.noteRenderedCameras(
+        new Map([["view", { ...VIEW, position: [index + 1, 0, 0] }]]),
+      );
+      frame(50);
+      vi.advanceTimersByTime(50);
+    }
     expect(governor.qualityFraction()).toBeLessThan(previousQuality);
     drag.release();
+    vi.advanceTimersByTime(250);
     expect(governor.qualityFraction()).toBe(previousQuality);
 
     frame(50);
     // A demand-driven host supplies no more samples once needsFrame is false.
     for (let index = 0; index < 300 && governor.needsFrame(); index++)
       frame(1000 / 60);
-    expect(governor.qualityFraction()).toBeGreaterThan(previousQuality);
+    expect(governor.qualityFraction()).toBe(1);
     expect(governor.needsFrame()).toBe(false);
     governor.dispose();
   });
