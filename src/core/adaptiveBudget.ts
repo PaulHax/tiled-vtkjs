@@ -20,7 +20,9 @@
  * show is a frame presenting in fewer refreshes than its budget allows: a
  * still view drawn every refresh under a two-refresh budget costs at most half
  * of it, and a probe spends most of that headroom in one step. Everything
- * between holds, which is what keeps a steady view steady.
+ * between holds, which is what keeps a steady view steady. A reduced still
+ * view can also probe after a bounded confirmation window with one missed
+ * frame, if its remaining samples show enough headroom.
  */
 
 import {
@@ -41,6 +43,7 @@ export type QualityAdjustmentReason =
   | "below-target"
   | "above-target"
   | "within-hysteresis"
+  | "confirming-equilibrium"
   | "cooldown"
   | "insufficient-samples"
   | "clamped"
@@ -235,7 +238,7 @@ type Track = {
     readonly atMs: number;
     previousView: boolean;
   } | null;
-  /** The level a probe left, until the probe's first window judges it. */
+  /** A proven level to restore while a probe is being judged. */
   probedFrom: number | null;
 };
 
@@ -459,22 +462,40 @@ export const createAdaptiveQuality = (
       record(track, now, "decrease", "above-target", from, estimate, late);
       return;
     }
+    const canConfirmStationaryHold =
+      track === stationary &&
+      (from < MAX_VIEW_QUALITY_FRACTION || track.probedFrom !== null);
+    // Keep the rollback target while we gather a second window. Repeated
+    // misses can turn the provisional hold into a failed probe.
+    if (
+      late > 0 &&
+      canConfirmStationaryHold &&
+      track.confirmingHoldFrames < windowSize
+    ) {
+      track.confirmingHoldFrames++;
+      return hold("confirming-equilibrium");
+    }
     if (track.samples.length >= windowSize) track.probedFrom = null;
-    // A late frame inside tolerance is the equilibrium, not a reason to move.
+
+    let probeCost: number | null = null;
     if (late > 0) {
-      // A still view stops painting once it converges. Let the first mixed
-      // window age out at reduced quality, otherwise a single hitch can
-      // strand the visible tiles at this level indefinitely. Another mixed
-      // window confirms equilibrium without an unbounded idle render loop.
       if (
-        track === stationary &&
-        from < MAX_VIEW_QUALITY_FRACTION &&
-        track.confirmingHoldFrames < windowSize
+        !canConfirmStationaryHold ||
+        late > 1 / windowSize ||
+        windowSize <= minSamples
       ) {
-        track.confirmingHoldFrames++;
-        return hold("insufficient-samples");
+        return hold("within-hysteresis");
       }
-      return hold("within-hysteresis");
+      // The confirmation window may have a separate isolated hitch. Require
+      // actual headroom in the slowest on-time sample before ignoring it.
+      const threshold = lateThresholdMs(track);
+      probeCost = track.samples.reduce(
+        (slowest, sample) =>
+          sample <= threshold ? Math.max(slowest, sample) : slowest,
+        0,
+      );
+      if (probeCost >= onTimeMs(track) * HEADROOM_SPENT)
+        return hold("within-hysteresis");
     }
     if (from >= MAX_VIEW_QUALITY_FRACTION) return hold("clamped");
     // Not converged: a still view renders only while this asks for frames,
@@ -489,7 +510,8 @@ export const createAdaptiveQuality = (
     const dwellMs =
       failed === null ? track.probeDwellMs / 2 : track.probeDwellMs;
     if (now - track.heldSince < dwellMs) return hold("cooldown");
-    const headroom = onTimeMs(track) / Math.max(...track.samples);
+    const headroom =
+      onTimeMs(track) / (probeCost ?? Math.max(...track.samples));
     const step = Math.max(
       failed === null ? 2 * maxIncreaseStep : maxIncreaseStep,
       headroom * HEADROOM_SPENT - 1,

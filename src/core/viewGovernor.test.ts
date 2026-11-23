@@ -73,6 +73,70 @@ describe("createViewGovernor", () => {
     governor.dispose();
   });
 
+  it.each([
+    {
+      name: "two sparse hitches with headroom",
+      duration: (index: number) =>
+        index === 30 || index === 54 ? 100 : 1000 / 60,
+      expected: 1,
+    },
+    {
+      name: "recurring missed frames",
+      duration: (index: number) => (index % 10 === 0 ? 100 : 1000 / 60),
+      expected: 0.6,
+    },
+    {
+      name: "two sparse hitches without measurable headroom",
+      duration: (index: number) =>
+        index === 30 || index === 54 ? 100 : 1000 / 30,
+      expected: 0.6,
+    },
+  ])("settles at feasible detail after $name", ({ duration, expected }) => {
+    vi.useFakeTimers();
+    const governor = createViewGovernor({ initialFraction: 0.6 });
+    let now = 0;
+    // Establish a 60 Hz display period without training the stationary track.
+    for (let frame = 0; frame < 3; frame++) {
+      now += 1000 / 60;
+      governor.recordTransientFrame({ hostFrameMs: 1000 / 60, now });
+    }
+    for (let frame = 1; frame <= 150 && governor.needsFrame(); frame++) {
+      const hostFrameMs = duration(frame);
+      now += hostFrameMs;
+      governor.recordHostFrame({ hostFrameMs, now });
+    }
+    expect(governor.qualityFraction()).toBe(expected);
+    expect(governor.needsFrame()).toBe(false);
+    governor.dispose();
+  });
+
+  it("rolls back a stationary probe that fails while its hold is being confirmed", () => {
+    vi.useFakeTimers();
+    const governor = createViewGovernor({
+      initialFraction: 0.4,
+      cooldownMs: 0,
+    });
+    let now = 0;
+    const frame = (hostFrameMs: number) => {
+      now += hostFrameMs;
+      governor.recordHostFrame({ hostFrameMs, now });
+    };
+
+    for (let index = 0; index < 30; index++) frame(1000 / 60);
+    const probe = governor.qualityFraction();
+    expect(probe).toBeGreaterThan(0.4);
+    for (let index = 0; index < 29; index++) frame(1000 / 60);
+    frame(100);
+    for (let index = 0; index < 30 && governor.needsFrame(); index++) {
+      frame(100);
+      if (governor.qualityFraction() < probe) break;
+    }
+
+    expect(governor.qualityFraction()).toBeCloseTo(0.4);
+    expect(governor.stats().failedLevel).toBe(probe);
+    governor.dispose();
+  });
+
   it("normalizes VTK and GPU spans against their host-frame share", () => {
     const governor = createViewGovernor({
       initialFraction: 0.8,
