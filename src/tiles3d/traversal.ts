@@ -195,6 +195,8 @@ type VisitResult = {
   readonly coverageSubmitted: boolean;
   readonly coveragePresented: boolean;
   readonly recoveringCoverage?: boolean;
+  /** Every visible region is presented or covered by a submitted fallback in the draw plan. */
+  readonly coverageSecured: boolean;
   /** False when complete coverage requires an excluded representation. */
   readonly coveragePossible: boolean;
   readonly desired: string[];
@@ -515,6 +517,7 @@ const traverseHierarchy = (
         visible: false,
         coverageSubmitted: true,
         coveragePresented: true,
+        coverageSecured: true,
         coveragePossible: true,
         desired: [],
         requested: [],
@@ -536,6 +539,7 @@ const traverseHierarchy = (
         visible: true,
         coverageSubmitted: submitted,
         coveragePresented: covered,
+        coverageSecured: covered,
         coveragePossible: true,
         desired: [],
         requested: submitted ? [tile.id] : [],
@@ -557,21 +561,24 @@ const traverseHierarchy = (
         ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
         : 0;
     const childRegion = ownPresented ? { error, offset } : coveredRegion;
+    const exceedsError = error > effective;
     const refine =
       tile.children.length > 0 &&
-      (!contentful ||
-        (error > effective && (options.refinable?.(tile.id) ?? true)));
+      (!contentful || (exceedsError && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
       ? tile.children.map((child) =>
           visit(child, accumulated, depth + 1, childRegion),
         )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
+    const childCoveragePossible = visibleChildren.every(
+      (child) => child.coveragePossible,
+    );
 
     if (
       !refine ||
       visibleChildren.length === 0 ||
-      (contentful && visibleChildren.some((child) => !child.coveragePossible))
+      (contentful && !childCoveragePossible)
     ) {
       if (!contentful) {
         return {
@@ -580,6 +587,7 @@ const traverseHierarchy = (
           // all culled) has no draw obligation of its own.
           coverageSubmitted: !authoredContent,
           coveragePresented: covered || !authoredContent,
+          coverageSecured: covered || !authoredContent,
           coveragePossible: !authoredContent,
           desired: [],
           requested: [],
@@ -587,6 +595,8 @@ const traverseHierarchy = (
         };
       }
       const submitted = options.readiness(tile.id) === "submitted";
+      const constrainedFallback =
+        (exceedsError && !refine) || !childCoveragePossible;
       // Reverse refinement is paced too: if a coarser desired parent is not
       // submitted yet, retain only descendants that were already submitted.
       // Fresh coarse startup does not request the entire hierarchy.
@@ -608,6 +618,11 @@ const traverseHierarchy = (
           covered ||
           (visibleFallbacks.length > 0 &&
             visibleFallbacks.every((child) => child.coveragePresented)),
+        coverageSecured:
+          covered ||
+          (submitted && constrainedFallback) ||
+          (visibleFallbacks.length > 0 &&
+            visibleFallbacks.every((child) => child.coverageSecured)),
         recoveringCoverage: visibleFallbacks.some(
           (child) => child.recoveringCoverage,
         ),
@@ -622,25 +637,23 @@ const traverseHierarchy = (
     const desired = visibleChildren.flatMap((child) => child.desired);
     const coveragePresented =
       covered || visibleChildren.every((child) => child.coveragePresented);
+    const coverageSecured =
+      coveragePresented ||
+      visibleChildren.every((child) => child.coverageSecured);
     const submitted = contentful && options.readiness(tile.id) === "submitted";
     const needsCoverage = Boolean(
       options.presented && submitted && !coveragePresented,
     );
     if (visibleChildren.every((child) => child.coverageSubmitted)) {
-      // Keep an already displayed neighboring region when each gap has its
-      // own submitted fallback. Falling back again here discards useful detail
-      // across the entire ancestor while the same gaps are being repaired.
-      const recoveringCoverage =
-        needsCoverage &&
-        (!visibleChildren.some((child) => child.coveragePresented) ||
-          visibleChildren.some(
-            (child) => !child.coveragePresented && !child.recoveringCoverage,
-          ));
+      // A submitted leaf may still be awaiting presentation. Keep a broad
+      // fallback only when some visible gap has no submitted fallback of its own.
+      const recoveringCoverage = needsCoverage && !coverageSecured;
       return {
         visible: true,
         coverageSubmitted: true,
         coveragePossible: true,
         coveragePresented,
+        coverageSecured: coverageSecured || recoveringCoverage,
         recoveringCoverage:
           recoveringCoverage ||
           visibleChildren.some((child) => child.recoveringCoverage),
@@ -659,11 +672,11 @@ const traverseHierarchy = (
       visible: true,
       coverageSubmitted: submitted,
       coveragePresented,
+      coverageSecured: coverageSecured || submitted,
       recoveringCoverage:
         needsCoverage ||
         visibleChildren.some((child) => child.recoveringCoverage),
-      coveragePossible:
-        contentful || visibleChildren.every((child) => child.coveragePossible),
+      coveragePossible: contentful || childCoveragePossible,
       desired,
       requested: [
         ...(contentful ? [tile.id] : []),

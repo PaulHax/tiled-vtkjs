@@ -70,6 +70,8 @@ import { createMemoryPool } from "../core/memoryPool";
 import { ResourcePolicyError } from "../core/memoryResources";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createGaussianContentAdapterFactory } from "./gaussianAdapter";
+import { createTilesetTraversal } from "./traversal";
+import type { TilesetTile } from "./tilesetSource";
 import {
   createGaussianDistanceSorter,
   createGaussianSortWorkerBackend,
@@ -1074,6 +1076,84 @@ describe("Gaussian admission ownership", () => {
       f.adapter.setDrawnTiles(["root/1"]);
       await f.drainUntil(() => f.drawnX()[0] === 10);
       expect(f.adapter.tileState("root/2/0/0")).toBe("queued");
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("publishes local fallback for two pending mixed regions", async () => {
+    const f = fixture();
+    try {
+      const submittedTiles = [
+        ["root", 0],
+        ["root/0", -0.5],
+        ["root/1", 0.5],
+        ["root/0/0", -0.75],
+        ["root/1/0", 0.75],
+      ] as const;
+      for (const [id, x] of submittedTiles)
+        expect(f.adapter.submitTile(id, locatedField([x], true))).toBe(
+          "queued",
+        );
+      await f.settle();
+      f.adapter.setDrawnTiles(["root/0/0", "root/1/0"]);
+      await f.settle();
+
+      const makeTile = (
+        id: string,
+        geometricError: number,
+        children: TilesetTile[] = [],
+      ): TilesetTile => ({
+        id,
+        geometricError,
+        children,
+        transform: IDENTITY,
+        worldTransform: IDENTITY,
+        contentUrl: `/tiles/${id}.glb`,
+        boundingVolume: {
+          center: [0, 0, 0],
+          halfAxes: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+        },
+      });
+      const root = makeTile("root", 16, [
+        makeTile("root/0", 8, [
+          makeTile("root/0/0", 0),
+          makeTile("root/0/1", 0),
+        ]),
+        makeTile("root/1", 8, [
+          makeTile("root/1/0", 0),
+          makeTile("root/1/1", 0),
+        ]),
+      ]);
+      const selection = createTilesetTraversal()({
+        root,
+        camera: {
+          projection: "perspective",
+          fovY: Math.PI / 3,
+          position: [0, 0, 10],
+          viewProj: IDENTITY,
+          viewportWidthCssPx: 100,
+          viewportHeightCssPx: 100,
+        },
+        maximumScreenSpaceErrorPx: 2,
+        readiness: (id) =>
+          f.adapter.tileState(id) === "submitted" ? "submitted" : "loading",
+        presented: (id) => f.adapter.presentedTileIds?.().includes(id) ?? false,
+      });
+      f.hold();
+      f.adapter.setDrawnTiles(selection.drawnTileIds);
+      await f.started();
+      expect(f.drawnX().sort((a, b) => a - b)).toEqual([-0.75, 0.75]);
+      f.release();
+      await f.settle();
+      expect(f.drawnX().sort((a, b) => a - b)).toEqual([-0.5, 0.5]);
+      expect(
+        f.adapter
+          .pickableMeshTiles()
+          .map(({ id }) => id)
+          .sort(),
+      ).toEqual(["root/0", "root/1"]);
       expect(f.errors).toEqual([]);
     } finally {
       f.dispose();

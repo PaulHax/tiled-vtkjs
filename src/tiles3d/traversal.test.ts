@@ -628,6 +628,46 @@ describe("traverseTileset", () => {
     expect(restored.drawnTileIds).toEqual(["root/0/0", "root/1/0", "root/1/1"]);
   });
 
+  it("restores broad coverage when a contentless branch has an uncovered region", () => {
+    const root = makeTile("root", 16, [
+      makeTile("root/0", 0),
+      withoutContent(
+        makeTile("root/1", 8, [
+          makeTile("root/1/0", 4, [
+            makeTile("root/1/0/0", 0),
+            makeTile("root/1/0/1", 0),
+          ]),
+          makeTile("root/1/1", 0),
+        ]),
+      ),
+    ]);
+    const selection = traverseTileset({
+      root,
+      camera: view([0, 0, -4]),
+      maximumScreenSpaceErrorPx: 2,
+      readiness: (id) => (id === "root/1/0/1" ? "decoded" : "submitted"),
+      presented: (id) => id === "root/0" || id === "root/1/0/0",
+    });
+    expect(selection.drawnTileIds).toEqual(["root"]);
+  });
+
+  it("keeps fine detail beside a region at its budget-constrained frontier", () => {
+    const root = makeTile("root", 16, [
+      makeTile("root/0", 8, [makeTile("root/0/0", 0)]),
+      makeTile("root/1", 8, [makeTile("root/1/0", 0), makeTile("root/1/1", 0)]),
+    ]);
+    const selection = traverseTileset({
+      root,
+      camera: view([0, 0, -4]),
+      maximumScreenSpaceErrorPx: 2,
+      readiness: () => "submitted",
+      presented: (id) => id === "root/0/0" || id === "root/1/0",
+      refinable: (id) => id !== "root/1",
+    });
+    expect(selection.drawnTileIds).toEqual(["root/0/0", "root/1"]);
+    expect(selection.requestedTileIds).toEqual(["root/1", "root/0/0"]);
+  });
+
   it("keeps the nearest submitted fallback through nested failure and admission", () => {
     const root = tree();
     const waiting = select(
