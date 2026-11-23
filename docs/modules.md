@@ -105,11 +105,14 @@ const usage = memory.stats();
 admits retained CPU buffers and reserved realization arrays; shared backing
 buffers count once. `workBytes` admits conservative estimates of overlapping
 fetch, input buffers, decoder workspace and output. One keyed admission service
-chooses ready network, compute and sort work using current demand priorities and
-fairness across owners. While a view has sortable content, its fetch backlog
-leaves a slot for sorting or decoding. A different member with no fetch in
-flight can use that slot when it would otherwise sit idle. A newly ready sort
-takes the next available slot after active work settles. Persistent workers
+chooses ready work using current demand priorities and fairness across owners.
+The configured `maxConcurrentOperations` bounds physical network and decode work.
+Sorting has one independent grant so camera movement can update a sortable
+view while tile content is pending. These stages all use the same work-byte
+budget. Stats expose both limits and active counts alongside aggregate
+`maxConcurrentOperations` and `activeOperations`.
+While a view has sortable content, its own fetch backlog leaves a background
+slot for decoding or a member without a fetch in flight. Persistent workers
 have separate limits. Waiting for a memory charge or worker does not occupy
 a running slot. Cancelled work retains its charges until completion,
 acknowledgement or worker termination. Finished output transfers to retained

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { createMemoryPool } from "./memoryPool";
 import { createRequestAdmission, type RequestLane } from "./requestAdmission";
 import type { RetryPolicy } from "./retryPolicy";
 
@@ -348,7 +349,7 @@ describe("page request admission", () => {
     };
   };
 
-  it("caps overlapping work of different lanes and owners, including canceled work", async () => {
+  it("charges a canceled background stage until the executor settles", async () => {
     const { admission, starts, run, finish } = controlledStages(2);
     const controller = new AbortController();
     const network = run("network", "fetch", { signal: controller.signal });
@@ -356,7 +357,6 @@ describe("page request admission", () => {
       name: "AbortError",
     });
     const compute = run("compute", "decode");
-    const sort = run("sort", "sort");
     const next = run("network", "next");
     controller.abort();
     await cancelled;
@@ -365,72 +365,43 @@ describe("page request admission", () => {
     expect(admission.activeOperations()).toBe(2);
     finish("fetch");
     await settle();
-    expect(starts).toEqual(["fetch", "decode", "sort"]);
+    expect(starts).toEqual(["fetch", "decode", "next"]);
     expect(admission.activeOperations()).toBe(2);
 
     finish("decode");
-    await compute;
-    expect(starts.at(-1)).toBe("next");
-    finish("sort");
     finish("next");
-    await Promise.all([sort, next]);
+    await Promise.all([compute, next]);
     expect(admission.activeOperations()).toBe(0);
   });
 
-  it("pipelines decode without making an interactive sort wait for network", async () => {
-    const { admission, starts, run, finish } = controlledStages(3);
-    const releaseCapacity = admission.reserveSortCapacity();
-    const network = run("network", "fetch");
-    const second = run("network", "second");
-    const next = run("network", "next");
-    expect(starts).toEqual(["fetch", "second"]);
-    const compute = run("compute", "decode");
-    const sort = run("sort", "sort");
-    expect(starts).toEqual(["fetch", "second", "decode"]);
-    expect(admission.activeOperations()).toBe(3);
-    finish("decode");
-    await compute;
-    expect(starts.at(-1)).toBe("sort");
-    finish("sort");
-    await sort;
-    expect(starts.at(-1)).toBe("sort");
-
-    releaseCapacity();
-    await settle();
-    expect(starts.at(-1)).toBe("next");
-    for (const key of ["fetch", "second", "next"]) finish(key);
-    await Promise.all([network, second, next]);
-  });
-
-  it("serves other network groups behind a slow fetch while reserving the next grant for a ready sort", async () => {
+  it("admits an independent fetch and a camera sort while a splat child is pending", async () => {
     const { admission, starts, run, finish } = controlledStages(2);
-    const releaseCapacity = admission.reserveSortCapacity();
+    const pool = createMemoryPool({ admission });
+    const release = admission.favorIndependentFetches();
     const splats = {};
     const delayed = run("network", "splat child", { group: splats });
     const sibling = run("network", "splat sibling", { group: splats });
     expect(starts).toEqual(["splat child"]);
 
     const mesh = run("network", "mesh", { group: {} });
-    const points = run("network", "COPC", { group: {} });
-    expect(starts).toEqual(["splat child", "mesh"]);
-    expect(admission.activeOperations()).toBe(2);
-
     const sort = run("sort", "resumed camera");
-    expect(starts.at(-1)).toBe("mesh");
-    finish("mesh");
-    await mesh;
-    expect(starts.at(-1)).toBe("resumed camera");
-    expect(admission.activeOperations()).toBe(2);
+    expect(starts).toEqual(["splat child", "mesh", "resumed camera"]);
+    expect(pool.stats()).toMatchObject({
+      maxConcurrentOperations: 3,
+      maxConcurrentBackgroundOperations: 2,
+      maxConcurrentSortOperations: 1,
+      activeOperations: 3,
+      activeBackgroundOperations: 2,
+      activeSortOperations: 1,
+    });
 
     const decode = run("compute", "mesh decode", { group: {} });
-    finish("resumed camera");
-    await sort;
+    finish("mesh");
+    await mesh;
     expect(starts.at(-1)).toBe("mesh decode");
     finish("mesh decode");
-    await decode;
-    expect(starts.at(-1)).toBe("COPC");
-    finish("COPC");
-    await points;
+    finish("resumed camera");
+    await Promise.all([decode, sort]);
     expect(admission.activeOperations()).toBe(1);
     expect(starts).not.toContain("splat sibling");
 
@@ -439,32 +410,39 @@ describe("page request admission", () => {
     expect(starts.at(-1)).toBe("splat sibling");
     finish("splat sibling");
     await sibling;
-    releaseCapacity();
+    release();
     expect(admission.activeOperations()).toBe(0);
   });
 
-  it("alternates ready sort and background stages with one grant", async () => {
+  it("runs only one physical sort and makes progress on background work", async () => {
     const { admission, starts, run, finish } = controlledStages(1);
-    const releaseCapacity = admission.reserveSortCapacity();
+    const controller = new AbortController();
+    const firstSort = run("sort", "sort 1", { signal: controller.signal });
+    const cancelled = expect(firstSort).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    const secondSort = run("sort", "sort 2");
     const network = run("network", "fetch");
     const decode = run("compute", "decode");
-    const firstSort = run("sort", "sort 1");
-    const secondSort = run("sort", "sort 2");
-    expect(starts).toEqual(["fetch"]);
-    for (const [current, expected] of [
-      ["fetch", "sort 1"],
-      ["sort 1", "decode"],
-      ["decode", "sort 2"],
-    ] as const) {
-      finish(current);
-      await settle();
-      expect(starts.at(-1)).toBe(expected);
-      expect(admission.activeOperations()).toBe(1);
-    }
+    controller.abort();
+    await cancelled;
+    expect(starts).toEqual(["sort 1", "fetch"]);
+    expect(admission.activeSortOperations()).toBe(1);
+
+    finish("fetch");
+    await network;
+    expect(starts).toEqual(["sort 1", "fetch", "decode"]);
+
+    finish("sort 1");
+    await settle();
+    expect(starts).toEqual(["sort 1", "fetch", "decode", "sort 2"]);
+    expect(admission.activeSortOperations()).toBe(1);
+
+    finish("decode");
     finish("sort 2");
-    await Promise.all([network, decode, firstSort, secondSort]);
-    releaseCapacity();
+    await Promise.all([decode, secondSort]);
     expect(admission.activeOperations()).toBe(0);
+    expect(admission.queuedOperations()).toBe(0);
   });
 
   it("reclaims idle persistent workers while keeping separate sort headroom", () => {

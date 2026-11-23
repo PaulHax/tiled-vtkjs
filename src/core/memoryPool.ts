@@ -63,7 +63,7 @@ export type MemoryPoolOptions = {
   workBytes?: number;
   /** Extra renderer capacity usable only for a complete replacement transition. */
   transitionBytes?: number;
-  /** Aggregate page limit for physical network, decode, and sort work. Default 2. */
+  /** Aggregate page limit for network and decode work. Default 2. Sorting has its own grant. */
   maxConcurrentOperations?: number;
   admission?: RequestAdmission;
 };

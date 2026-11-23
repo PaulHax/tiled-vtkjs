@@ -570,10 +570,10 @@ const createManager = (
   let newerPublication = false;
   const idleWaiters = new Set<() => void>();
   let sortAvailability = 0;
-  let releaseSortCapacity: (() => void) | undefined;
-  const freeSortCapacity = (): void => {
-    releaseSortCapacity?.();
-    releaseSortCapacity = undefined;
+  let releaseIndependentFetchPriority: (() => void) | undefined;
+  const clearIndependentFetchPriority = (): void => {
+    releaseIndependentFetchPriority?.();
+    releaseIndependentFetchPriority = undefined;
   };
   let idleCheckQueued = false;
   const waitingForPreparation = () => dirty || !!allocationJob || !!packing;
@@ -1419,7 +1419,7 @@ const createManager = (
       },
       dispose() {
         sortCancellation.abort();
-        freeSortCapacity();
+        clearIndependentFetchPriority();
         retireBackend();
       },
     },
@@ -1461,7 +1461,7 @@ const createManager = (
         return "retry";
       }
       sortUnavailable = true;
-      freeSortCapacity();
+      clearIndependentFetchPriority();
       sortFailure(error);
       return "stop";
     },
@@ -1478,8 +1478,9 @@ const createManager = (
     forgetOrder();
     sortRanges = ranges;
     if (ranges.length > 0 && !sortUnavailable)
-      releaseSortCapacity ??= memoryPool.admission.reserveSortCapacity();
-    else freeSortCapacity();
+      releaseIndependentFetchPriority ??=
+        memoryPool.admission.favorIndependentFetches();
+    else clearIndependentFetchPriority();
     sortAvailability += 1;
     memoryPool.admission.wake();
     sorter.setScene(ranges, { defer: true });

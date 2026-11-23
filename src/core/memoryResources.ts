@@ -136,13 +136,22 @@ export type MemoryResourceOptions = {
   readonly maxConcurrentOperations: number;
 };
 
-export type MemoryResourceStats = MemoryResourceOptions & {
+export type MemoryResourceStats = Omit<
+  MemoryResourceOptions,
+  "maxConcurrentOperations"
+> & {
+  /** Total physical capacity, including the separate sort slot. */
+  readonly maxConcurrentOperations: number;
+  readonly maxConcurrentBackgroundOperations: number;
+  readonly maxConcurrentSortOperations: number;
   readonly cpuRetainedBytes: number;
   readonly cpuReservedBytes: number;
   readonly rendererBytes: number;
   readonly workReservedBytes: number;
-  /** Physical stages running under the shared page admission limit. */
+  /** Active physical work, including sort and work pending cancellation. */
   readonly activeOperations: number;
+  readonly activeBackgroundOperations: number;
+  readonly activeSortOperations: number;
   readonly queuedOperations: number;
   readonly owners: number;
   readonly revision: number;
@@ -590,14 +599,23 @@ export const createMemoryResources = (
     availability: () => availabilityRevision,
     policyRevision: () => revision,
     stats(): MemoryResourceStats {
+      const maxConcurrentBackgroundOperations = admission.capacity();
+      const maxConcurrentSortOperations = admission.sortCapacity();
+      const activeOperations = admission.activeOperations();
+      const activeSortOperations = admission.activeSortOperations();
       return {
         ...limits,
-        maxConcurrentOperations: admission.capacity(),
+        maxConcurrentOperations:
+          maxConcurrentBackgroundOperations + maxConcurrentSortOperations,
+        maxConcurrentBackgroundOperations,
+        maxConcurrentSortOperations,
         cpuRetainedBytes: cpuRetained,
         cpuReservedBytes: cpuReserved,
         rendererBytes: renderer,
         workReservedBytes: workReserved,
-        activeOperations: admission.activeOperations(),
+        activeOperations,
+        activeBackgroundOperations: activeOperations - activeSortOperations,
+        activeSortOperations,
         queuedOperations: admission.queuedOperations(),
         owners: owners.size,
         revision,

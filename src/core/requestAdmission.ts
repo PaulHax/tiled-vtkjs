@@ -185,10 +185,13 @@ export type RequestAdmission = {
   run<T>(options: OneShotOptions<T>): Promise<T>;
   wake(): void;
   configure(parallel: number): void;
+  /** Network and compute capacity. Sorting has an independent grant. */
   capacity(): number;
+  sortCapacity(): number;
   activeOperations(): number;
-  /** Keep a grant available for sorting unless another member needs its first fetch. */
-  reserveSortCapacity(): () => void;
+  activeSortOperations(): number;
+  /** Prefer a decode or a member with no fetch in flight for the last background grant. */
+  favorIndependentFetches(): () => void;
   queuedOperations(): number;
   canAcquireWorker(kind: WorkerKind, reclaim?: boolean): boolean;
   workerCapacityPinned(kind: WorkerKind): boolean;
@@ -202,12 +205,12 @@ export type RequestAdmission = {
 /** One start authority for all owners on the page. Executors report readiness and settlement. */
 export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let limit = integerAtLeast("parallel", parallel, 1);
-  let active = 0;
+  const sortLimit = 1;
+  let background = 0;
   let networking = 0;
   const networkByGroup = new WeakMap<object, number>();
   let sorting = 0;
-  let sortReservations = 0;
-  let preferSort = true;
+  let independentFetchUsers = 0;
   const owners = new Set<PendingOwner>();
   const sharedScopes = new WeakMap<object, Map<string, unknown>>();
   const workers = {
@@ -226,12 +229,12 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   let wakeQueued = false;
 
   const charge = (lane: RequestLane, group: object, delta: number): void => {
-    active += delta;
+    if (lane === "sort") sorting += delta;
+    else background += delta;
     if (lane === "network") {
       networking += delta;
       networkByGroup.set(group, (networkByGroup.get(group) ?? 0) + delta);
     }
-    if (lane === "sort") sorting += delta;
   };
 
   const offer = (
@@ -266,11 +269,11 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   };
 
   const offerBackground = (): Grant | undefined => {
-    if (sortReservations === 0 || limit === 1 || networking < limit - 1)
+    if (independentFetchUsers === 0 || limit === 1 || networking < limit - 1)
       return offer(backgroundLanes, lastBackgroundGrant);
     // A ready decode can free buffered input without waiting for another
-    // response. If the grant would otherwise sit idle, lend it to a member
-    // with no fetch in flight so a slow peer cannot block its first tile.
+    // response. Keep the last grant open to independent members so several
+    // slow requests from one tileset cannot block another member's first tile.
     return (
       offer(computeLane, lastBackgroundGrant) ??
       offer(networkLane, lastBackgroundGrant, true)
@@ -284,17 +287,13 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     }
     pumping = true;
     try {
-      while (active < limit) {
-        const sort = sorting === 0 ? offer(sortLane, lastSortGrant) : undefined;
-        const sortFirst = sort && (limit > 1 || preferSort);
-        const background = sortFirst ? undefined : offerBackground();
-        const next = background ?? sort;
+      while (true) {
+        const sort =
+          sorting < sortLimit ? offer(sortLane, lastSortGrant) : undefined;
+        const next =
+          sort ?? (background < limit ? offerBackground() : undefined);
         if (!next) break;
-        // With one grant, alternate ready classes. A waiting sort takes the
-        // next turn after background work, and continuous sorts yield in turn.
-        preferSort = next === background;
-        const served = preferSort ? lastBackgroundGrant : lastSortGrant;
-        served.set(next.group, ++serial);
+        (sort ? lastSortGrant : lastBackgroundGrant).set(next.group, ++serial);
         next.start();
       }
     } finally {
@@ -839,14 +838,16 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       wake();
     },
     capacity: () => limit,
-    activeOperations: () => active,
-    reserveSortCapacity() {
-      sortReservations += 1;
+    sortCapacity: () => sortLimit,
+    activeOperations: () => background + sorting,
+    activeSortOperations: () => sorting,
+    favorIndependentFetches() {
+      independentFetchUsers += 1;
       let held = true;
       return () => {
         if (!held) return;
         held = false;
-        sortReservations -= 1;
+        independentFetchUsers -= 1;
         wake();
       };
     },

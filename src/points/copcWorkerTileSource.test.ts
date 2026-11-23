@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { createRequestAdmission } from "../core/requestAdmission";
 import type { CopcDecodeState, CopcNodeEntry } from "./copcTileSource";
 import {
   CopcWorkerCapacityError,
@@ -175,6 +176,54 @@ describe("COPC worker tile source", () => {
 
     source.dispose?.();
     expect(worker.terminated).toBe(true);
+  });
+
+  it("starts a camera sort while a tile fetch and COPC worker open are pending", async () => {
+    const admission = createRequestAdmission(2);
+    let finishFetch!: () => void;
+    const delayed = admission.run({
+      signal: new AbortController().signal,
+      stage: {
+        lane: "network",
+        start: () =>
+          new Promise<{ value: undefined }>((resolve) => {
+            finishFetch = () => resolve({ value: undefined });
+          }),
+      },
+    });
+    const worker = new FakeWorker();
+    const opening = createCopcWorkerTileSource({
+      admission,
+      source: "https://example.test/cloud.copc.laz",
+      lazPerfWasmUrl: "https://example.test/laz-perf.wasm",
+      createWorker: () => worker as unknown as Worker,
+      workers: 1,
+    });
+    const openRequest = worker.sent[0]!;
+    expect(openRequest.type).toBe("open");
+    const sortStarted = vi.fn(() => ({ value: undefined }));
+    const sorted = admission.run({
+      signal: new AbortController().signal,
+      stage: { lane: "sort", start: sortStarted },
+    });
+
+    // Capture dispatch before either held operation has returned its result.
+    const startsWhileBothHeld = sortStarted.mock.calls.length;
+    worker.respond({
+      type: "opened",
+      id: openRequest.id,
+      metadata: { pointCount: 42 },
+      state: STATE,
+    });
+    const source = await opening;
+    await sorted;
+    source.dispose?.();
+    finishFetch();
+    await delayed;
+
+    expect(startsWhileBothHeld).toBe(1);
+    expect(worker.terminated).toBe(true);
+    expect(admission.activeOperations()).toBe(0);
   });
 
   it("reports occupied hierarchy slots and opens another source after one closes", async () => {
