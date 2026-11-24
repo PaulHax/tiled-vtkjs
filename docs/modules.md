@@ -109,8 +109,10 @@ chooses ready work using current demand priorities and fairness across owners.
 The configured `maxConcurrentOperations` bounds physical network and decode work.
 Sorting has one independent grant so camera movement can update a sortable
 view while tile content is pending. These stages all use the same work-byte
-budget. Stats expose both limits and active counts alongside aggregate
-`maxConcurrentOperations` and `activeOperations`.
+budget. Stats report the configurable background limit as
+`maxConcurrentOperations` and `maxConcurrentBackgroundOperations`. Use
+`maxConcurrentTotalOperations` for capacity across all stages, including sorting,
+and `activeOperations` for their combined active count.
 While a view has sortable content, its own fetch backlog leaves a background
 slot for decoding or a member without a fetch in flight. Persistent workers
 have separate limits. Waiting for a memory charge or worker does not occupy

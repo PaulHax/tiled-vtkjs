@@ -133,15 +133,13 @@ export type MemoryResourceOptions = {
   readonly cpuBytes: number;
   readonly workBytes: number;
   readonly transitionBytes: number;
+  /** Configurable capacity for network and decode work. */
   readonly maxConcurrentOperations: number;
 };
 
-export type MemoryResourceStats = Omit<
-  MemoryResourceOptions,
-  "maxConcurrentOperations"
-> & {
+export type MemoryResourceStats = MemoryResourceOptions & {
   /** Total physical capacity, including the separate sort slot. */
-  readonly maxConcurrentOperations: number;
+  readonly maxConcurrentTotalOperations: number;
   readonly maxConcurrentBackgroundOperations: number;
   readonly maxConcurrentSortOperations: number;
   readonly cpuRetainedBytes: number;
@@ -605,7 +603,8 @@ export const createMemoryResources = (
       const activeSortOperations = admission.activeSortOperations();
       return {
         ...limits,
-        maxConcurrentOperations:
+        maxConcurrentOperations: maxConcurrentBackgroundOperations,
+        maxConcurrentTotalOperations:
           maxConcurrentBackgroundOperations + maxConcurrentSortOperations,
         maxConcurrentBackgroundOperations,
         maxConcurrentSortOperations,

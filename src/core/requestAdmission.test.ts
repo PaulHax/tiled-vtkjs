@@ -387,7 +387,8 @@ describe("page request admission", () => {
     const sort = run("sort", "resumed camera");
     expect(starts).toEqual(["splat child", "mesh", "resumed camera"]);
     expect(pool.stats()).toMatchObject({
-      maxConcurrentOperations: 3,
+      maxConcurrentOperations: 2,
+      maxConcurrentTotalOperations: 3,
       maxConcurrentBackgroundOperations: 2,
       maxConcurrentSortOperations: 1,
       activeOperations: 3,

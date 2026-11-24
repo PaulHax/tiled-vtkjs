@@ -6,6 +6,7 @@ import {
   defaultMemoryBudgetBytes,
 } from "./memoryPool";
 import { ResourcePolicyError } from "./memoryResources";
+import type { RequestLane } from "./requestAdmission";
 
 const MiB = 1024 * 1024;
 
@@ -178,6 +179,62 @@ describe("createMemoryPool", () => {
     owner.close();
     other.close();
     expect(pool.stats()).toMatchObject({ rendererBytes: 0, owners: 0 });
+  });
+
+  it("preserves the background limit when stats are reapplied during concurrent work", async () => {
+    const pool = createMemoryPool({ maxConcurrentOperations: 2 });
+    const signal = new AbortController().signal;
+    const started: string[] = [];
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const run = (lane: RequestLane, key: string) =>
+      pool.admission.run({
+        signal,
+        stage: {
+          lane,
+          async start() {
+            started.push(key);
+            await pending;
+            return { value: key };
+          },
+        },
+      });
+
+    const work = [
+      run("network", "splat fetch"),
+      run("compute", "mesh decode"),
+      run("sort", "camera sort"),
+      run("network", "point fetch"),
+    ];
+    const admitted = ["splat fetch", "mesh decode", "camera sort"];
+    try {
+      expect(started).toEqual(admitted);
+      for (let round = 0; round < 3; round += 1) {
+        pool.configure(pool.stats());
+      }
+      await Promise.resolve();
+      expect(started).toEqual(admitted);
+      expect(pool.stats()).toMatchObject({
+        maxConcurrentOperations: 2,
+        maxConcurrentBackgroundOperations: 2,
+        maxConcurrentSortOperations: 1,
+        maxConcurrentTotalOperations: 3,
+        activeOperations: 3,
+        activeBackgroundOperations: 2,
+        activeSortOperations: 1,
+        queuedOperations: 1,
+      });
+    } finally {
+      release();
+      await Promise.all(work);
+    }
+    expect(started).toEqual([...admitted, "point fetch"]);
+    expect(pool.stats()).toMatchObject({
+      activeOperations: 0,
+      queuedOperations: 0,
+    });
   });
 
   it("retains reserved work bytes independently of admission and owner closure", () => {
