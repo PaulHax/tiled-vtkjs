@@ -146,6 +146,15 @@ export const createControlSurface = (
       download: () => telemetry.download(),
       gpuTimingSupported: () => host.gpuTimingSupported(),
     },
+    onPaint: (listener: () => void) => {
+      let lastPaint = host.paintCount();
+      host.onFrame(() => {
+        const paint = host.paintCount();
+        if (paint === lastPaint) return;
+        lastPaint = paint;
+        listener();
+      });
+    },
     render: () => host.scheduleRender(),
     needsFrame: () => host.coordinator.needsFrame(),
   };

@@ -140,6 +140,7 @@ export type SceneWindow = {
       trace(): TelemetryTrace;
       gpuTimingSupported(): boolean;
     };
+    onPaint(listener: () => void): void;
     render(): void;
   };
   pointCloudRecorder: {
