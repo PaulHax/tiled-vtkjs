@@ -414,6 +414,50 @@ describe("page request admission", () => {
     expect(admission.activeOperations()).toBe(0);
   });
 
+  it("shares the last background grant between an independent fetch and replenished compute", async () => {
+    const { admission, starts, run, finish } = controlledStages(2);
+    const release = admission.favorIndependentFetches();
+    const splats = {};
+    const meshes = {};
+    const points = {};
+    const splat = run("network", "splat child", { group: splats });
+    const firstCompute = run("compute", "COPC 1", { group: points });
+    const sibling = run("network", "splat sibling", { group: splats });
+    const firstMesh = run("network", "mesh 1", { group: meshes });
+    const secondCompute = run("compute", "COPC 2", { group: points });
+    expect(starts).toEqual(["splat child", "COPC 1"]);
+
+    finish("COPC 1");
+    await firstCompute;
+    expect(starts.at(-1)).toBe("mesh 1");
+
+    const secondMesh = run("network", "mesh 2", { group: meshes });
+    finish("mesh 1");
+    await firstMesh;
+    expect(starts.at(-1)).toBe("COPC 2");
+
+    const thirdCompute = run("compute", "COPC 3", { group: points });
+    finish("COPC 2");
+    await secondCompute;
+    expect(starts.at(-1)).toBe("mesh 2");
+
+    finish("mesh 2");
+    await secondMesh;
+    expect(starts.at(-1)).toBe("COPC 3");
+    finish("COPC 3");
+    await thirdCompute;
+    expect(admission.activeOperations()).toBe(1);
+    expect(starts).not.toContain("splat sibling");
+
+    finish("splat child");
+    await splat;
+    expect(starts.at(-1)).toBe("splat sibling");
+    finish("splat sibling");
+    await sibling;
+    release();
+    expect(admission.activeOperations()).toBe(0);
+  });
+
   it("runs only one physical sort and makes progress on background work", async () => {
     const { admission, starts, run, finish } = controlledStages(1);
     const controller = new AbortController();

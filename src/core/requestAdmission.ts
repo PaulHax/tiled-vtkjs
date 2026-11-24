@@ -219,8 +219,6 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
     sort: new Set<{ reclaimable?: IdleWorker }>(),
   };
   const backgroundLanes = ["compute", "network"] as const;
-  const computeLane = ["compute"] as const;
-  const networkLane = ["network"] as const;
   const sortLane = ["sort"] as const;
   const lastBackgroundGrant = new WeakMap<object, number>();
   const lastSortGrant = new WeakMap<object, number>();
@@ -250,6 +248,7 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
       for (const owner of owners) {
         if (
           newNetworkGroupOnly &&
+          lane === "network" &&
           (!owner.group || networkByGroup.get(owner.group))
         )
           continue;
@@ -271,13 +270,9 @@ export const createRequestAdmission = (parallel = 2): RequestAdmission => {
   const offerBackground = (): Grant | undefined => {
     if (independentFetchUsers === 0 || limit === 1 || networking < limit - 1)
       return offer(backgroundLanes, lastBackgroundGrant);
-    // A ready decode can free buffered input without waiting for another
-    // response. Keep the last grant open to independent members so several
-    // slow requests from one tileset cannot block another member's first tile.
-    return (
-      offer(computeLane, lastBackgroundGrant) ??
-      offer(networkLane, lastBackgroundGrant, true)
-    );
+    // Keep the last grant open to compute and independent fetches. Rank
+    // both together so recurring work in either lane cannot starve the other.
+    return offer(backgroundLanes, lastBackgroundGrant, true);
   };
 
   const pump = (): void => {
