@@ -26,6 +26,7 @@ type View = {
   triangles: number;
   points: number;
   activeRequests: number;
+  localJobs: number;
   regime: "stationary" | "interaction";
   pending: boolean;
   needsFrame: boolean;
@@ -75,6 +76,14 @@ const installViewReader = (page: Page) =>
         triangles: meshStats.renderer.drawnTriangles,
         points: pointStats.renderer.drawnPoints,
         activeRequests: splatStats?.queue?.active ?? 0,
+        localJobs:
+          coordinator.submissions.queuedJobs +
+          pointStats.controller.physicalTileOperations +
+          pointStats.controller.physicalHierarchyOperations +
+          pointStats.renderer.pendingJobs +
+          meshStats.renderer.pendingJobs +
+          (splatStats?.renderer.pendingJobs ?? 0) +
+          (meshStats.decode?.activeJobs ?? 0),
         regime: coordinator.governor.regime,
         pending: coordinator.governor.activity.workPending,
         needsFrame: coordinator.governor.needsFrame,
@@ -263,20 +272,31 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(moving.paint).toBeGreaterThan(started.paint);
 
     await tab.mouse.up();
-    const stopped = await advanceUntil(
-      tab,
-      64,
-      (view) => view.regime === "stationary" && !view.needsFrame,
-    );
-    expect(stopped).toMatchObject({
-      regime: "stationary",
-      needsFrame: false,
-      pending: true,
-    });
+    // Demand can go idle while a sort completion or presentation callback
+    // is still queued. Require quiet across multiple complete ticks after
+    // local jobs drain, with the child physically held throughout.
+    const quietTicks = 10;
+    let quiet = 0;
+    let stopped = await readView(tab);
+    const idleWhileHeld = (view: View) =>
+      view.regime === "stationary" &&
+      !view.needsFrame &&
+      view.pending &&
+      view.activeRequests > 0 &&
+      view.localJobs === 0 &&
+      heldChildren.size > 0;
+    for (let tick = 0; tick < 120 && quiet < quietTicks; tick++) {
+      const previouslyIdle = idleWhileHeld(stopped);
+      await tab.clock.runFor(16);
+      const next = await readView(tab);
+      quiet =
+        previouslyIdle && idleWhileHeld(next) && next.paint === stopped.paint
+          ? quiet + 1
+          : 0;
+      stopped = next;
+    }
+    expect(quiet, JSON.stringify(stopped)).toBe(quietTicks);
     expect(stopped.splats).toEqual(coarse);
-    await tab.clock.runFor(160);
-    expect((await readView(tab)).paint).toBe(stopped.paint);
-    expect(heldChildren.size).toBeGreaterThan(0);
 
     const childFinished = tab.waitForEvent("requestfinished", {
       predicate: (request) => childPath.test(new URL(request.url()).pathname),
