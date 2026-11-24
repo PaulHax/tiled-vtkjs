@@ -2,7 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 
-import type { Page } from "playwright";
+import type { Page, Request } from "playwright";
 import sharp from "sharp";
 import { afterAll, expect, it } from "vitest";
 
@@ -45,17 +45,19 @@ const installViewReader = (page: Page) =>
     const scene = w.pointCloudScene;
     w.readMotionView = () => {
       const { coordinator, members, paints } = scene.stats();
-      const [points, splats, mesh] = members;
+      const [points, mesh, splats] = members;
       const pointStats = points!.stats as unknown as PointCloudMemberStats;
-      const splatStats = splats!.stats as unknown as Tiles3dMemberStats;
+      const splatStats = splats?.stats as unknown as
+        | Tiles3dMemberStats
+        | undefined;
       const meshStats = mesh!.stats as unknown as Tiles3dMemberStats;
       return {
         paint: paints,
         camera: [...scene.camera.read().position],
-        splats: [...splatStats.renderer.drawnTileIds].sort(),
+        splats: [...(splatStats?.renderer.drawnTileIds ?? [])].sort(),
         triangles: meshStats.renderer.drawnTriangles,
         points: pointStats.renderer.drawnPoints,
-        activeRequests: splatStats.queue?.active ?? 0,
+        activeRequests: splatStats?.queue?.active ?? 0,
         regime: coordinator.governor.regime,
         pending: coordinator.governor.activity.workPending,
         needsFrame: coordinator.governor.needsFrame,
@@ -88,6 +90,10 @@ afterAll(closeBrowsers);
 
 it("keeps all three members drawn while moving and wakes on held Gaussian refinement", async () => {
   const directory = await mkdtemp(resolve(tmpdir(), "mixed-motion-"));
+  let openTileset!: () => void;
+  const metadataHeld = new Promise<void>((done) => {
+    openTileset = done;
+  });
   let release!: () => void;
   const held = new Promise<void>((done) => {
     release = done;
@@ -111,18 +117,25 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     page = tab;
     const errors = collectPageFailures(tab);
     const external: string[] = [];
-    let childRequestHeld = false;
+    const heldChildren = new Set<Request>();
+    tab.on("requestfailed", (request) => heldChildren.delete(request));
     await tab.route("**/*", async (route) => {
       const url = new URL(route.request().url());
       if (url.origin !== localServer.origin) {
         external.push(url.href);
         return route.abort();
       }
-      if (/^\/fixture\/splats\/(left|right)\.glb$/.test(url.pathname)) {
-        childRequestHeld = true;
+      if (url.pathname === "/fixture/splats/tileset.json") await metadataHeld;
+      if (!/^\/fixture\/splats\/(left|right)\.glb$/.test(url.pathname))
+        return route.continue();
+      const request = route.request();
+      heldChildren.add(request);
+      try {
         await held;
+        if (heldChildren.has(request)) await route.continue();
+      } finally {
+        heldChildren.delete(request);
       }
-      await route.continue();
     });
 
     const url = new URL(localServer.origin);
@@ -134,10 +147,6 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     );
     url.searchParams.append(
       "data",
-      `tiles-url:${localServer.origin}/fixture/splats/tileset.json`,
-    );
-    url.searchParams.append(
-      "data",
       `tiles-url:${localServer.origin}/fixture/mesh/tileset.json`,
     );
     await tab.clock.install();
@@ -145,18 +154,46 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     await tab.waitForFunction(
       () =>
         (window as unknown as SceneWindow).pointCloudScene?.datasets()
-          .length === 3,
+          .length === 2,
     );
     await installViewReader(tab);
     await tab.evaluate(() => {
       const scene = (window as unknown as SceneWindow).pointCloudScene;
-      scene.settings.setScreenSpaceErrorPx(scene.datasets()[1]!.id, 64);
       scene.camera.place({
         position: [0, -21, 10],
         focalPoint: [0, 0, 0],
         viewUp: [0, 0, 1],
       });
     });
+    // A held child legitimately occupies the only network slot on some
+    // configurations. Draw both peers before opening the Gaussian tileset.
+    await expect
+      .poll(
+        async () => {
+          const { triangles, points } = await readView(tab);
+          return [triangles, points > 0];
+        },
+        { timeout: 10_000 },
+      )
+      .toEqual([1, true]);
+    await tab.locator("#open-add-dataset").click();
+    await tab.locator("#dataset-type").selectOption("tiles");
+    await tab.locator("#source-type").selectOption("url");
+    await tab
+      .locator("#dataset-url")
+      .fill(`${localServer.origin}/fixture/splats/tileset.json`);
+    await tab.locator("#submit-dataset").click();
+    await tab.waitForFunction(
+      () =>
+        (window as unknown as SceneWindow).pointCloudScene.datasets().length ===
+        3,
+    );
+    await tab.evaluate(() => {
+      const scene = (window as unknown as SceneWindow).pointCloudScene;
+      scene.settings.setScreenSpaceErrorPx(scene.datasets()[2]!.id, 64);
+    });
+    openTileset();
+
     const coarse = ["root"];
     const fine = ["root/0", "root/1"];
     await expect
@@ -172,6 +209,7 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(initial.red).toBeGreaterThan(40);
     expect(initial.cyan).toBeGreaterThan(40);
 
+    expect(heldChildren.size).toBe(0);
     const now = await tab.evaluate(() => Date.now());
     await tab.clock.pauseAt(new Date(now + 200));
     const firstPaint = await tab.evaluate(() => {
@@ -179,14 +217,16 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
       const scene = w.pointCloudScene;
       w.motionPaints = [];
       scene.onPaint(() => w.motionPaints.push(w.readMotionView()));
-      scene.settings.setScreenSpaceErrorPx(scene.datasets()[1]!.id, 4);
+      scene.settings.setScreenSpaceErrorPx(scene.datasets()[2]!.id, 4);
       return scene.stats().paints;
     });
     await expect
       .poll(
         async () => {
           await tab.clock.fastForward(16);
-          return childRequestHeld && (await readView(tab)).activeRequests > 0;
+          return (
+            heldChildren.size > 0 && (await readView(tab)).activeRequests > 0
+          );
         },
         { timeout: 10_000 },
       )
@@ -205,6 +245,7 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     const moving = await readView(tab);
     expect(moving).toMatchObject({ regime: "interaction", splats: coarse });
     expect(moving.activeRequests).toBeGreaterThan(0);
+    expect(heldChildren.size).toBeGreaterThan(0);
     expect(moving.camera).not.toEqual(started.camera);
     expect(moving.paint).toBeGreaterThan(started.paint);
 
@@ -220,6 +261,7 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(stopped.splats).toEqual(coarse);
     await tab.clock.runFor(160);
     expect((await readView(tab)).paint).toBe(stopped.paint);
+    expect(heldChildren.size).toBeGreaterThan(0);
 
     release();
     await expect
@@ -264,9 +306,10 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(errors).toEqual([]);
     expect(external).toEqual([]);
   } finally {
+    openTileset();
     release();
     await page?.close();
     await server?.close();
     await rm(directory, { recursive: true, force: true });
   }
-}, 30_000);
+}, 45_000);
