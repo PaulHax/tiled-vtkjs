@@ -496,6 +496,70 @@ describe("Gaussian sort publication", () => {
     }
   });
 
+  it("publishes a mesh admitted during a sort of unchanged Gaussian ranges", async () => {
+    const f = fixture();
+    try {
+      await f.show("field", 1);
+      const mesh = f.additionalAdapter();
+      f.hold();
+      f.move(1);
+      await f.started();
+
+      expect(
+        mesh.submitTile("root", meshOnly(), () => mesh.setDrawnTiles(["root"])),
+      ).toBe("queued");
+      await f.drainUntil(() => mesh.tileState("root") === "submitted");
+      expect(mesh.stats().drawnTileIds).toEqual([]);
+      expect(f.drawnX()).toEqual([0]);
+
+      f.release();
+      await f.settle();
+      expect(mesh.stats().drawnTileIds).toEqual(["root"]);
+      expect(f.drawnX()).toEqual([0]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it.each([false, true])(
+    "publishes the latest mesh selection during a staged order (hide=%s)",
+    async (hide) => {
+      const f = fixture();
+      try {
+        await f.show("field", 1);
+        const mesh = f.additionalAdapter();
+        expect(mesh.submitTile("first", meshOnly())).toBe("queued");
+        expect(mesh.submitTile("latest", meshOnly())).toBe("queued");
+        await f.settle();
+
+        f.hold();
+        f.move(1);
+        await f.started();
+        mesh.setDrawnTiles(["first"]);
+        await Promise.resolve();
+        f.release();
+        // Let the worker reply and stage the upload without consuming a frame.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(f.submissions.hasPending()).toBe(true);
+        expect(mesh.stats().drawnTileIds).toEqual([]);
+
+        if (hide) {
+          mesh.setVisible(false);
+          await f.settle();
+          expect(mesh.stats().drawnTileIds).toEqual([]);
+          mesh.setVisible(true);
+        }
+        mesh.setDrawnTiles(["latest"]);
+        await f.settle();
+        expect(mesh.stats().drawnTileIds).toEqual(["latest"]);
+        expect(f.drawnX()).toEqual([0]);
+        expect(f.errors).toEqual([]);
+      } finally {
+        f.dispose();
+      }
+    },
+  );
+
   it("keeps physical work charged and rejects a cleared generation before reusing its slots", async () => {
     const f = fixture();
     try {

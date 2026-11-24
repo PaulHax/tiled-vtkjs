@@ -1440,15 +1440,19 @@ const createManager = (
           return;
         }
       }
-      if (!sortTarget) return;
+      const target = sortTarget;
+      if (!target) return;
+      const matchesCurrentRanges = cachedOrder === presentation;
+      // A mesh-only change does not invalidate the sorted Gaussian indices.
+      // Publish the current mesh plan even if it arrived after dispatch.
       if (
         !publish(
           presentation,
-          snapshot,
-          sortTarget,
+          matchesCurrentRanges ? target.snapshot : snapshot,
+          target,
           performance.now() - sorting!.started,
         ) &&
-        cachedOrder === presentation
+        matchesCurrentRanges
       ) {
         // Sorting inputs can survive an atlas change. A refresh can reuse the
         // order with its own current mapping, even if this dispatch cannot.
