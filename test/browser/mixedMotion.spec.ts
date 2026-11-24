@@ -298,18 +298,15 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(quiet, JSON.stringify(stopped)).toBe(quietTicks);
     expect(stopped.splats).toEqual(coarse);
 
-    const childFinished = tab.waitForEvent("requestfinished", {
-      predicate: (request) => childPath.test(new URL(request.url()).pathname),
-      timeout: 10_000,
-    });
+    // A child may be canceled and replaced as the final request set settles.
+    // Keep the virtual scheduler running while real network events arrive.
     release();
-    await childFinished;
     const refined = await advanceUntil(
       tab,
       240,
       (view) => view.splats.length === fine.length,
     );
-    expect(refined.splats).toEqual(fine);
+    expect(refined.splats, JSON.stringify(refined)).toEqual(fine);
     expect(refined.camera).toEqual(stopped.camera);
     expect(refined.paint).toBeGreaterThan(stopped.paint);
 
