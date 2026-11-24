@@ -39,6 +39,23 @@ type MotionWindow = SceneWindow & {
 const readView = (page: Page) =>
   page.evaluate(() => (window as unknown as MotionWindow).readMotionView());
 
+// Advance browser time without requesting renders or making simulated progress
+// depend on the test runner's wall-clock polling cadence.
+const advanceUntil = async (
+  page: Page,
+  frameLimit: number,
+  predicate: (view: View) => boolean,
+): Promise<View> => {
+  let view = await readView(page);
+  for (let frame = 0; frame < frameLimit && !predicate(view); frame++) {
+    await page.clock.runFor(16);
+    view = await readView(page);
+  }
+  return view;
+};
+
+const childPath = /^\/fixture\/splats\/(left|right)\.glb$/;
+
 const installViewReader = (page: Page) =>
   page.evaluate(() => {
     const w = window as unknown as MotionWindow;
@@ -126,8 +143,7 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
         return route.abort();
       }
       if (url.pathname === "/fixture/splats/tileset.json") await metadataHeld;
-      if (!/^\/fixture\/splats\/(left|right)\.glb$/.test(url.pathname))
-        return route.continue();
+      if (!childPath.test(url.pathname)) return route.continue();
       const request = route.request();
       heldChildren.add(request);
       try {
@@ -165,8 +181,8 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
         viewUp: [0, 0, 1],
       });
     });
-    // A held child legitimately occupies the only network slot on some
-    // configurations. Draw both peers before opening the Gaussian tileset.
+    // Establish the mixed-scene baseline before introducing Gaussian work.
+    // Bootstrap admission must be finished before exercising the child gate.
     await expect
       .poll(
         async () => {
@@ -220,18 +236,15 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
       scene.settings.setScreenSpaceErrorPx(scene.datasets()[2]!.id, 4);
       return scene.stats().paints;
     });
+    const started = await advanceUntil(
+      tab,
+      64,
+      (view) => view.activeRequests > 0,
+    );
+    expect(started.activeRequests).toBeGreaterThan(0);
     await expect
-      .poll(
-        async () => {
-          await tab.clock.fastForward(16);
-          return (
-            heldChildren.size > 0 && (await readView(tab)).activeRequests > 0
-          );
-        },
-        { timeout: 10_000 },
-      )
-      .toBe(true);
-    const started = await readView(tab);
+      .poll(() => heldChildren.size, { timeout: 10_000 })
+      .toBeGreaterThan(0);
 
     const viewer = (await tab.locator("#viewer").boundingBox())!;
     const x = viewer.x + viewer.width / 2;
@@ -250,30 +263,33 @@ it("keeps all three members drawn while moving and wakes on held Gaussian refine
     expect(moving.paint).toBeGreaterThan(started.paint);
 
     await tab.mouse.up();
-    await expect
-      .poll(async () => {
-        await tab.clock.fastForward(16);
-        const { regime, needsFrame, pending } = await readView(tab);
-        return { regime, needsFrame, pending };
-      })
-      .toEqual({ regime: "stationary", needsFrame: false, pending: true });
-    const stopped = await readView(tab);
+    const stopped = await advanceUntil(
+      tab,
+      64,
+      (view) => view.regime === "stationary" && !view.needsFrame,
+    );
+    expect(stopped).toMatchObject({
+      regime: "stationary",
+      needsFrame: false,
+      pending: true,
+    });
     expect(stopped.splats).toEqual(coarse);
     await tab.clock.runFor(160);
     expect((await readView(tab)).paint).toBe(stopped.paint);
     expect(heldChildren.size).toBeGreaterThan(0);
 
+    const childFinished = tab.waitForEvent("requestfinished", {
+      predicate: (request) => childPath.test(new URL(request.url()).pathname),
+      timeout: 10_000,
+    });
     release();
-    await expect
-      .poll(
-        async () => {
-          await tab.clock.fastForward(16);
-          return (await readView(tab)).splats;
-        },
-        { timeout: 10_000 },
-      )
-      .toEqual(fine);
-    const refined = await readView(tab);
+    await childFinished;
+    const refined = await advanceUntil(
+      tab,
+      240,
+      (view) => view.splats.length === fine.length,
+    );
+    expect(refined.splats).toEqual(fine);
     expect(refined.camera).toEqual(stopped.camera);
     expect(refined.paint).toBeGreaterThan(stopped.paint);
 
