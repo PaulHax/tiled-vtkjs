@@ -132,6 +132,25 @@ const select = (
   });
 
 describe("traverseTileset", () => {
+  it("keeps the coarse tile when the camera is outside a thin diagonal box", () => {
+    const root: TilesetTile = {
+      ...makeTile("root", 0.1, [makeTile("root/0", 0)]),
+      boundingVolume: {
+        center: [0, 0, 0],
+        halfAxes: [1, 1, 0, -0.05, 0.05, 0, 0, 0, 0.1],
+      },
+    };
+    const at = (position: [number, number, number]) =>
+      traverseTileset({
+        root,
+        camera: view(position),
+        maximumScreenSpaceErrorPx: 10,
+        readiness: () => "unloaded",
+      }).requestedTileIds;
+    expect(at([0.9, -0.9, 0])).toEqual(["root"]);
+    expect(at([0.9, 0.9, 0])).toContain("root/0");
+  });
+
   it("requests coarser tiles first, then those nearest the view centre", () => {
     const root = makeTile("root", 8, [
       makeTile("root/0", 0, [], matrix(-0.6)),

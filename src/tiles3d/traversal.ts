@@ -103,6 +103,8 @@ type Vec3 = readonly [number, number, number];
 type WorldBox = {
   readonly center: Vec3;
   readonly axes: readonly [Vec3, Vec3, Vec3];
+  readonly radius: Vec3;
+  readonly faces: readonly { normal: Vec3; radius: number }[];
 };
 
 type TilePlacement = {
@@ -112,13 +114,38 @@ type TilePlacement = {
 
 const worldBox = (box: TilesetBox, matrix: readonly number[]): WorldBox => {
   const h = box.halfAxes;
+  const axes: [Vec3, Vec3, Vec3] = [
+    transformVector(matrix, [h[0], h[1], h[2]]),
+    transformVector(matrix, [h[3], h[4], h[5]]),
+    transformVector(matrix, [h[6], h[7], h[8]]),
+  ];
+  const extent = (axis: number) =>
+    Math.abs(axes[0][axis]!) +
+    Math.abs(axes[1][axis]!) +
+    Math.abs(axes[2][axis]!);
+  const faces = [];
+  for (let i = 0; i < 3; i++) {
+    const a = axes[(i + 1) % 3]!,
+      b = axes[(i + 2) % 3]!;
+    const x = a[1] * b[2] - a[2] * b[1],
+      y = a[2] * b[0] - a[0] * b[2],
+      z = a[0] * b[1] - a[1] * b[0];
+    // Axis-aligned faces are already included in the world AABB.
+    if (Number(x !== 0) + Number(y !== 0) + Number(z !== 0) < 2) continue;
+    const length = Math.hypot(x, y, z);
+    if (!Number.isFinite(length)) continue;
+    const normal: Vec3 = [x / length, y / length, z / length];
+    const radius = axes.reduce(
+      (sum, axis) => sum + Math.abs(dot(normal, axis)),
+      0,
+    );
+    faces.push({ normal, radius });
+  }
   return {
     center: transformPoint(matrix, box.center),
-    axes: [
-      transformVector(matrix, [h[0], h[1], h[2]]),
-      transformVector(matrix, [h[3], h[4], h[5]]),
-      transformVector(matrix, [h[6], h[7], h[8]]),
-    ],
+    axes,
+    radius: [extent(0), extent(1), extent(2)],
+    faces,
   };
 };
 
@@ -141,23 +168,23 @@ const boxIntersectsFrustum = (
 };
 
 const boxDistance = (box: WorldBox, point: Vec3): number => {
-  // A conservative world AABB is sufficient for SSE: it may refine early,
-  // but never drops detail because an oriented or sheared box was too near.
-  const radius: Vec3 = [
-    Math.abs(box.axes[0][0]) +
-      Math.abs(box.axes[1][0]) +
-      Math.abs(box.axes[2][0]),
-    Math.abs(box.axes[0][1]) +
-      Math.abs(box.axes[1][1]) +
-      Math.abs(box.axes[2][1]),
-    Math.abs(box.axes[0][2]) +
-      Math.abs(box.axes[1][2]) +
-      Math.abs(box.axes[2][2]),
-  ];
-  const dx = Math.max(Math.abs(point[0] - box.center[0]) - radius[0], 0);
-  const dy = Math.max(Math.abs(point[1] - box.center[1]) - radius[1], 0);
-  const dz = Math.max(Math.abs(point[2] - box.center[2]) - radius[2], 0);
-  return Math.hypot(dx, dy, dz);
+  const x = point[0] - box.center[0],
+    y = point[1] - box.center[1],
+    z = point[2] - box.center[2];
+  let distance = Math.hypot(
+    Math.max(Math.abs(x) - box.radius[0], 0),
+    Math.max(Math.abs(y) - box.radius[1], 0),
+    Math.max(Math.abs(z) - box.radius[2], 0),
+  );
+  // Both the AABB distance and each face clearance bound the distance
+  // from below, including for nonuniformly scaled and sheared tiles.
+  for (const { normal, radius } of box.faces) {
+    distance = Math.max(
+      distance,
+      Math.abs(x * normal[0] + y * normal[1] + z * normal[2]) - radius,
+    );
+  }
+  return distance;
 };
 
 const maximumScale = (matrix: readonly number[]): number =>
@@ -711,12 +738,12 @@ const traverseHierarchy = (
         : Number(!!aRegion) - Number(!!bRegion);
     return coverageOrder || a.depth - b.depth || a.offset - b.offset;
   });
-  const rootAccumulated = multiply(rootParent, hierarchy.root.transform);
+  const rootPlacement = placements.get(hierarchy.root)!;
   const rootSse = result.visible
     ? screenSpaceError(
         hierarchy.root,
-        rootAccumulated,
-        worldBox(hierarchy.root.boundingVolume, rootAccumulated),
+        rootPlacement.transform,
+        rootPlacement.bounds,
         view,
         errorScale,
       )
