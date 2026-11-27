@@ -2547,17 +2547,24 @@ const createManager = (
             arenaTupleLimit(),
           );
           if (reusableTiles.size && projectedCapacity > arena.capacity) {
-            clearReuse();
-            arena.retireExcept(
-              retainRanges(
-                arena,
-                requests.map(({ key }) => key),
-              ),
-            );
-            projectedCapacity = arena.requiredCapacity(
-              requests,
-              arenaTupleLimit(),
-            );
+            const requestedKeys = requests.map(({ key }) => key);
+            const oldest = reusableTiles.values();
+            // Reclaim increasingly large batches to bound repeated allocation planning.
+            let batch = 1;
+            while (reusableTiles.size && projectedCapacity > arena.capacity) {
+              for (let i = 0; i < batch; i++) {
+                const next = oldest.next();
+                if (next.done) break;
+                reusableTiles.delete(next.value);
+              }
+              arena.retireExcept(retainRanges(arena, requestedKeys));
+              projectedCapacity = arena.requiredCapacity(
+                requests,
+                arenaTupleLimit(),
+              );
+              batch *= 2;
+            }
+            releaseRetiredSources();
           }
           const fullGaussianBytes = gaussianShare(
             owner,

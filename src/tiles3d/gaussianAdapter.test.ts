@@ -1603,6 +1603,39 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("restores the more recent tile when one retired range fits new geometry", async () => {
+    const f = fixture();
+    try {
+      await f.show("anchor", 4);
+      f.adapter.submitTile("older", field(2));
+      f.adapter.submitTile("recent", field(2));
+      await f.settle();
+      f.adapter.setDrawnTiles(["anchor", "older", "recent"]);
+      await f.settle();
+      const residentBytes = f.pool.stats().rendererBytes;
+
+      f.adapter.retireTile("older", "revisit");
+      f.adapter.retireTile("recent", "revisit");
+      f.adapter.setDrawnTiles(["anchor"]);
+      await f.settle();
+      f.adapter.submitTile("incoming", field(2));
+      await f.settle();
+      expect(f.pool.stats().rendererBytes).toBe(residentBytes);
+      expect(f.adapter.restoreTile("older")).toBe("absent");
+      expect(f.adapter.restoreTile("recent")).toBe("restored");
+      f.adapter.setDrawnTiles(["anchor", "incoming", "recent"]);
+      await f.settle();
+      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual([
+        "anchor",
+        "incoming",
+        "recent",
+      ]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("checks a cached tile and its fresh sibling against another owner's splats", async () => {
     const f = fixture(undefined, 12);
     try {
