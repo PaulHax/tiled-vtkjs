@@ -7,7 +7,13 @@ export type GaussianShape = {
   rotation: [number, number, number, number];
 };
 
-export const createGaussianShapeTransform = (matrix: Mat16) => {
+export const createGaussianShapeWriter = (
+  matrix: Mat16,
+  scales: Float32Array,
+  rotations: Float32Array,
+  outputScales: Float32Array,
+  outputRotations: Float32Array,
+) => {
   const lengths = [0, 4, 8].map((offset) =>
     Math.hypot(matrix[offset]!, matrix[offset + 1]!, matrix[offset + 2]!),
   );
@@ -29,8 +35,15 @@ export const createGaussianShapeTransform = (matrix: Mat16) => {
     matrix[4]! * (matrix[1]! * matrix[10]! - matrix[2]! * matrix[9]!) +
     matrix[8]! * (matrix[1]! * matrix[6]! - matrix[2]! * matrix[5]!);
   if (!similarity || determinant <= 0)
-    return (scales: ArrayLike<number>, quaternion: ArrayLike<number>) =>
-      transformedGaussianShape(scales, quaternion, matrix);
+    return (index: number, destination: number) => {
+      const shape = transformedGaussianShape(
+        scales.subarray(index * 3, index * 3 + 3),
+        rotations.subarray(index * 4, index * 4 + 4),
+        matrix,
+      );
+      outputScales.set(shape.scales, destination * 3);
+      outputRotations.set(shape.rotation, destination * 4);
+    };
   const [aw, ax, ay, az] = rotationQuaternion([
     matrix[0]! / scale,
     matrix[4]! / scale,
@@ -42,29 +55,25 @@ export const createGaussianShapeTransform = (matrix: Mat16) => {
     matrix[6]! / scale,
     matrix[10]! / scale,
   ]);
-  return (
-    scales: ArrayLike<number>,
-    quaternion: ArrayLike<number>,
-  ): GaussianShape => {
+  return (index: number, destination: number) => {
+    const q = index * 4;
     const length = Math.hypot(
-      quaternion[0]!,
-      quaternion[1]!,
-      quaternion[2]!,
-      quaternion[3]!,
+      rotations[q]!,
+      rotations[q + 1]!,
+      rotations[q + 2]!,
+      rotations[q + 3]!,
     );
-    const x = quaternion[0]! / length,
-      y = quaternion[1]! / length,
-      z = quaternion[2]! / length,
-      w = quaternion[3]! / length;
-    return {
-      scales: [scales[0]! * scale, scales[1]! * scale, scales[2]! * scale],
-      rotation: [
-        aw * w - ax * x - ay * y - az * z,
-        aw * x + ax * w + ay * z - az * y,
-        aw * y - ax * z + ay * w + az * x,
-        aw * z + ax * y - ay * x + az * w,
-      ],
-    };
+    const x = rotations[q]! / length;
+    const y = rotations[q + 1]! / length;
+    const z = rotations[q + 2]! / length;
+    const w = rotations[q + 3]! / length;
+    const out = destination * 4;
+    outputRotations[out] = aw * w - ax * x - ay * y - az * z;
+    outputRotations[out + 1] = aw * x + ax * w + ay * z - az * y;
+    outputRotations[out + 2] = aw * y - ax * z + ay * w + az * x;
+    outputRotations[out + 3] = aw * z + ax * y - ay * x + az * w;
+    for (let axis = 0; axis < 3; axis++)
+      outputScales[destination * 3 + axis] = scales[index * 3 + axis]! * scale;
   };
 };
 
@@ -307,13 +316,21 @@ export const writeGaussianColor = (
     ? splat * (count - 1) * 3
     : dcOffset + 3;
   const scale = quantizedHarmonics ? 1 / 128 : 1;
-  for (let channel = 0; channel < 3; channel++) {
-    let value = 0.5 + basis[0]! * sphericalHarmonics[dcOffset + channel]!;
-    for (let coefficient = 1; coefficient < count; coefficient++)
-      value +=
-        basis[coefficient]! *
-        (higherBands[higherOffset + (coefficient - 1) * 3 + channel]! * scale);
-    target[offset + channel] = Math.max(0, value);
+  let red = 0.5 + basis[0]! * sphericalHarmonics[dcOffset]!;
+  let green = 0.5 + basis[0]! * sphericalHarmonics[dcOffset + 1]!;
+  let blue = 0.5 + basis[0]! * sphericalHarmonics[dcOffset + 2]!;
+  for (
+    let coefficient = 1, source = higherOffset;
+    coefficient < count;
+    coefficient++, source += 3
+  ) {
+    const weight = basis[coefficient]!;
+    red += weight * (higherBands[source]! * scale);
+    green += weight * (higherBands[source + 1]! * scale);
+    blue += weight * (higherBands[source + 2]! * scale);
   }
+  target[offset] = Math.max(0, red);
+  target[offset + 1] = Math.max(0, green);
+  target[offset + 2] = Math.max(0, blue);
   target[offset + 3] = primitive.opacities[splat]!;
 };
