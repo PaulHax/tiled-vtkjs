@@ -23,6 +23,7 @@ import {
 import {
   decodeSpzGaussian,
   spzProfileFor,
+  estimateSpzMemory,
   SPZ_EXTENSION,
   SPLAT_OPACITY_EXTENSION,
 } from "./spz";
@@ -1963,10 +1964,10 @@ const checkedGeometryBytes = (bytes: number): number => {
   return bytes;
 };
 
-const primitiveInstanceBytes = (
+const estimatePrimitiveMemory = (
   primitive: GltfPrimitive,
   json: GltfJson,
-): number => {
+): { retainedBytes: number; scratchBytes: number } => {
   if (
     primitive.extensions?.[GAUSSIAN_EXTENSION] !== undefined &&
     typeof primitive.attributes.POSITION === "number"
@@ -1976,9 +1977,22 @@ const primitiveInstanceBytes = (
       primitive.attributes.POSITION,
       "Gaussian POSITION",
     );
-    // SPZ harmonics live inside the stream rather than its glTF accessors.
-    // Every node decodes its own output, codec/chunk arrays and placement.
-    return checkedGeometryBytes(position.count * (44 + 16 * 12) * 3 + 128);
+    const profile = primitive.extensions[GAUSSIAN_EXTENSION] as {
+      extensions?: Record<string, { bufferView?: number }>;
+    };
+    const compressed = profile.extensions?.[SPZ_EXTENSION];
+    if (compressed && typeof compressed.bufferView === "number") {
+      const view = requireIndex(
+        json.bufferViews,
+        compressed.bufferView,
+        "SPZ bufferView",
+      );
+      return estimateSpzMemory(position.count, view.byteLength);
+    }
+    return {
+      retainedBytes: position.count * (44 + 16 * 12) * 3 + 128,
+      scratchBytes: 0,
+    };
   }
   // Accessor expansion, transformed Float64 positions, RTC rebasing, colors and
   // strip triangulation allocate independently for every node using a mesh.
@@ -2006,7 +2020,7 @@ const primitiveInstanceBytes = (
     );
     bytes += accessor.count * 3 * 4;
   }
-  return checkedGeometryBytes(bytes);
+  return { retainedBytes: bytes, scratchBytes: 0 };
 };
 
 /** Visit meshes and estimate the active scene without expanding repeated node subtrees. */
@@ -2079,6 +2093,7 @@ const decodeTileContentInner = async (
   const originalJson = contentJson(content);
   await options.reserveMemory?.(0);
   const colorSpaces = request.gaussianColorSpaces;
+  let peakScratchBytes = 0;
   const instanceBytes =
     options.reserveMemory || colorSpaces
       ? sceneInstanceBytes(originalJson, (primitive) => {
@@ -2097,9 +2112,14 @@ const decodeTileContentInner = async (
                 profile.colorSpace,
               );
           }
-          return options.reserveMemory
-            ? primitiveInstanceBytes(primitive, originalJson)
-            : 0;
+          if (!options.reserveMemory) return 0;
+          const { retainedBytes, scratchBytes } = estimatePrimitiveMemory(
+            primitive,
+            originalJson,
+          );
+          // SPZ primitives decode serially while their outputs remain live.
+          peakScratchBytes = Math.max(peakScratchBytes, scratchBytes);
+          return checkedGeometryBytes(retainedBytes);
         })
       : 0;
   if (options.reserveMemory) {
@@ -2130,7 +2150,9 @@ const decodeTileContentInner = async (
       }
       geometry += accessor.count * components * 4 * 3;
     }
-    geometry = checkedGeometryBytes(geometry + instanceBytes);
+    geometry = checkedGeometryBytes(
+      geometry + instanceBytes + peakScratchBytes,
+    );
     await options.reserveMemory(geometry);
   }
   validateRequiredExtensions(originalJson, request.contentUrl);

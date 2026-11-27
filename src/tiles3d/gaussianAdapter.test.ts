@@ -1548,6 +1548,114 @@ describe("Gaussian admission ownership", () => {
     }
   });
 
+  it("shows an already-sorting intermediate level before finer coverage", async () => {
+    const f = fixture();
+    try {
+      await f.show("root", 1);
+      expect(f.adapter.submitTile("root/0", field(3))).toBe("queued");
+      expect(f.adapter.submitTile("root/0/0", field(5))).toBe("queued");
+      await f.settle();
+
+      f.hold();
+      f.adapter.setDrawnTiles(["root/0"]);
+      await f.started();
+      f.adapter.retireTile("root/0", "refining");
+      f.adapter.setDrawnTiles(["root/0/0"]);
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(1);
+
+      f.releaseNext();
+      await f.drainUntil(
+        () => f.factory.stats(f.renderer)?.displayedSplats === 3,
+      );
+      f.release();
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("can display a recently retired range without another source submission", async () => {
+    const f = fixture();
+    try {
+      await f.show("a", 8);
+      expect(f.adapter.submitTile("b", field(5))).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      f.adapter.retireTile("b", "revisit");
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(8);
+      const before = f.factory.stats(f.renderer)?.attributeUploadBytes;
+
+      expect(f.adapter.restoreTile("b")).toBe("restored");
+      f.adapter.setDrawnTiles(["a", "b"]);
+      await f.settle();
+      expect(f.factory.stats(f.renderer)).toMatchObject({
+        displayedSplats: 13,
+        attributeUploadBytes: before,
+      });
+
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("checks a cached tile and its fresh sibling against another owner's splats", async () => {
+    const f = fixture(undefined, 12);
+    try {
+      await f.show("anchor", 1);
+      expect(f.adapter.submitTile("cached", field(5))).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["anchor", "cached"]);
+      await f.settle();
+      f.adapter.retireTile("cached", "revisit");
+      await f.settle();
+
+      const other = f.additionalAdapter();
+      expect(other.submitTile("other", field(7))).toBe("queued");
+      await f.settle();
+      other.setDrawnTiles(["other"]);
+      await f.settle();
+      expect(f.adapter.restoreTile("cached")).toBe("absent");
+
+      const published: string[][] = [];
+      const record = () =>
+        published.push([...f.adapter.submittedTileIds()].sort());
+      const group = [
+        { id: "cached", content: field(5), onSubmitted: record },
+        { id: "fresh", content: field(2), onSubmitted: record },
+      ];
+      expect(f.adapter.submitTileGroup(group, ["anchor"])).toMatchObject({
+        status: "blocked",
+        refusal: { domain: "count", finalCount: 14, limitCount: 12 },
+      });
+      expect(published).toEqual([]);
+      expect(f.adapter.stats().drawnTileIds).toEqual(["anchor"]);
+      expect(other.stats().drawnTileIds).toEqual(["other"]);
+
+      other.retireTile("other");
+      await f.settle();
+      expect(f.adapter.submitTileGroup(group, ["anchor"])).toBe("queued");
+      await f.settle();
+      expect(published).toEqual([
+        ["anchor", "cached", "fresh"],
+        ["anchor", "cached", "fresh"],
+      ]);
+      f.adapter.setDrawnTiles(["cached", "fresh"]);
+      await f.settle();
+      expect([...f.adapter.stats().drawnTileIds].sort()).toEqual([
+        "cached",
+        "fresh",
+      ]);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
   it("retires stable tuples without requiring extra capacity for optional compaction", async () => {
     const f = fixture();
     try {

@@ -188,14 +188,27 @@ export const openScene = async (options: {
   readonly cache?: HttpCacheOptions;
   readonly deviceScaleFactor?: number;
   readonly headless?: boolean;
+  readonly hardware?: boolean;
+  readonly localCopc?: string;
   /** Browser window size; `resizeViewer` refines it to the viewer's own size. */
   readonly windowSize?: { width: number; height: number };
 }): Promise<SceneSession & { readonly cache: HttpCache | null }> => {
-  const server: StaticServer = await startStaticServer({
-    "/fixtures": FIXTURES,
-    "/": EXAMPLE_DIST,
-  });
-  const browser = await benchmarkBrowser(options.headless ?? false);
+  if (
+    options.localCopc &&
+    !new URL(options.path, "http://localhost").searchParams
+      .get("url")
+      ?.endsWith(".copc.laz")
+  )
+    throw new Error(
+      "A local COPC override requires a recorded url query pointing to COPC",
+    );
+  const server: StaticServer = await startStaticServer(
+    { "/fixtures": FIXTURES, "/": EXAMPLE_DIST },
+    options.localCopc ? { "/recording.copc.laz": options.localCopc } : {},
+  );
+  const browser = options.hardware
+    ? await browserFor("headless-gpu")
+    : await benchmarkBrowser(options.headless ?? false);
   const context: BrowserContext = await browser.newContext({
     viewport: options.windowSize ?? { width: 1600, height: 1000 },
     deviceScaleFactor: options.deviceScaleFactor ?? 1,
@@ -218,6 +231,12 @@ export const openScene = async (options: {
   // measured, so ask for it rather than depending on whichever query string a
   // caller happened to pass.
   const target = new URL(`${server.origin}${options.path}`);
+  if (options.localCopc) {
+    target.searchParams.set(
+      "url",
+      new URL("/recording.copc.laz", server.origin).href,
+    );
+  }
   target.searchParams.set("harness", "1");
   await page.goto(target.toString(), { waitUntil: "load" });
   await page.waitForFunction(

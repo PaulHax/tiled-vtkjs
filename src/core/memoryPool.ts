@@ -79,7 +79,7 @@ export type MemoryPool = {
    */
   register(onChange?: () => void): MemoryPoolMember;
   createOwner(options?: {
-    readonly reclaim?: (domain: MemoryDomain) => void;
+    readonly reclaim?: (domain: MemoryDomain, deficit: () => number) => void;
   }): MemoryOwner;
   /** Update limits. Existing allocations remain charged while members coarsen. */
   configure(options: MemoryPoolOptions): void;

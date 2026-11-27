@@ -54,6 +54,13 @@ export type SceneHandle = {
   /** Names the page shape a trace came from, so two are never averaged. */
   readonly preset: string;
   readonly host: SceneHost;
+  readonly benchmarkCamera?: boolean;
+  memoryStats?: () => ReturnType<
+    import("../../../src/core").MemoryPool["stats"]
+  >;
+  gaussianStats?: () => ReturnType<
+    import("../../../src/tiles3d/gaussianAdapter").GaussianContentAdapterFactory["stats"]
+  >;
   /** The element a gesture is aimed at; recorded coordinates are relative to it. */
   readonly viewer: HTMLElement;
   datasets(): readonly HarnessDataset[];

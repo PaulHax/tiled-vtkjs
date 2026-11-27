@@ -77,3 +77,17 @@ it("reports dirty texture ranges for packed live tuples", () => {
   arena.retireExcept(new Set(["parent", "child"]));
   expect(arena.takePackedUpdates()).toEqual([[child.offset, child.count]]);
 });
+
+it("charges only the missing tail space and bounds growth to the available capacity", () => {
+  const arena = createGaussianStorage();
+  arena.grow(65_536);
+  arena.allocate("occupied", 60_000);
+  const requests = [{ key: "new", count: 6_000 }];
+  expect(arena.requiredCapacity(requests)).toBe(73_728);
+  expect(arena.requiredCapacity(requests, 67_000)).toBe(67_000);
+  expect(arena.requiredCapacity(requests, 64_000)).toBe(66_000);
+
+  arena.grow(arena.requiredCapacity(requests, 67_000));
+  expect(arena.allocate("new", 6_000).offset).toBe(60_000);
+  expect(arena.capacity).toBe(67_000);
+});

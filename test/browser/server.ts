@@ -15,6 +15,7 @@ import { join, normalize, resolve, sep } from "node:path";
 const CONTENT_TYPES = new Map([
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json"],
   [".glb", "model/gltf-binary"],
@@ -101,6 +102,7 @@ export const startStaticServer = async (
    */
   files: Readonly<Record<string, string>> = {},
   network?: NetworkProfile,
+  populate?: (urlPath: string, file: string) => Promise<void>,
 ): Promise<StaticServer> => {
   if (
     network !== undefined &&
@@ -154,7 +156,11 @@ export const startStaticServer = async (
       }
       let size: number;
       try {
-        const stat = await fs.stat(path);
+        const stat = await fs.stat(path).catch(async (error) => {
+          if (error.code !== "ENOENT" || !populate) throw error;
+          await populate(urlPath, path);
+          return fs.stat(path);
+        });
         if (!stat.isFile()) throw new Error("not a file");
         size = stat.size;
       } catch {

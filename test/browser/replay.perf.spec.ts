@@ -75,6 +75,9 @@ const repeats = Math.max(
   1,
   Math.floor(environmentNumber("TILED_VTKJS_REPLAY_REPEATS", 1)),
 );
+const localCopc = process.env.TILED_VTKJS_REPLAY_LOCAL_COPC?.trim()
+  ? environmentPath("TILED_VTKJS_REPLAY_LOCAL_COPC", "")
+  : undefined;
 /**
  * How long a scene is given to converge before the run is called a failure.
  * A sweep pays this several times per run, so a configuration that cannot
@@ -412,7 +415,9 @@ describe("recorded-gesture replay benchmark", { tags: ["perf"] }, () => {
             const session = await openScene({
               path: replayPath(recording.href),
               deviceScaleFactor: recording.viewer.devicePixelRatio,
-              headless: !usingRealGpu,
+              headless: true,
+              hardware: usingRealGpu,
+              localCopc,
               cache: {
                 mode: networkMode,
                 directory: cacheDirectory,
@@ -510,6 +515,11 @@ describe("recorded-gesture replay benchmark", { tags: ["perf"] }, () => {
               const trace = await session.telemetryTrace();
               const cacheStats = session.cache?.stats() ?? null;
 
+              if (usingRealGpu)
+                expect(
+                  trace.environment.webgl.unmaskedRenderer,
+                  "Hardware timing requires the unmasked WebGL renderer",
+                ).toBeTruthy();
               expect(trace.environment.webgl.softwareRenderer).toBe(
                 !usingRealGpu && allowSoftware,
               );

@@ -479,6 +479,64 @@ describe("traverseTileset", () => {
     expect(result.requestedTileIds).toContain("root/0/0");
     expect(result.drawnTileIds).toEqual(["root"]);
   });
+  it("keeps loaded subtree dependencies while reversing to an unloaded coarse tile", () => {
+    const base = implicitRoot();
+    const root = {
+      ...base,
+      implicitTiling: { ...base.implicitTiling!, availableLevels: 5 },
+    };
+    const boundaries = Array.from({ length: 16 }, (_, index) => index < 2);
+    const top = parseSubtree(
+      makeSubtreeFixture({ childSubtreeAvailability: boundaries }),
+      2,
+      SUBTREE_METADATA_SCHEMA,
+    );
+    const middle = parseSubtree(
+      makeSubtreeFixture({ childSubtreeAvailability: boundaries }),
+      2,
+      SUBTREE_METADATA_SCHEMA,
+    );
+    const bottom = parseSubtree(
+      makeSubtreeFixture({ childSubtreeAvailability: Array(16).fill(false) }),
+      2,
+      SUBTREE_METADATA_SCHEMA,
+    );
+    const subtrees = {
+      ...subtreeSnapshot(top),
+      subtreeById: new Map([
+        ["subtree/0/0/0", top],
+        ["subtree/2/0/0", middle],
+        ["subtree/4/0/0", bottom],
+      ]),
+    };
+    const camera = view(
+      [0, 0, 120],
+      Array.from({ length: 16 }, () => 0),
+    );
+    const leaf = "root/0/0/0/0";
+    const kept = select(
+      root,
+      { [leaf]: "submitted" },
+      { camera, subtrees, maximumScreenSpaceErrorPx: Number.MAX_VALUE },
+    );
+    expect(kept.drawnTileIds).toEqual([leaf]);
+    const requests = kept.neededSubtreeRequests.map(({ id }) => id).sort();
+    expect(requests).toEqual([
+      "subtree/0/0/0",
+      "subtree/2/0/0",
+      "subtree/4/0/0",
+    ]);
+    const after = select(
+      root,
+      { root: "submitted", [leaf]: "submitted" },
+      { camera, subtrees, maximumScreenSpaceErrorPx: Number.MAX_VALUE },
+    );
+    expect(after.drawnTileIds).toEqual(["root"]);
+    expect(after.neededSubtreeRequests.map(({ id }) => id)).toEqual([
+      "subtree/0/0/0",
+    ]);
+  });
+
   it("pins near/far camera selection and stable document order", () => {
     expect(
       select(tree(), {}, { camera: view([0, 0, 120]) }).desiredTileIds,
@@ -577,6 +635,26 @@ describe("traverseTileset", () => {
     expect(result.desiredTileIds).toEqual(["root"]);
     expect(result.requestedTileIds).toEqual(["root", "root/0", "root/1"]);
     expect(result.drawnTileIds).toEqual(["root/0", "root/1"]);
+  });
+
+  it("keeps deep detail visible on zoom out without requesting intermediate tiles", () => {
+    const root = tree();
+    const detail = ["root/0/0", "root/1/0"];
+    const readiness: Record<string, TileReadiness> = {
+      root: "loading",
+      "root/0/0": "submitted",
+      "root/1/0": "submitted",
+    };
+    const camera = view([0, 0, 120]);
+
+    const waiting = select(root, readiness, { camera });
+    expect(waiting.desiredTileIds).toEqual(["root"]);
+    expect(waiting.drawnTileIds).toEqual(detail);
+    expect(waiting.requestedTileIds).toEqual(["root", ...detail]);
+
+    const ready = select(root, { ...readiness, root: "submitted" }, { camera });
+    expect(ready.drawnTileIds).toEqual(["root"]);
+    expect(ready.requestedTileIds).toEqual(["root"]);
   });
 
   it("restores broad published coverage before refining an asynchronously admitted region", () => {

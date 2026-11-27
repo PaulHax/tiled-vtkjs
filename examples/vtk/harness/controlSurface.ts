@@ -36,11 +36,14 @@ export const createControlSurface = (
 
   return {
     preset: handle.preset,
+    benchmarkCamera: handle.benchmarkCamera,
     datasets: () =>
       handle.datasets().map(({ id, kind, label }) => ({ id, kind, label })),
     /** Coordinator and per-member numbers, as the diagnostics panel reads them. */
     stats: () => ({
       coordinator: host.coordinator.stats(),
+      memory: handle.memoryStats?.(),
+      gaussian: handle.gaussianStats?.(),
       members: handle.datasets().map((dataset) => ({
         id: dataset.id,
         kind: dataset.kind,

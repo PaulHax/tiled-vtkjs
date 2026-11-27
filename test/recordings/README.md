@@ -59,8 +59,8 @@ gesture performed against a stalling page.
 npm run bench:replay
 ```
 
-Every recording here runs against every configuration, headed on the real GPU,
-and writes one artifact per run under `artifacts/replay/`. Then:
+Every recording here runs against every configuration in hardware headless
+Chrome. The runner verifies the WebGL renderer and writes one artifact per run under `artifacts/replay/`. Then:
 
 ```bash
 npm run bench:analyze artifacts/replay
@@ -107,6 +107,13 @@ measurement rather than something to eliminate:
 
 Record once, then sweep settings against the replayed network, and confirm
 against a live run when the profile starts to look unlike the real thing.
+
+To replay the Luxembourg point-cloud gesture with the original COPC payload
+available locally, set `TILED_VTKJS_REPLAY_RECORDINGS=luxembourg-points.json`,
+`TILED_VTKJS_REPLAY_LOCAL_COPC=/path/to/original.copc.laz`, and
+`TILED_VTKJS_REPLAY_NETWORK=live`. The benchmark serves the file from its own
+Range server. This run isolates the recorded input and viewer from remote
+network variability.
 
 ### What a replayed gesture cannot reproduce exactly
 

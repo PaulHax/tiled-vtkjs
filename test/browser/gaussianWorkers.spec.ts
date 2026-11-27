@@ -88,7 +88,10 @@ describe("packaged Gaussian workers", () => {
             degree: primitive.harmonicDegree,
             opacityKernel: primitive.opacityKernel,
             alpha: primitive.opacities[1],
-            harmonics: primitive.sphericalHarmonics.length,
+            harmonics:
+              primitive.sphericalHarmonics.length +
+              (primitive.quantizedHarmonics?.length ?? 0),
+            firstDirectionalCoefficient: primitive.quantizedHarmonics?.[0],
           };
         } finally {
           pool.dispose();
@@ -99,6 +102,7 @@ describe("packaged Gaussian workers", () => {
         degree: 3,
         opacityKernel: "power",
         harmonics: 96,
+        firstDirectionalCoefficient: -32,
       });
       expect(result.alpha).toBeGreaterThan(1);
       expect(requests.every((url) => url.startsWith(`${server.origin}/`))).toBe(

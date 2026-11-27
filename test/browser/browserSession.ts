@@ -18,6 +18,8 @@ import {
   type Page,
 } from "playwright";
 
+import { launchHeadlessGpu } from "../reference-viewers/headless-gpu.mjs";
+
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../..");
 
@@ -29,15 +31,16 @@ export const FIXTURES = resolve(repoRoot, "test/fixtures");
  *
  * `software` is headless SwiftShader: correct pixels, frame times that
  * describe SwiftShader and nothing else. `gpu` is a headed window on the
- * machine's own GPU, which is the only mode a measurement may be taken in.
+ * machine's own GPU. `headless-gpu` uses the native GPU without a window.
  */
-export type RenderMode = "software" | "gpu";
+export type RenderMode = "software" | "gpu" | "headless-gpu";
 
 /** The mode a run asked for, as the environment states it. */
 export const requestedRenderMode = (): RenderMode =>
   (process.env.TILED_VTKJS_BROWSER_GPU ?? "") !== "" ? "gpu" : "software";
 
 const browsers = new Map<RenderMode, Browser>();
+let closeHeadlessGpu: (() => Promise<void>) | undefined;
 
 /**
  * One browser per mode, for the whole file. Launching Chromium costs far more
@@ -47,13 +50,20 @@ const browsers = new Map<RenderMode, Browser>();
 export const browserFor = async (mode: RenderMode): Promise<Browser> => {
   const running = browsers.get(mode);
   if (running !== undefined) return running;
+  if (mode === "headless-gpu") {
+    const session = await launchHeadlessGpu(chromium);
+    const browser: Browser = session.browser;
+    closeHeadlessGpu = session.close;
+    browsers.set(mode, browser);
+    return browser;
+  }
   const launched = await chromium.launch(
     mode === "gpu"
       ? { headless: false, args: ["--disable-dev-shm-usage"] }
       : {
           args: [
-            // Headless Chromium has no GPU; SwiftShader rasterises WebGL in
-            // software. Recent builds refuse it for WebGL without the opt-in.
+            // SwiftShader rasterises WebGL in software. Recent builds require
+            // the opt-in to create a WebGL context with it.
             "--use-gl=angle",
             "--use-angle=swiftshader",
             "--enable-unsafe-swiftshader",
@@ -66,6 +76,12 @@ export const browserFor = async (mode: RenderMode): Promise<Browser> => {
 };
 
 export const closeBrowsers = async (): Promise<void> => {
+  browsers.delete("headless-gpu");
+  try {
+    await closeHeadlessGpu?.();
+  } finally {
+    closeHeadlessGpu = undefined;
+  }
   const running = [...browsers.values()];
   browsers.clear();
   for (const browser of running) await browser.close();

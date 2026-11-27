@@ -1,0 +1,23 @@
+{
+  "name": "reference-viewer-benchmark",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "node run.mjs"
+  },
+  "dependencies": {
+    "3d-tiles-renderer": "0.5.4",
+    "3d-tiles-rendererjs-3dgs-plugin": "0.3.1",
+    "@sparkjsdev/spark": "2.4.0",
+    "cesium": "1.144.0",
+    "gaussian-splat-lite": "1.10.3",
+    "maplibre-gl": "6.19.0",
+    "ol": "10.11.0",
+    "playcanvas": "2.24.3",
+    "potree-core": "2.0.17",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@playcanvas/splat-transform": "3.12.0"
+  }
+}

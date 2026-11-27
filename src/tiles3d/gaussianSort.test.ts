@@ -115,6 +115,32 @@ describe("Gaussian camera-distance order", () => {
     );
   });
 
+  it("matches the stable numeric order across the wide histogram threshold", () => {
+    const sorter = createGaussianDistanceSorter();
+    const values = [7, -7, 0, 1e-20, 1e20, 7, 0.0001, 1e10];
+    const count = 65536;
+    const positions = new Float32Array(count * 3);
+    for (let id = 0; id < count; id++) {
+      positions[id * 3] = values[id % values.length]!;
+      positions[id * 3 + 1] = (id % 13) / 10000;
+    }
+    for (const size of [count - 1, count, count - 1]) {
+      const distances = Float64Array.from(
+        { length: size },
+        (_, id) => positions[id * 3]! ** 2 + positions[id * 3 + 1]! ** 2,
+      );
+      const expected = Uint32Array.from(distances, (_, id) => id).sort(
+        (a, b) => distances[b]! - distances[a]! || a - b,
+      );
+      const order = sorter.sort(
+        [{ ...range("dense", []), positions: positions.subarray(0, size * 3) }],
+        [0, 0, 0],
+      );
+      expect(order.length).toBe(size);
+      expect(order.every((id, index) => id === expected[index])).toBe(true);
+    }
+  });
+
   it("rejects invalid identities, placement and distances with actionable errors", () => {
     const sorter = createGaussianDistanceSorter();
     expect(() => sorter.sort([range("bad", [NaN, 0, 0])], [0, 0, 0])).toThrow(

@@ -250,6 +250,7 @@ export const writeGaussianColor = (
   camera: readonly number[],
   target: Float32Array,
   offset: number,
+  scratch?: Float64Array,
 ): void => {
   if (primitive.harmonicDegree === 0) {
     for (let channel = 0; channel < 3; channel++)
@@ -276,38 +277,42 @@ export const writeGaussianColor = (
     y = 0;
     z = 1;
   }
-  const basis = [0.2820947917738781];
-  if (primitive.harmonicDegree >= 1)
-    basis.push(
-      -0.4886025119029199 * y,
-      0.4886025119029199 * z,
-      -0.4886025119029199 * x,
-    );
-  if (primitive.harmonicDegree >= 2)
-    basis.push(
-      1.092548430592079 * x * y,
-      -1.092548430592079 * y * z,
-      0.31539156525252 * (2 * z * z - x * x - y * y),
-      -1.092548430592079 * x * z,
-      0.5462742152960395 * (x * x - y * y),
-    );
-  if (primitive.harmonicDegree >= 3)
-    basis.push(
-      -0.5900435899266435 * y * (3 * x * x - y * y),
-      2.890611442640554 * x * y * z,
-      -0.4570457994644657 * y * (4 * z * z - x * x - y * y),
-      0.3731763325901154 * z * (2 * z * z - 3 * x * x - 3 * y * y),
-      -0.4570457994644657 * x * (4 * z * z - x * x - y * y),
-      1.445305721320277 * z * (x * x - y * y),
-      -0.5900435899266435 * x * (x * x - 3 * y * y),
-    );
-  const start = splat * basis.length * 3;
+  const basis = scratch ?? new Float64Array(16);
+  basis[0] = 0.2820947917738781;
+  basis[1] = -0.4886025119029199 * y;
+  basis[2] = 0.4886025119029199 * z;
+  basis[3] = -0.4886025119029199 * x;
+  const degree = primitive.harmonicDegree;
+  const count = (degree + 1) ** 2;
+  if (degree >= 2) {
+    basis[4] = 1.092548430592079 * x * y;
+    basis[5] = -1.092548430592079 * y * z;
+    basis[6] = 0.31539156525252 * (2 * z * z - x * x - y * y);
+    basis[7] = -1.092548430592079 * x * z;
+    basis[8] = 0.5462742152960395 * (x * x - y * y);
+  }
+  if (degree >= 3) {
+    basis[9] = -0.5900435899266435 * y * (3 * x * x - y * y);
+    basis[10] = 2.890611442640554 * x * y * z;
+    basis[11] = -0.4570457994644657 * y * (4 * z * z - x * x - y * y);
+    basis[12] = 0.3731763325901154 * z * (2 * z * z - 3 * x * x - 3 * y * y);
+    basis[13] = -0.4570457994644657 * x * (4 * z * z - x * x - y * y);
+    basis[14] = 1.445305721320277 * z * (x * x - y * y);
+    basis[15] = -0.5900435899266435 * x * (x * x - 3 * y * y);
+  }
+  const { quantizedHarmonics, sphericalHarmonics } = primitive;
+  const dcOffset = splat * (quantizedHarmonics ? 3 : count * 3);
+  const higherBands = quantizedHarmonics ?? sphericalHarmonics;
+  const higherOffset = quantizedHarmonics
+    ? splat * (count - 1) * 3
+    : dcOffset + 3;
+  const scale = quantizedHarmonics ? 1 / 128 : 1;
   for (let channel = 0; channel < 3; channel++) {
-    let value = 0.5;
-    for (let coefficient = 0; coefficient < basis.length; coefficient++)
+    let value = 0.5 + basis[0]! * sphericalHarmonics[dcOffset + channel]!;
+    for (let coefficient = 1; coefficient < count; coefficient++)
       value +=
         basis[coefficient]! *
-        primitive.sphericalHarmonics[start + coefficient * 3 + channel]!;
+        (higherBands[higherOffset + (coefficient - 1) * 3 + channel]! * scale);
     target[offset + channel] = Math.max(0, value);
   }
   target[offset + 3] = primitive.opacities[splat]!;

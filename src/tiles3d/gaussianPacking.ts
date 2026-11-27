@@ -34,10 +34,60 @@ export function* packGaussianRanges(
   ranges: readonly GaussianPackedRange[],
   tuplesPerStep: number,
   onPacked: () => void,
+  reusable?: {
+    storage: PackingStorage;
+    ranges: ReadonlyMap<GaussianPackedRange, GaussianPackedRange>;
+  },
 ) {
   for (const packed of ranges) {
     const { primitive, matrix, offset, count, allocationRevision } = packed;
     if (storage.arena.isPacked(allocationRevision)) continue;
+    const previous = reusable?.ranges.get(packed);
+    const previousStorage = reusable?.storage;
+    const previousBounds =
+      previous &&
+      previousStorage?.arena.packedBounds(previous.allocationRevision);
+    if (previous && previousStorage && previousBounds) {
+      const bounds: GaussianBounds = [...previousBounds];
+      for (
+        let first =
+          storage.arena.packingProgress(allocationRevision)?.count ?? 0;
+        first < count;
+        first += tuplesPerStep
+      ) {
+        const end = Math.min(count, first + tuplesPerStep);
+        yield {
+          bytes: (end - first) * GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE,
+          run() {
+            for (const [name, components] of [
+              ["positions", 3],
+              ["scales", 3],
+              ["rotations", 4],
+              ["colors", 4],
+            ] as const) {
+              const start = (previous.offset + first) * components;
+              storage[name].set(
+                previousStorage[name].subarray(
+                  start,
+                  start + (end - first) * components,
+                ),
+                (offset + first) * components,
+              );
+            }
+            if (end === count) {
+              storage.arena.markPacked(
+                allocationRevision,
+                bounds,
+                offset,
+                count,
+              );
+              onPacked();
+            } else storage.arena.markPartial(allocationRevision, end, bounds);
+          },
+        };
+      }
+      continue;
+    }
     const { origin } = storage;
     const transformShape = createGaussianShapeTransform(matrix);
     const staticCamera = [0, 0, 0] as const;

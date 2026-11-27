@@ -100,13 +100,13 @@ describe("SPZ Gaussian tile decoding", () => {
       expect([...gaussian.positions]).toEqual([1, 2, 3, 4, 5, 6]);
       expect(gaussian.modelToScene[12]).toBe(0.125);
       expect(gaussian.harmonicDegree).toBe(degree);
-      expect(gaussian.sphericalHarmonics.length).toBe(
-        2 * (degree + 1) ** 2 * 3,
+      expect(gaussian.sphericalHarmonics.length).toBe(6);
+      expect(gaussian.quantizedHarmonics?.length ?? 0).toBe(
+        2 * ((degree + 1) ** 2 - 1) * 3,
       );
       expect(gaussian.sphericalHarmonics[0]).toBeCloseTo(-1, 1);
       expect(gaussian.sphericalHarmonics[2]).toBeCloseTo(1, 1);
-      if (degree > 0)
-        expect(gaussian.sphericalHarmonics[3]).toBeCloseTo(-0.25, 2);
+      if (degree > 0) expect(gaussian.quantizedHarmonics?.[0]).toBe(-32);
       expect(gaussian.opacities[0]).toBeCloseTo(0.5, 2);
       expect(gaussian.opacities[1]).toBe(1);
       expect(gaussian.scales[0]).toBeCloseTo(Math.exp(-1), 5);
@@ -130,29 +130,38 @@ describe("SPZ Gaussian tile decoding", () => {
     expect(gaussian.opacities[1]).toBeCloseTo(Math.exp(3 / Math.E), 5);
   });
 
-  it("refuses repeated SPZ node expansion before entering the codec", async () => {
-    const content = await spzGlb({
-      degree: 3,
-      // If preflight admits this scene, the codec fails on the corrupt payload.
-      compressedBytes: Uint8Array.of(0),
-      mutate(json) {
-        json.nodes = Array.from({ length: 100 }, () => ({ mesh: 0 }));
-        json.scenes[0].nodes = json.nodes.map(
-          (_: unknown, index: number) => index,
-        );
-      },
-    });
-    await expect(
-      decodeTileContent(request(content), {
-        reserveMemory: async (bytes) => {
-          if (bytes > 40_000)
-            throw new ResourcePolicyError("work", bytes, 40_000);
+  it("shares codec scratch across instances and reserves each decoded output", async () => {
+    const limitBytes = 11_820_000;
+    const decodeInstances = async (
+      instances: number,
+      compressedBytes?: Uint8Array,
+    ) => {
+      const content = await spzGlb({
+        degree: 3,
+        compressedBytes,
+        mutate(json) {
+          json.nodes = Array.from({ length: instances }, () => ({ mesh: 0 }));
+          json.scenes[0].nodes = json.nodes.map(
+            (_: unknown, index: number) => index,
+          );
         },
-      }),
-    ).rejects.toMatchObject({
+      });
+      return decodeTileContent(request(content), {
+        reserveMemory: async (bytes) => {
+          if (bytes > limitBytes)
+            throw new ResourcePolicyError("work", bytes, limitBytes);
+        },
+      });
+    };
+
+    const decoded = await decodeInstances(2);
+    expect(decoded.primitives).toHaveLength(2);
+
+    // A corrupt payload fails in the codec if preflight admits this scene.
+    await expect(decodeInstances(100, Uint8Array.of(0))).rejects.toMatchObject({
       name: "ResourcePolicyError",
       domain: "work",
-      limitBytes: 40_000,
+      limitBytes,
     });
   });
 

@@ -394,7 +394,7 @@ const implicitHierarchy = (
 const hasContent = (tile: TilesetTile): boolean =>
   tile.contentUrl !== undefined;
 
-const sameHierarchy = (
+export const sameSubtreeHierarchy = (
   left: SubtreeHierarchyState | null | undefined,
   right: SubtreeHierarchyState | null | undefined,
 ): boolean => {
@@ -433,7 +433,10 @@ export const createTilesetTraversal = () => {
   let modelMatrix: readonly number[] | undefined;
   const placements = new Map<TilesetTile, TilePlacement>();
   return (options: TilesetTraversalOptions): TilesetTraversalResult => {
-    if (root !== options.root || !sameHierarchy(snapshot, options.subtrees)) {
+    if (
+      root !== options.root ||
+      !sameSubtreeHierarchy(snapshot, options.subtrees)
+    ) {
       hierarchy = undefined;
       placements.clear();
     }
@@ -499,6 +502,7 @@ const traverseHierarchy = (
     parentTransform: readonly number[],
     depth: number,
     coveredRegion?: Region,
+    retainSubmitted = false,
   ): VisitResult => {
     let placement = placements.get(tile);
     if (!placement) {
@@ -527,10 +531,12 @@ const traverseHierarchy = (
     const covered = !!coveredRegion || ownPresented;
 
     const subtreeRequest = hierarchy.subtreeRequestByTileId.get(tile.id);
-    if (subtreeRequest) neededSubtrees.set(subtreeRequest.id, subtreeRequest);
+    if (subtreeRequest && !retainSubmitted)
+      neededSubtrees.set(subtreeRequest.id, subtreeRequest);
     const unknownRequest = hierarchy.unknownRequestByTileId.get(tile.id);
     if (unknownRequest) {
-      neededSubtrees.set(unknownRequest.id, unknownRequest);
+      if (!retainSubmitted)
+        neededSubtrees.set(unknownRequest.id, unknownRequest);
       const submitted = options.readiness(tile.id) === "submitted";
       return {
         visible: true,
@@ -545,9 +551,9 @@ const traverseHierarchy = (
 
     const authoredContent = hasContent(tile);
     const available = !options.unavailable?.(tile.id);
-    const contentful =
-      authoredContent &&
-      (available || options.readiness(tile.id) === "submitted");
+    const submitted =
+      authoredContent && options.readiness(tile.id) === "submitted";
+    const contentful = authoredContent && (available || submitted);
     // Contentless tiles are hierarchy nodes, not drawable levels of detail.
     // Their descendants remain reachable regardless of the node's own SSE, and
     // regardless of `refinable` — such a node has no content of its own to
@@ -559,11 +565,13 @@ const traverseHierarchy = (
     const childRegion = ownPresented ? { error, offset } : coveredRegion;
     const refine =
       tile.children.length > 0 &&
-      (!contentful ||
-        (error > effective && (options.refinable?.(tile.id) ?? true)));
+      (retainSubmitted
+        ? !submitted
+        : !contentful ||
+          (error > effective && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
       ? tile.children.map((child) =>
-          visit(child, accumulated, depth + 1, childRegion),
+          visit(child, accumulated, depth + 1, childRegion, retainSubmitted),
         )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
@@ -571,7 +579,9 @@ const traverseHierarchy = (
     if (
       !refine ||
       visibleChildren.length === 0 ||
-      (contentful && visibleChildren.some((child) => !child.coveragePossible))
+      (!retainSubmitted &&
+        contentful &&
+        visibleChildren.some((child) => !child.coveragePossible))
     ) {
       if (!contentful) {
         return {
@@ -586,14 +596,12 @@ const traverseHierarchy = (
           drawn: [],
         };
       }
-      const submitted = options.readiness(tile.id) === "submitted";
-      // Reverse refinement is paced too: if a coarser desired parent is not
-      // submitted yet, retain only descendants that were already submitted.
-      // Fresh coarse startup does not request the entire hierarchy.
+      // A coarse tile still loading can use finer coverage already on the
+      // renderer. Intermediate levels may have been retired after refinement.
       const fallbacks =
-        !submitted && hasSubmittedDescendant(tile)
+        !retainSubmitted && !submitted && hasSubmittedDescendant(tile)
           ? tile.children.map((child) =>
-              visit(child, accumulated, depth + 1, childRegion),
+              visit(child, accumulated, depth + 1, childRegion, true),
             )
           : [];
       const visibleFallbacks = fallbacks.filter((child) => child.visible);
@@ -611,8 +619,11 @@ const traverseHierarchy = (
         recoveringCoverage: visibleFallbacks.some(
           (child) => child.recoveringCoverage,
         ),
-        desired: [tile.id],
-        requested: [tile.id, ...fallbacks.flatMap((child) => child.requested)],
+        desired: retainSubmitted ? [] : [tile.id],
+        requested: [
+          ...(!retainSubmitted || submitted ? [tile.id] : []),
+          ...fallbacks.flatMap((child) => child.requested),
+        ],
         drawn: submitted
           ? [tile.id]
           : fallbacks.flatMap((child) => child.drawn),
@@ -622,7 +633,6 @@ const traverseHierarchy = (
     const desired = visibleChildren.flatMap((child) => child.desired);
     const coveragePresented =
       covered || visibleChildren.every((child) => child.coveragePresented);
-    const submitted = contentful && options.readiness(tile.id) === "submitted";
     const recoveringCoverage = Boolean(
       options.presented && submitted && !coveragePresented,
     );
@@ -657,7 +667,7 @@ const traverseHierarchy = (
         contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
       requested: [
-        ...(contentful ? [tile.id] : []),
+        ...(contentful && !retainSubmitted ? [tile.id] : []),
         ...visibleChildren.flatMap((child) => child.requested),
       ],
       // Never partially replace a submitted parent. If it has not arrived yet,
@@ -670,6 +680,24 @@ const traverseHierarchy = (
 
   const rootParent = options.modelMatrix ?? IDENTITY;
   const result = visit(hierarchy.root, rootParent, 0);
+  if (hierarchy.subtreeRequestByTileId.size) {
+    // A drawn fallback can cross loaded subtree boundaries that refinement
+    // no longer visits. Keep its metadata reachable until coverage switches.
+    const visited = new Set<string>();
+    for (const drawn of result.drawn) {
+      for (
+        let id = drawn;
+        !visited.has(id);
+        id = id.slice(0, id.lastIndexOf("/"))
+      ) {
+        visited.add(id);
+        const request = hierarchy.subtreeRequestByTileId.get(id);
+        if (request) neededSubtrees.set(request.id, request);
+        if (!id.includes("/")) break;
+      }
+    }
+  }
+
   const requested = [...result.requested].sort((left, right) => {
     const a = requestOrder.get(left)!;
     const b = requestOrder.get(right)!;

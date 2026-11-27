@@ -28,7 +28,7 @@ export const createGaussianGpuAtlas = (
   const geometry = createPointTextureBank(context.window);
   const makePresentation = () => ({
     textures: createPointTextureBank(context.window),
-    staticColors: new Set<number>(),
+    colorViews: new Map<number, CameraView["position"] | null>(),
   });
   const presentations = [makePresentation(), makePresentation()] as const;
   let active = 0;
@@ -42,12 +42,11 @@ export const createGaussianGpuAtlas = (
       active = 1 - active;
     },
     retireExcept(live: ReadonlySet<number>) {
-      for (const ranges of [
-        geometryRanges,
-        ...presentations.map((draw) => draw.staticColors),
-      ])
-        for (const revision of ranges)
-          if (!live.has(revision)) ranges.delete(revision);
+      for (const revision of geometryRanges)
+        if (!live.has(revision)) geometryRanges.delete(revision);
+      for (const { colorViews } of presentations)
+        for (const revision of colorViews.keys())
+          if (!live.has(revision)) colorViews.delete(revision);
     },
     prepared(maximumId: number): PreparedPointTextures {
       const draw = presentations[1 - active]!.textures;
@@ -210,12 +209,20 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
 
   const colorUpdates: [number, number][] = [];
   const dirtyColors: GaussianPackedRange[] = [];
+  const basis = new Float64Array(16);
   for (const range of ranges) {
     const { allocationRevision, offset, count, primitive } = range;
     const harmonic = primitive.harmonicDegree > 0;
-    const colorChanged = harmonic && (!!draw || recolor(range));
-    if (!colorChanged && (!draw || draw.staticColors.has(allocationRevision)))
-      continue;
+    const previous = draw?.colorViews.get(allocationRevision);
+    if (draw) {
+      if (
+        previous === null ||
+        previous?.every((component, index) => component === camera[index])
+      )
+        continue;
+      // A cancelled upload may have overwritten part of the previous range.
+      draw.colorViews.delete(allocationRevision);
+    } else if (!harmonic || !recolor(range)) continue;
     const modelCamera = harmonic
       ? gaussianModelCamera(range.matrix, camera)
       : null;
@@ -232,13 +239,14 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
                 modelCamera,
                 attributes.colors,
                 (offset + index) * 4,
+                basis,
               );
           },
         };
       }
     }
     if (draw) dirtyColors.push(range);
-    if (colorChanged) colorUpdates.push([offset, count]);
+    if (harmonic) colorUpdates.push([offset, count]);
   }
   if (draw) {
     yield* uploadRanges(
@@ -252,8 +260,10 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
       onAttributeUpload,
     );
     for (const { primitive, allocationRevision } of dirtyColors)
-      if (primitive.harmonicDegree === 0)
-        draw.staticColors.add(allocationRevision);
+      draw.colorViews.set(
+        allocationRevision,
+        primitive.harmonicDegree === 0 ? null : [...camera],
+      );
     yield* uploadRanges(
       draw.textures,
       "pointOrder",

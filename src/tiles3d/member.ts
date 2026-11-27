@@ -66,6 +66,7 @@ import {
 import { parseSubtree, type ParsedSubtree } from "./subtree";
 import {
   createTilesetTraversal,
+  sameSubtreeHierarchy,
   type SubtreeHierarchyState,
   type TilesetTraversalResult,
 } from "./traversal";
@@ -189,7 +190,7 @@ export const createTiles3dMember = (
   let subtreeQueue: ContentQueue<ParsedSubtree> | null = null;
   let subtreeSnapshot: ContentQueueSnapshot | null = null;
   let subtreeHierarchy: SubtreeHierarchyState | null = null;
-  let materializedTileById = new Map<string, TilesetTile>();
+  let materializedTileById: ReadonlyMap<string, TilesetTile> = new Map();
   let traversal: TilesetTraversalResult | null = null;
   let errorCount = 0;
   let lastError: string | null = null;
@@ -314,13 +315,12 @@ export const createTiles3dMember = (
   };
 
   const memory = context.memory.createOwner({
-    reclaim(domain: MemoryDomain) {
+    reclaim(domain: MemoryDomain, deficit: () => number) {
       if (domain === "cpu") {
-        queue?.trimCache(0);
-        subtreeQueue?.trimCache(0);
-        adapter.trimReuse();
+        queue?.reclaimDecoded(deficit);
+        if (deficit() > 0) subtreeQueue?.reclaimDecoded(deficit);
       }
-      if (domain === "renderer") adapter.trimReuse();
+      if (deficit() > 0) adapter.trimReuse();
     },
   });
 
@@ -473,7 +473,7 @@ export const createTiles3dMember = (
     });
     // This hierarchy is derived from the bounded subtree snapshot. Replacing
     // the map keeps camera exploration from retaining every historical tile.
-    materializedTileById = new Map(result.tileById);
+    materializedTileById = result.tileById;
     return result;
   };
 
@@ -623,7 +623,7 @@ export const createTiles3dMember = (
   const trySubmitDesiredGroup = (
     id: string,
   ): TileSubmissionOutcome | undefined => {
-    if (!traversal || !queue) return undefined;
+    if (!traversal?.desiredTileIds.includes(id) || !queue) return undefined;
     const ancestor = submittedAncestors(id)[0];
     if (!ancestor) return undefined;
     // Already submitted siblings keep their realization and count toward
@@ -710,6 +710,17 @@ export const createTiles3dMember = (
       setResourceState({ status: "ready" });
   };
 
+  const releaseAffordableConstraint = (): boolean => {
+    if (
+      !memoryConstrained ||
+      adapter.workState().residentBytes > allocation.memoryBudgetBytes
+    )
+      return false;
+    memoryConstrained = false;
+    if (!blockedGroupAncestors.size) constrainedDesiredSignature = null;
+    return true;
+  };
+
   const clearAdmissionState = (): void => {
     demand.clear();
     unavailableRepresentations.clear();
@@ -742,7 +753,10 @@ export const createTiles3dMember = (
     refreshSelection();
   };
 
-  const updateDrawSet = (selectionComplete = false): void => {
+  const updateDrawSet = (
+    selectionComplete = false,
+    coverage?: TilesetTraversalResult,
+  ): void => {
     // Cached-content callbacks can run synchronously inside setSelection.
     // Publish coverage once that batch has finished, not once per callback.
     if (!drawSetDirty || (refreshing && !selectionComplete)) return;
@@ -752,8 +766,9 @@ export const createTiles3dMember = (
       pickSet.replaceDrawn([]);
       return;
     }
-    traversal = select(traversalMaximumSse(), traversalQualityFraction());
-    selectionPasses += 1;
+    if (!coverage) selectionPasses += 1;
+    traversal =
+      coverage ?? select(traversalMaximumSse(), traversalQualityFraction());
     adapter.setDrawnTiles(traversal.drawnTileIds);
     pickSet.replaceDrawn(adapter.pickableMeshTiles());
   };
@@ -776,6 +791,8 @@ export const createTiles3dMember = (
         return;
       }
       selectionPasses += 1;
+      const submission = adapter.submissionRevision();
+      const hierarchy = subtreeHierarchy;
       const next = select(traversalMaximumSse(), traversalQualityFraction());
       prioritizedPresentation = adapter.presentedTileIds?.() ?? [];
       const previousDesired = traversal?.desiredTileIds;
@@ -793,10 +810,14 @@ export const createTiles3dMember = (
       const nextRequested = new Set(
         nextContentRequests.map((request) => request.id),
       );
+      let refining: Set<string> | undefined;
       for (const id of demand.keys()) {
         if (nextRequested.has(id)) continue;
         adapter.cancelTile(id);
-        if (!next.drawnTileIds.includes(id)) adapter.retireTile(id);
+        if (!next.drawnTileIds.includes(id)) {
+          refining ??= new Set(next.desiredTileIds.flatMap(ancestorIds));
+          adapter.retireTile(id, refining.has(id) ? "refining" : "revisit");
+        }
         demand.delete(id);
       }
       for (const id of nextRequested) {
@@ -806,11 +827,23 @@ export const createTiles3dMember = (
       queue.setSelection(
         nextContentRequests.filter(({ id }) => {
           const state = adapter.tileState(id);
-          return (
-            state !== "submitted" &&
-            state !== "failed" &&
-            !unavailableRepresentations.has(id)
-          );
+          if (
+            state === "submitted" ||
+            state === "failed" ||
+            unavailableRepresentations.has(id)
+          )
+            return false;
+          if (queue?.state(id)?.status === "ready") return true;
+          // Keep one level of lookahead behind missing coverage so deep tiles
+          // do not occupy every download and decode slot before their fallback.
+          let missingAncestors = 0;
+          for (const ancestor of ancestorIds(id)) {
+            if (!nextRequested.has(ancestor)) continue;
+            const state = readiness(ancestor);
+            if (state === "submitted" || state === "failed") continue;
+            if (++missingAncestors > 1) return false;
+          }
+          return true;
         }),
       );
       const admissionOrder =
@@ -867,7 +900,13 @@ export const createTiles3dMember = (
         else blockGroupUnder(id);
         if (refreshAgain) break;
       }
-      updateDrawSet(true);
+      // Request updates alone cannot change coverage. Revisit traversal when
+      // synchronous restoration, retirement, or hierarchy work changes it.
+      const unchanged =
+        !refreshAgain &&
+        sameSubtreeHierarchy(hierarchy, subtreeHierarchy) &&
+        submission === adapter.submissionRevision();
+      updateDrawSet(true, unchanged ? next : undefined);
       noteResourceRecovery();
     } finally {
       refreshing = false;
@@ -981,11 +1020,13 @@ export const createTiles3dMember = (
       onError: (_request, error) => {
         workProgressSerial += 1;
         report(error);
+        if (!disposed && active) refreshSelection();
       },
       onPolicyRefusal: (request, error) => {
         workProgressSerial += 1;
         policyRefused(error);
         if (!error.retryable) omitRepresentation(request.id);
+        else if (!disposed && active) refreshSelection();
       },
       onStateChange: (snapshot) => {
         workProgressSerial += 1;
@@ -1053,7 +1094,7 @@ export const createTiles3dMember = (
     sourceMemory?.release();
     sourceMemory = undefined;
     source = null;
-    materializedTileById.clear();
+    materializedTileById = new Map();
     traversal = null;
     queueSnapshot = null;
     context.onWorkChange?.();
@@ -1099,7 +1140,7 @@ export const createTiles3dMember = (
           }
           sourceMemory = lease;
           source = loaded;
-          materializedTileById = new Map(loaded.tileById);
+          materializedTileById = loaded.tileById;
           workProgressSerial += 1;
           sourceState = "ready";
           createQueue();
@@ -1219,7 +1260,7 @@ export const createTiles3dMember = (
         adapter.clearTiles();
         pickSet.replaceDrawn([]);
         source = null;
-        materializedTileById.clear();
+        materializedTileById = new Map();
         sourceState = "idle";
         traversal = null;
         clearAdmissionState();
@@ -1254,15 +1295,18 @@ export const createTiles3dMember = (
           queue?.retryBlocked();
           subtreeQueue?.retryBlocked();
           refreshSelection();
-        } else if (availability !== lastAvailability) {
-          let retry = retryRealizations("availability");
-          if (
-            rendererRefusal?.error.estimate.wake === "availability" &&
-            rendererRefusal.availability !== availability
-          ) {
-            rendererRefusal = undefined;
-            adapter.clearRequiredBytes();
-            retry = true;
+        } else {
+          let retry = releaseAffordableConstraint();
+          if (availability !== lastAvailability) {
+            if (retryRealizations("availability")) retry = true;
+            if (
+              rendererRefusal?.error.estimate.wake === "availability" &&
+              rendererRefusal.availability !== availability
+            ) {
+              rendererRefusal = undefined;
+              adapter.clearRequiredBytes();
+              retry = true;
+            }
           }
           if (retry) refreshSelection();
         }
@@ -1329,13 +1373,21 @@ export const createTiles3dMember = (
       if (allocation.memoryBudgetBytes > previousMemoryBudgetBytes) {
         unavailableRepresentations.clear();
         clearBudgetConstraint();
-      } else if (
-        adapter.workState().residentBytes > allocation.memoryBudgetBytes
-      ) {
-        memoryConstrained = true;
-        constrainedDesiredSignature = unconstrainedDesiredSignature();
       } else {
-        retryIfDesiredSelectionChanged();
+        const renderer = adapter.workState();
+        const shrank = allocation.memoryBudgetBytes < previousMemoryBudgetBytes;
+        if (
+          (shrank || renderer.pendingJobs === 0) &&
+          renderer.residentBytes > allocation.memoryBudgetBytes
+        ) {
+          if (!memoryConstrained) {
+            memoryConstrained = true;
+            constrainedDesiredSignature = unconstrainedDesiredSignature();
+          }
+        } else {
+          releaseAffordableConstraint();
+          retryIfDesiredSelectionChanged();
+        }
       }
       refreshSelection();
     },
@@ -1377,6 +1429,8 @@ export const createTiles3dMember = (
         blockedGroups: blockedGroupAncestors.size,
         selectedTiles: traversal?.desiredTileIds.length ?? 0,
         requestedTiles: traversal?.requestedTileIds.length ?? 0,
+        desiredTileIds: traversal?.desiredTileIds ?? [],
+        requestedTileIds: traversal?.requestedTileIds ?? [],
         selectionPasses,
         errorCount,
         lastError,
@@ -1416,7 +1470,7 @@ export const createTiles3dMember = (
       memory.close();
       pickSet.dispose();
       source = null;
-      materializedTileById.clear();
+      materializedTileById = new Map();
       camera = null;
     },
   };
