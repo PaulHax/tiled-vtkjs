@@ -100,6 +100,7 @@ export function* stageGaussianOrder(
     for (let first = 0; first < count; first += mappingStep) {
       const end = Math.min(count, first + mappingStep);
       yield {
+        stage: "remap",
         bytes: (end - first) * 4,
         run() {
           for (let index = first; index < end; index++)
@@ -112,6 +113,7 @@ export function* stageGaussianOrder(
   for (let first = 0; first < order.length; first += orderStep) {
     const end = Math.min(order.length, first + orderStep);
     yield {
+      stage: "remap",
       bytes: (end - first) * 8,
       run() {
         for (let index = first; index < end; index++) {
@@ -146,6 +148,7 @@ function* uploadRanges(
       const size = Math.min(step, count - first);
       const bytes = size * bytesPerTuple;
       yield {
+        stage: name,
         bytes,
         run() {
           bank.write(name, values, components, capacity, offset + first, size);
@@ -230,6 +233,7 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
       for (let first = 0; first < count; first += colorTuplesPerStep) {
         const size = Math.min(colorTuplesPerStep, count - first);
         yield {
+          stage: "harmonics",
           bytes: size * 16,
           run() {
             for (let index = first; index < first + size; index++)

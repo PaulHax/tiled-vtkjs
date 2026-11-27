@@ -70,6 +70,31 @@ npm --prefix test/reference-viewers run bench -- \
 
 Use `--vtk-dist /path/to/examples/vtk/dist` to compare locally built tiled-vtkjs revisions that support the benchmark camera and SSE controls with the same manifest. Choose a different output directory per revision. Cases can override `traces` with arrays of `[milliseconds, normalizedZoom, halfTurns]` keyframes starting at zero. Zoom values zero and one select the far and near camera endpoints. For raster, the third value pans horizontally using the configured `panDegrees`.
 
+Add `--trace` to a tiled-vtkjs diagnostic run to include the selection, decode,
+sort, CPU preparation, texture writes, commit and first rendered frame in
+`detailTrace`. Events and resource timings share the browser performance clock.
+The route-start marker aligns them with the authored camera phases. Follow tile
+IDs from selection into sort-target revisions, and match the revision and camera
+position for each result and publication. Preparation costs separate time spent
+running each step from time waiting for admission. Texture times measure CPU
+submission. Capture frame timing in a separate run with tracing disabled. To inspect the fallback covering a
+particular explicit leaf tile, run
+`node test/reference-viewers/summarize-detail.mjs <report.json> <tile-path>`.
+Times in the coverage history are relative to route start. A missing timestamp
+means that operation was unobserved for the reported revision or tile.
+Stage totals include startup and can overlap between preparations.
+
+The pressure duration sums frame
+intervals with an observed pressure flag. Repeated response bytes use the
+declared length for each repeated path and byte range. A response cancelled
+after headers can contribute its full declared length.
+
+For a settled Gaussian reference that reaches the splat-count ceiling, set
+`referenceSplatLimit` in its manifest case and record the value alongside
+`memoryMiB`. This override applies only to the settled pass. Reference capture
+requires 500 ms of reported convergence, with a 30-second no-progress guard
+and a three-minute bound per pose.
+
 ## Memory pressure and LOD churn
 
 Set `memoryMiB` on a 3D Tiles case to sweep the engine's own limit. For

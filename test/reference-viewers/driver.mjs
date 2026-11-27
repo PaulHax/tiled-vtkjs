@@ -185,16 +185,29 @@ export async function initialize(config) {
         const exact = exactPose(config.route.keyframes, at);
         const start = performance.now();
         let settledSince;
+        let progressAt = start;
+        let progress = "";
         for (;;) {
           const now = await nextFrame();
           const snapshot = frame(exact);
           const { ready, settled } = snapshot;
+          const current = JSON.stringify([
+            snapshot.selected,
+            snapshot.readyRequests,
+            snapshot.gaussianSorts,
+            snapshot.frontierRebuilds,
+            snapshot.packingUploadBytes,
+          ]);
+          if (current !== progress) {
+            progress = current;
+            progressAt = now;
+          }
           if (ready && settled && (settledSince ??= now) + 500 <= now) {
             capture(label, at, now - start, exact);
             break;
           }
           if (!ready || !settled) settledSince = undefined;
-          if (now - start > 30000) {
+          if (now - progressAt > 30000 || now - start > 180000) {
             const state = { ...snapshot };
             delete state.selected;
             delete state.desired;
@@ -214,6 +227,8 @@ export async function initialize(config) {
       let segment = 1;
       let checkpointIndex = 0;
       const start = await nextFrame();
+      if (config.trace)
+        performance.mark("tile-detail:route-start", { startTime: start });
       const duration = keyframes.at(-1)[0];
       let last = start;
       for (;;) {

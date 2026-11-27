@@ -160,6 +160,11 @@ export const createTiles3dMember = (
   initialConfig: Tiles3dMemberConfig,
   services: Tiles3dMemberServices,
 ): StreamedMember => {
+  const observer = services.trace;
+  const trace =
+    observer &&
+    ((stage: string, detail: Record<string, unknown>) =>
+      safeCall(() => observer(stage, detail)));
   let traverseTileset = createTilesetTraversal();
   let config = validateTiles3dMemberConfig(initialConfig);
   let active = true;
@@ -801,6 +806,13 @@ export const createTiles3dMember = (
         next.desiredTileIds.some((id, index) => id !== previousDesired[index])
       )
         for (const tile of demand.values()) tile.blocked = undefined;
+      trace?.("selection", {
+        desired: next.desiredTileIds,
+        requested: next.requestedTileIds,
+        presented: prioritizedPresentation,
+        sse: next.effectiveScreenSpaceErrorPx,
+        camera: camera.position,
+      });
       traversal = next;
       subtreeQueue?.setSelection(next.neededSubtreeRequests);
       const nextContentRequests = contentRequests(
@@ -998,6 +1010,11 @@ export const createTiles3dMember = (
             ]),
           },
           async decode(bytes, { signal, work }) {
+            trace?.("decode-start", {
+              tile: request.id,
+              url: request.url,
+              bytes: bytes.byteLength,
+            });
             const job = workers.decode(
               { ...inputs, content: bytes },
               { memory: work },
@@ -1005,7 +1022,9 @@ export const createTiles3dMember = (
             const abort = () => job.cancel();
             signal.addEventListener("abort", abort, { once: true });
             try {
-              return await job.promise;
+              const content = await job.promise;
+              trace?.("decode-end", { tile: request.id });
+              return content;
             } finally {
               signal.removeEventListener("abort", abort);
             }

@@ -457,9 +457,34 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     host.camera.setPosition(...pose.position);
     host.camera.setFocalPoint(...pose.target);
     host.camera.setViewUp(...pose.up);
+    // A distant initial target must be inside the frustum before the first tile supplies bounds.
+    const [near, far] = host.camera.getClippingRange();
+    const distance = host.camera.getDistance();
+    if (distance >= far) host.camera.setClippingRange(near, 2 * distance);
     host.scheduleRender();
   }
+  let pendingPaint: Record<string, unknown> | undefined;
+  const trace = benchmarkParams?.has("benchmarkTrace")
+    ? (stage: string, detail: Record<string, unknown>) => {
+        performance.mark("tile-detail:" + stage, { detail });
+        if (stage === "commit") pendingPaint = detail;
+      }
+    : undefined;
+  if (trace) {
+    performance.setResourceTimingBufferSize(10000);
+    host.onFrame((view) => {
+      if (pendingPaint) {
+        trace("paint", { ...pendingPaint, drawnCamera: view.position });
+        pendingPaint = undefined;
+      }
+    });
+  }
+  const referenceLimit = benchmarkParams?.get("referenceSplatLimit");
   const gaussian = createGaussianContentAdapterFactory({
+    trace,
+    ...(referenceLimit == null
+      ? {}
+      : { maximumVisibleSplats: Number(referenceLimit) }),
     resourceBudgetBytes,
     getOpenGLRenderWindow: () => host.openGLRenderWindow,
     createSortBackend: (onIdleFailure) =>
@@ -846,7 +871,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       const member = createTiles3dMember(
         host.coordinator.context(host.renderer),
         config,
-        { ...host.tiles3dServices, createContentAdapter: gaussian },
+        { ...host.tiles3dServices, createContentAdapter: gaussian, trace },
       );
       const registration = host.coordinator.register(member, {
         id,

@@ -24,6 +24,7 @@ const { values } = parseArgs({
     gpu: { type: "boolean", default: false },
     coverage: { type: "boolean", default: false },
     checkpoints: { type: "boolean", default: false },
+    trace: { type: "boolean", default: false },
     "settled-reference": { type: "boolean", default: false },
     "prepare-assets": { type: "boolean", default: false },
     repeats: { type: "string", default: "1" },
@@ -291,6 +292,14 @@ const summary = (samples) => {
     peakEffectiveSse: peak("effectiveSse"),
     peakCacheEvictions: peak("cacheEvictions"),
     peakUploadBytes: peak("cumulativeUploadBytes"),
+    sampledPressureMs: samples.some(
+      (sample) => typeof sample.pressure === "boolean",
+    )
+      ? samples.reduce(
+          (total, sample) => total + (sample.pressure ? sample.intervalMs : 0),
+          0,
+        )
+      : null,
     pressureFrames: samples.some(
       (sample) => typeof sample.pressure === "boolean",
     )
@@ -490,6 +499,12 @@ try {
         );
         if (vtk) {
           entry.searchParams.set("harness", "1");
+          if (values.trace) entry.searchParams.set("benchmarkTrace", "1");
+          if (settledReference && test.referenceSplatLimit !== undefined)
+            entry.searchParams.set(
+              "referenceSplatLimit",
+              String(test.referenceSplatLimit),
+            );
           entry.searchParams.set(
             "benchmarkCamera",
             JSON.stringify(initialBenchmarkPose(test)),
@@ -549,6 +564,7 @@ try {
             coverage: values.coverage,
             checkpoints: values.checkpoints,
             settledReference,
+            trace: values.trace,
           },
         );
         await page.waitForFunction(
@@ -681,6 +697,27 @@ try {
             };
           }
         }
+        if (values.trace && vtk) {
+          record.detailTrace = await page.evaluate(() => ({
+            events: performance
+              .getEntriesByType("mark")
+              .filter(({ name }) => name.startsWith("tile-detail:"))
+              .map(({ name, startTime, detail }) => ({
+                stage: name.slice("tile-detail:".length),
+                at: startTime,
+                ...detail,
+              })),
+            requests: performance
+              .getEntriesByType("resource")
+              .filter(({ name }) => new URL(name).pathname.startsWith("/data/"))
+              .map(({ name, startTime, responseEnd, encodedBodySize }) => ({
+                url: name,
+                start: startTime,
+                end: responseEnd,
+                bytes: encodedBodySize,
+              })),
+          }));
+        }
         if (
           test.format === "cog" &&
           !requests.some(({ status, range }) => status === 206 && range)
@@ -696,15 +733,11 @@ try {
         )
           throw new Error("No visible content in any checkpoint");
         const seenResponses = new Set();
-        const requestKeys = new Map();
+        const repeated = new Set();
         for (const request of requests) {
           if (!request.status || request.status >= 400) continue;
           const key = request.path + "|" + (request.range ?? "");
-          if (seenResponses.has(key))
-            requestKeys.set(
-              request.phase,
-              (requestKeys.get(request.phase) ?? 0) + 1,
-            );
+          if (seenResponses.has(key)) repeated.add(request);
           seenResponses.add(key);
         }
         record.transport = Object.fromEntries(
@@ -712,11 +745,18 @@ try {
             const responses = requests.filter(
               (request) => request.phase === label && request.status,
             );
+            const repeats = responses.filter((response) =>
+              repeated.has(response),
+            );
             return [
               label,
               {
                 responses: responses.length,
-                repeatedResponses: requestKeys.get(label) ?? 0,
+                repeatedResponses: repeats.length,
+                repeatedDeclaredBytes: repeats.reduce(
+                  (total, response) => total + (response.bytes ?? 0),
+                  0,
+                ),
                 failedRequests: requests.filter(
                   (request) => request.phase === label && request.failed,
                 ).length,
@@ -744,8 +784,9 @@ try {
           JSON.stringify(record, null, 2) + "\n",
         );
       }
+      const { detailTrace: _trace, ...summaryRecord } = record;
       results.push({
-        ...record,
+        ...summaryRecord,
         phases: Object.fromEntries(
           Object.entries(record.phases).map(
             ([label, { samples: _samples, ...metrics }]) => [label, metrics],
