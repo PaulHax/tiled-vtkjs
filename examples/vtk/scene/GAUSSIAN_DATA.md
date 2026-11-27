@@ -68,7 +68,8 @@ The canonical endpoint redirects to expiring Vercel Blob URLs. Its redirect
 response does not provide the CORS headers required by a browser request from
 localhost. The example's Vite development and preview servers expose
 `/gaussian-city/` as a same-origin, read-only proxy for this one preset.
-Relative content URLs continue to resolve beneath that route.
+The Netlify edge function serves the same route on the hosted demo and deploy
+previews. Relative content URLs continue to resolve beneath that route.
 
 The proxy follows redirects server-side and streams response bodies. It accepts
 only `GET` and `HEAD` for the manifest, build summary, and numeric GLB tile

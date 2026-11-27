@@ -26,6 +26,7 @@ beforeAll(async () => {
     );
   server = await startStaticServer({
     "/fixture": directory,
+    "/point-fixture": resolve("test/fixtures"),
     "/": resolve("examples/vtk/dist"),
   });
   browser = await chromium.launch({ headless: true });
@@ -35,7 +36,7 @@ afterAll(async () => {
   await server?.close();
   if (directory) await rm(directory, { recursive: true, force: true });
 });
-const open = async () => {
+const open = async (source: "tiles" | "points" = "tiles") => {
   const page = await browser.newPage();
   const workers = new Set<Worker>();
   const failures: string[] = [];
@@ -44,9 +45,15 @@ const open = async () => {
     worker.on("close", () => workers.delete(worker));
   });
   page.on("pageerror", (error) => failures.push(error.message));
-  await page.goto(
-    `${server.origin}/?harness=1&tiles=${encodeURIComponent(`${server.origin}/fixture/tileset.json`)}`,
-  );
+  const url = new URL(server.origin);
+  url.searchParams.set("harness", "1");
+  if (source === "points")
+    url.searchParams.set(
+      "url",
+      `${server.origin}/point-fixture/fixture.copc.laz`,
+    );
+  else url.searchParams.set("tiles", `${server.origin}/fixture/tileset.json`);
+  await page.goto(url.href);
   await page.locator("#dataset-list .dataset-heading select").waitFor();
   await page.waitForFunction(() => "pointCloudScene" in globalThis);
   return { page, workers, failures };
@@ -101,6 +108,47 @@ const gate = () => {
     started: () => started(),
   };
 };
+it("shows a failed Gaussian choice and lets the user retry from the point cloud", async () => {
+  const { page, failures } = await open("points");
+  const held = gate();
+  const dropdown = page.locator(".dataset-source-select");
+  const status = page.locator(".dataset-switch-status");
+  const label = "Jastrzębia Góra, Poland · 103.5M splats";
+  try {
+    const original = await dropdown.inputValue();
+    expect(original).toContain("fixture.copc.laz");
+    await page.route(
+      "**/gaussian-city/tileset.json",
+      async (route) => {
+        held.started();
+        await held.waiting;
+        await route.fulfill({ status: 404 });
+      },
+      { times: 1 },
+    );
+    await dropdown.selectOption({ label });
+    await held.ready;
+    expect(await dropdown.locator("option:checked").textContent()).toBe(label);
+    expect(await status.textContent()).toBe("Loading selected dataset…");
+    held.release();
+    await expect.poll(() => status.textContent()).toContain("HTTP 404");
+    expect(await dropdown.inputValue()).toBe(original);
+    await page.route("**/gaussian-city/tileset.json", (route) =>
+      route.fulfill({ json: manifest(6378137) }),
+    );
+    await dropdown.selectOption({ label });
+    await page.getByRole("combobox", { name: `Change ${label}` }).waitFor();
+    expect(await page.locator("#dataset-list > .dataset-card").count()).toBe(1);
+    expect(new URL(page.url()).searchParams.get("tiles")).toContain(
+      "JastrebiaGora",
+    );
+    expect(failures).toEqual([]);
+  } finally {
+    held.release();
+    await page.close();
+  }
+});
+
 const custom = async (
   page: Page,
   kind: "tiles" | "points",
