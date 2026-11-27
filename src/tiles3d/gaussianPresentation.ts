@@ -169,6 +169,7 @@ type GaussianAttributePlan<Range extends GaussianPackedRange> = {
   uploadTuplesPerStep: (bytes: number) => number;
   onAttributeUpload: (bytes: number) => void;
   onOrderUpload: (bytes: number) => void;
+  onGeometryRange?: (range: Range) => void;
 };
 
 /** Stage geometry into unaccepted ranges and colors and order into the next draw bank. */
@@ -183,6 +184,7 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
   uploadTuplesPerStep,
   onAttributeUpload,
   onOrderUpload,
+  onGeometryRange,
 }: GaussianAttributePlan<Range>) {
   const capacity = attributes.positions.length / 3;
   const draw = gpu?.next();
@@ -206,8 +208,10 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
         uploadTuplesPerStep,
         onAttributeUpload,
       );
-    for (const { allocationRevision } of dirtyGeometry)
-      gpu.geometryRanges.add(allocationRevision);
+    for (const range of dirtyGeometry) {
+      gpu.geometryRanges.add(range.allocationRevision);
+      onGeometryRange?.(range);
+    }
   }
 
   const colorUpdates: [number, number][] = [];

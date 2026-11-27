@@ -1353,6 +1353,16 @@ const createManager = (
         onAttributeUpload: (bytes) => {
           attributeUploadBytes += bytes;
         },
+        onGeometryRange:
+          trace &&
+          ((range) =>
+            trace("geometry-upload", {
+              revision: snapshot.revision,
+              tile: range.tile.id,
+              allocation: range.allocationRevision,
+              count: range.count,
+              bytes: range.count * 40,
+            })),
         onOrderUpload: (bytes) => {
           orderUploadBytes += bytes;
         },
@@ -1663,7 +1673,17 @@ const createManager = (
         value,
         ranges,
         tuplesPerStep(GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE),
-        scheduleRefresh,
+        trace
+          ? (range, source) => {
+              trace("range-packed", {
+                tile: range.tile.id,
+                allocation: range.allocationRevision,
+                count: range.count,
+                source,
+              });
+              scheduleRefresh();
+            }
+          : scheduleRefresh,
         previous && copies.size
           ? { storage: previous, ranges: copies }
           : undefined,

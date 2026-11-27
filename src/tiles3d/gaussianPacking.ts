@@ -29,11 +29,11 @@ type PackingStorage = GaussianAttributes & {
   origin: readonly [number, number, number];
 };
 
-export function* packGaussianRanges(
+export function* packGaussianRanges<Range extends GaussianPackedRange>(
   storage: PackingStorage,
-  ranges: readonly GaussianPackedRange[],
+  ranges: readonly Range[],
   tuplesPerStep: number,
-  onPacked: () => void,
+  onPacked: (range: Range, source: "copy" | "transform") => void,
   reusable?: {
     storage: PackingStorage;
     ranges: ReadonlyMap<GaussianPackedRange, GaussianPackedRange>;
@@ -81,7 +81,7 @@ export function* packGaussianRanges(
                 offset,
                 count,
               );
-              onPacked();
+              onPacked(packed, "copy");
             } else storage.arena.markPartial(allocationRevision, end, bounds);
           },
         };
@@ -153,7 +153,7 @@ export function* packGaussianRanges(
           }
           if (end === count) {
             storage.arena.markPacked(allocationRevision, bounds, offset, count);
-            onPacked();
+            onPacked(packed, "transform");
           } else storage.arena.markPartial(allocationRevision, end, bounds);
         },
       };
