@@ -140,6 +140,7 @@ function* uploadRanges(
   ranges: readonly [number, number][],
   tuplesPerStep: (bytes: number) => number,
   onUpload: (bytes: number) => void,
+  onWrite?: (offset: number, count: number) => void,
 ) {
   const bytesPerTuple = components * values.BYTES_PER_ELEMENT;
   const step = tuplesPerStep(bytesPerTuple);
@@ -153,6 +154,7 @@ function* uploadRanges(
         run() {
           bank.write(name, values, components, capacity, offset + first, size);
           onUpload(bytes);
+          onWrite?.(offset + first, size);
         },
       };
     }
@@ -169,7 +171,13 @@ type GaussianAttributePlan<Range extends GaussianPackedRange> = {
   uploadTuplesPerStep: (bytes: number) => number;
   onAttributeUpload: (bytes: number) => void;
   onOrderUpload: (bytes: number) => void;
-  onGeometryRange?: (range: Range) => void;
+  onGeometryUpload?: (
+    range: Range,
+    name: string,
+    offset: number,
+    count: number,
+    bytes: number,
+  ) => void;
 };
 
 /** Stage geometry into unaccepted ranges and colors and order into the next draw bank. */
@@ -184,7 +192,7 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
   uploadTuplesPerStep,
   onAttributeUpload,
   onOrderUpload,
-  onGeometryRange,
+  onGeometryUpload,
 }: GaussianAttributePlan<Range>) {
   const capacity = attributes.positions.length / 3;
   const draw = gpu?.next();
@@ -193,11 +201,15 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
       ({ allocationRevision }) => !gpu.geometryRanges.has(allocationRevision),
     );
     const updates = contiguousTupleRanges(dirtyGeometry);
+    const tracedRanges =
+      onGeometryUpload &&
+      [...dirtyGeometry].sort((a, b) => a.offset - b.offset);
     for (const [name, values, components] of [
       ["pointPositions", attributes.positions, 3],
       ["pointRadius", attributes.scales, 3],
       ["pointRotation", attributes.rotations, 4],
-    ] as const)
+    ] as const) {
+      let index = 0;
       yield* uploadRanges(
         gpu.geometry,
         name,
@@ -207,11 +219,33 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
         updates,
         uploadTuplesPerStep,
         onAttributeUpload,
+        tracedRanges &&
+          onGeometryUpload &&
+          ((offset, count) => {
+            const end = offset + count;
+            // A single texture write can span several adjacent tile allocations.
+            while (index < tracedRanges.length) {
+              const range = tracedRanges[index]!;
+              if (range.offset >= end) break;
+              const rangeEnd = range.offset + range.count;
+              const start = Math.max(offset, range.offset);
+              const size = Math.min(end, rangeEnd) - start;
+              if (size > 0)
+                onGeometryUpload(
+                  range,
+                  name,
+                  start,
+                  size,
+                  size * components * values.BYTES_PER_ELEMENT,
+                );
+              if (rangeEnd > end) break;
+              index++;
+            }
+          }),
       );
-    for (const range of dirtyGeometry) {
-      gpu.geometryRanges.add(range.allocationRevision);
-      onGeometryRange?.(range);
     }
+    for (const range of dirtyGeometry)
+      gpu.geometryRanges.add(range.allocationRevision);
   }
 
   const colorUpdates: [number, number][] = [];
