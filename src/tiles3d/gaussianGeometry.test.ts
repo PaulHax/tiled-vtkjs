@@ -4,7 +4,7 @@ import { IDENTITY } from "../core/mat4";
 import type { DecodedGaussianPrimitive } from "./decode";
 import { decodeSpzGaussian } from "./decode/spz";
 import {
-  createGaussianShapeWriter,
+  createGaussianShapeTransform,
   gaussianModelCamera,
   transformedGaussianShape,
   writeGaussianColor,
@@ -64,20 +64,12 @@ describe("Gaussian placement and appearance", () => {
 
   it("uses the same shape for a rigid placement through the fast path", () => {
     const matrix = [0, 2, 0, 0, -2, 0, 0, 0, 0, 0, 2, 0, 6000000, 10, 20, 1];
-    const scales = new Float32Array(6);
-    const rotations = new Float32Array(8);
-    const write = createGaussianShapeWriter(
-      matrix,
-      new Float32Array([3, 2, 1]),
-      new Float32Array([0, 0, 0, 1]),
-      scales,
-      rotations,
-    );
-    write(0, 1);
-    expect([...scales]).toEqual([0, 0, 0, 6, 4, 2]);
-    expect(rotations[4]).toBeCloseTo(Math.SQRT1_2, 6);
-    expect(rotations[7]).toBeCloseTo(Math.SQRT1_2, 6);
-    expect(rotations.subarray(5, 7)).toEqual(new Float32Array(2));
+    const transform = createGaussianShapeTransform(matrix);
+    const shape = transform([3, 2, 1], [0, 0, 0, 1]);
+    expect(shape.scales).toEqual([6, 4, 2]);
+    expect(shape.rotation[0]).toBeCloseTo(Math.SQRT1_2, 14);
+    expect(shape.rotation[3]).toBeCloseTo(Math.SQRT1_2, 14);
+    expect(shape.rotation.slice(1, 3)).toEqual([0, 0]);
   });
 
   it("evaluates directional appearance in the placed primitive model frame", () => {
