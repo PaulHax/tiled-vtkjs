@@ -138,18 +138,25 @@ describe("explorer controls", () => {
     }
   });
 
-  it("says nothing is loaded until a dataset is added", async () => {
-    const session = await openScene({ path: "/index.html", headless: true });
+  it("shows the empty state after the last dataset is removed", async () => {
+    const session = await openScene({
+      path: "/index.html?url=/fixtures/fixture.copc.laz",
+      headless: true,
+    });
     try {
+      await session.page
+        .getByRole("button", { name: "Remove", exact: true })
+        .click();
+      await session.page
+        .getByRole("status", {
+          name: "Add a dataset to begin streaming",
+          exact: true,
+        })
+        .waitFor({ state: "visible" });
       expect(await session.page.locator("#message").textContent()).toBe(
         "Add a point cloud or 3D Tiles dataset.",
       );
       expect(await session.datasets()).toEqual([]);
-      expect(
-        await session.page
-          .locator("#governor-activity")
-          .getAttribute("aria-label"),
-      ).toBe("Add a dataset to begin streaming");
       expect(session.failures).toEqual([]);
     } finally {
       await session.close();
