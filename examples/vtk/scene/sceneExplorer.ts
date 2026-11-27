@@ -1160,7 +1160,7 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       : "current";
     if (![...select.options].some((option) => option.value === selectedValue)) {
       const current = document.createElement("option");
-      current.value = "current";
+      current.value = selectedValue;
       current.textContent = dataset.label;
       select.prepend(current);
     }
@@ -1172,24 +1172,43 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     for (const eventName of ["click", "pointerdown"]) {
       select.addEventListener(eventName, (event) => event.stopPropagation());
     }
+    const status = document.createElement("span");
+    status.className = "dataset-switch-status";
+    status.setAttribute("role", "status");
+    status.hidden = true;
+    let selection = 0;
+    const showStatus = (message: string) => {
+      status.textContent = message;
+      status.hidden = message === "";
+    };
     select.addEventListener("change", () => {
       const wanted = select.value;
-      select.value = selectedValue;
-      if (wanted === "custom") {
-        openDatasetDialog(dataset);
+      const revision = ++selection;
+      if (wanted === selectedValue || wanted === "custom") {
+        operations.cancel(dataset.card);
+        select.value = selectedValue;
+        showStatus("");
+        if (wanted === "custom") openDatasetDialog(dataset);
         return;
       }
       const location = parseLocation(wanted);
       const source = location ? sourceForLocation(location) : null;
       if (!source) return;
       sceneError = null;
+      showStatus("Loading selected dataset…");
       void replaceDataset(dataset, source).catch((error: unknown) => {
-        if (error instanceof DOMException && error.name === "AbortError")
+        if (revision !== selection || !dataset.card.isConnected) return;
+        select.value = selectedValue;
+        if (error instanceof DOMException && error.name === "AbortError") {
+          showStatus("");
           return;
-        sceneError = error instanceof Error ? error.message : String(error);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        showStatus(message);
       });
     });
     title.replaceWith(select);
+    select.parentElement!.append(status);
   }
 
   const closeDialog = (): void => {

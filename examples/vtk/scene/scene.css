@@ -172,6 +172,18 @@
   box-shadow: 0 0 0 2px rgba(72, 162, 215, 0.12);
 }
 
+.dataset-switch-status {
+  display: block;
+  margin-top: 4px;
+  color: #adc2d1;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.dataset-switch-status[hidden] {
+  display: none;
+}
+
 .dataset-heading strong {
   display: block;
   overflow: hidden;
