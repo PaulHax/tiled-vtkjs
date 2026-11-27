@@ -24,6 +24,7 @@ export function measureCheckpoint(
     crop[1] >= crop[3]
   )
     throw new Error("Quality crop must be a nonempty normalized rectangle");
+  let differentPixels = 0;
   let expectedPixels = 0,
     actualPixels = 0,
     sharedPixels = 0,
@@ -46,6 +47,12 @@ export function measureCheckpoint(
   for (let y = y0; y < y1; y++) {
     for (let x = x0; x < x1; x++) {
       const p = (y * width + x) * 3;
+      if (
+        actual[p] !== reference[p] ||
+        actual[p + 1] !== reference[p + 1] ||
+        actual[p + 2] !== reference[p + 2]
+      )
+        differentPixels++;
       const expected = foreground(reference, p);
       const drawn = foreground(actual, p);
       expectedPixels += Number(expected);
@@ -69,6 +76,8 @@ export function measureCheckpoint(
     }
   }
   return {
+    pixels: (x1 - x0) * (y1 - y0),
+    differentPixels,
     coverageRecall: expectedPixels ? sharedPixels / expectedPixels : null,
     coveragePrecision: actualPixels ? sharedPixels / actualPixels : 0,
     meanLinearRgbError: unionPixels ? rgbError / (unionPixels * 3) : null,

@@ -79,7 +79,7 @@ The route-start marker aligns them with the authored camera phases. Follow tile
 IDs from selection into sort-target revisions, and match the revision and camera
 position for each result and publication. Preparation costs separate time spent
 running each step from time waiting for admission. Texture times measure CPU
-submission. Capture frame timing in a separate run with tracing disabled. To inspect the fallback covering a
+submission. Each geometry-upload event records the portion of a completed texture write within one tile allocation, including writes made before a preparation is canceled. Sum bytes across events for transferred geometry. Capture frame timing in a separate run with tracing disabled. To inspect the fallback covering a
 particular explicit leaf tile, run
 `node test/reference-viewers/summarize-detail.mjs <report.json> <tile-path>`.
 Times in the coverage history are relative to route start. A missing timestamp

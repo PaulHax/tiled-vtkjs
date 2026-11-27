@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { parseArgs } from "node:util";
 import sharp from "sharp";
 import {
   measureCheckpoint,
@@ -8,10 +9,15 @@ import {
   recoveryOffsets,
 } from "./quality.mjs";
 
-const [runFile, oracleFile, policyFile] = process.argv.slice(2);
+const { values, positionals } = parseArgs({
+  options: { "exact-settled": { type: "string" } },
+  allowPositionals: true,
+});
+const labelToMatch = values["exact-settled"];
+const [runFile, oracleFile, policyFile] = positionals;
 if (!runFile || !oracleFile || !policyFile)
   throw new Error(
-    "Usage: node score-checkpoints.mjs <quality run> <converged oracle> <calibrated policy>",
+    "Usage: node score-checkpoints.mjs [--exact-settled label] <run> <converged oracle> <calibrated policy>",
   );
 const json = async (path) => JSON.parse(await readFile(path, "utf8"));
 const [run, oracle, policy] = await Promise.all(
@@ -27,8 +33,13 @@ if (
   JSON.stringify(run.clearColor) !== JSON.stringify(oracle.clearColor) ||
   run.viewer !== oracle.viewer ||
   run.gpu !== oracle.gpu ||
-  JSON.stringify(run.options.route) !== JSON.stringify(oracle.options.route) ||
-  run.timingMode !== "coverage readback" ||
+  (labelToMatch === undefined &&
+    JSON.stringify(run.options.route) !==
+      JSON.stringify(oracle.options.route)) ||
+  run.timingMode !==
+    (labelToMatch === undefined
+      ? "coverage readback"
+      : "settled quality reference") ||
   oracle.timingMode !== "settled quality reference"
 )
   throw new Error(
@@ -85,6 +96,22 @@ const compare = async (label, candidate, reference, { crop, ...limits }) => {
       full.coveragePrecision >= limits.minimumPrecision,
   };
 };
+if (labelToMatch !== undefined) {
+  const rule = policy.checkpoints[labelToMatch];
+  if (!rule) throw new Error("Unknown checkpoint " + labelToMatch);
+  const find = (record) =>
+    record.checkpoints.find(({ label }) => label === labelToMatch);
+  const { pixels, differentPixels } = await compare(
+    labelToMatch,
+    find(run),
+    find(oracle),
+    rule,
+  );
+  console.log(
+    JSON.stringify({ label: labelToMatch, pixels, differentPixels }, null, 2),
+  );
+  process.exit(differentPixels ? 1 : 0);
+}
 const checkpoints = [];
 const recovery = [];
 const rules = Object.entries(policy.checkpoints);

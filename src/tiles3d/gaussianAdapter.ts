@@ -1353,15 +1353,17 @@ const createManager = (
         onAttributeUpload: (bytes) => {
           attributeUploadBytes += bytes;
         },
-        onGeometryRange:
+        onGeometryUpload:
           trace &&
-          ((range) =>
+          ((range, attribute, offset, count, bytes) =>
             trace("geometry-upload", {
               revision: snapshot.revision,
               tile: range.tile.id,
               allocation: range.allocationRevision,
-              count: range.count,
-              bytes: range.count * 40,
+              attribute,
+              offset,
+              count,
+              bytes,
             })),
         onOrderUpload: (bytes) => {
           orderUploadBytes += bytes;

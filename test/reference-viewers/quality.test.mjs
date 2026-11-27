@@ -25,6 +25,25 @@ const score = (candidate) =>
 test("a stable exact-pose capture passes all quality gates", () => {
   expect(passesQuality(score(reference), limits)).toBe(true);
 });
+test("exact crop comparison counts changed RGB pixels including the background", () => {
+  const original = image(() => 0);
+  const changed = original.slice();
+  changed[0] = 1;
+  changed[(8 * size + 8) * 3 + 2] = 1;
+  expect(
+    measureCheckpoint(
+      changed,
+      original,
+      size,
+      size,
+      [0, 0, 0],
+      [0.25, 0.25, 0.75, 0.75],
+    ),
+  ).toMatchObject({
+    pixels: 256,
+    differentPixels: 1,
+  });
+});
 test("quality gates reject blank, blurred, coarsened, and stale appearances", () => {
   const variants = {
     blank: image(() => 0),

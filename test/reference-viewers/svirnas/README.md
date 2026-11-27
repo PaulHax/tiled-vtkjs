@@ -32,9 +32,30 @@ PY
 p=artifacts/svirnas-capture-results
 mkdir -p "$p"
 node test/reference-viewers/recorded-route.mjs test/reference-viewers/svirnas/scene.json "$p/route.json"
-node test/reference-viewers/run.mjs --manifest "$p/route.json" --case vtk-sse-12 --case three-sse-12 --gpu --latency 40 --mbps 80 --coverage --checkpoints --out "$p/motion"
+node test/reference-viewers/run.mjs --manifest "$p/route.json" --case vtk-sse-12 --case three-sse-12 --repeats 3 --gpu --latency 40 --mbps 80 --coverage --checkpoints --out "$p/motion"
 node test/reference-viewers/run.mjs --manifest "$p/route.json" --case vtk-sse-6-reference --gpu --latency 40 --mbps 80 --coverage --checkpoints --settled-reference --out "$p/reference"
-node test/reference-viewers/score-checkpoints.mjs "$p/motion/vtk-sse-12-1.json" "$p/reference/vtk-sse-6-reference-1-settled-reference.json" test/reference-viewers/svirnas/policy.json
+oracle="$p/reference/vtk-sse-6-reference-1-settled-reference.json"
+policy=test/reference-viewers/svirnas/policy.json
+
+# Hold the timed configuration at the roof pose until it converges.
+python3 - "$p/route.json" "$p/roof.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+route = json.loads(Path(sys.argv[1]).read_text())
+for case in route["cases"]:
+    case["route"]["checkpoints"] = [
+        point for point in case["route"]["checkpoints"] if point[1] == "inspect-a"
+    ]
+Path(sys.argv[2]).write_text(json.dumps(route))
+PY
+node test/reference-viewers/run.mjs --manifest "$p/roof.json" --case vtk-sse-12 --gpu --latency 40 --mbps 80 --coverage --checkpoints --settled-reference --out "$p/settled"
+node test/reference-viewers/score-checkpoints.mjs --exact-settled inspect-a "$p/settled/vtk-sse-12-1-settled-reference.json" "$oracle" "$policy"
+
+for run in "$p"/motion/vtk-sse-12-[123].json; do
+  node test/reference-viewers/score-checkpoints.mjs "$run" "$oracle" "$policy"
+done
 ```
 
 The scorer reports each stop independently and exits with status 1 if any gate misses. The timed run uses SSE 12 and 256 MiB. Only the reference uses SSE 6, 768 MiB and a six-million-splat limit. Capture hardware was a laptop RTX 3000 Ada with ANGLE D3D11 at 960 × 720. Latency and throughput shaping apply per request.
