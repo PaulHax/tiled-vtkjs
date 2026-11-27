@@ -97,6 +97,8 @@ export type GaussianContentAdapterFactory = TileContentAdapterFactory & {
 };
 
 export type GaussianContentAdapterFactoryOptions = {
+  /** Optional diagnostic sink for the selection-to-paint benchmark. */
+  trace?: (stage: string, detail: Record<string, unknown>) => void;
   /** Creates a fresh backend for first use and after worker failure. */
   createSortBackend?: (
     onIdleFailure: (error: GaussianSortWorkerError) => void,
@@ -450,6 +452,7 @@ export const createGaussianContentAdapterFactory = (
         budget,
         configuration.createSortBackend,
         configuration.getOpenGLRenderWindow,
+        configuration.trace,
       );
       managers.set(renderer, manager);
     }
@@ -469,13 +472,67 @@ export const createGaussianContentAdapterFactory = (
   return factory;
 };
 
+function* tracePresentationSteps(
+  steps: Iterable<{
+    stage?: string;
+    bytes: number;
+    requiresPaint?: boolean;
+    run(): void;
+  }>,
+  context: Record<string, unknown>,
+  trace: NonNullable<GaussianContentAdapterFactoryOptions["trace"]>,
+) {
+  const totals = new Map<
+    string,
+    { activeMs: number; waitMs: number; bytes: number; jobs: number }
+  >();
+  try {
+    for (const step of steps) {
+      const queued = performance.now();
+      yield {
+        ...step,
+        run() {
+          const start = performance.now();
+          try {
+            step.run();
+          } finally {
+            const stage =
+              step.stage ?? (step.requiresPaint ? "commit" : "pack");
+            const total = totals.get(stage) ?? {
+              activeMs: 0,
+              waitMs: 0,
+              bytes: 0,
+              jobs: 0,
+            };
+            total.waitMs += start - queued;
+            total.activeMs += performance.now() - start;
+            total.bytes += step.bytes;
+            total.jobs++;
+            totals.set(stage, total);
+          }
+        },
+      };
+    }
+  } finally {
+    trace("preparation-cost", {
+      ...context,
+      stages: Object.fromEntries(totals),
+    });
+  }
+}
+
 const createManager = (
   firstOptions: TileContentAdapterOptions,
   maximum: number,
   budget: number,
   createBackend?: GaussianContentAdapterFactoryOptions["createSortBackend"],
   getOpenGLRenderWindow?: TileContentAdapterOptions["getOpenGLRenderWindow"],
+  observer?: GaussianContentAdapterFactoryOptions["trace"],
 ) => {
+  const trace =
+    observer &&
+    ((stage: string, detail: Record<string, unknown>) =>
+      safeCall(() => observer(stage, detail)));
   const owners = new Set<Owner>();
   const submissions = firstOptions.submissions;
   const maxBytes = submissions.stats().maxBytesPerFrame;
@@ -509,6 +566,7 @@ const createManager = (
     dirty = false,
     pendingSort = false;
   let camera: CameraView | null = null;
+  let cameraRevision = 0;
   let storage: Storage | null = null,
     candidate: Storage | null = null;
   let sortTarget: SortTarget | null = null;
@@ -957,6 +1015,7 @@ const createManager = (
   };
   const cancelPublication = (): void => {
     if (!publication) return;
+    trace?.("cancel", { revision: publication.snapshot.revision });
     publication.job.cancel();
     publication.scratch?.release();
     publication = null;
@@ -1256,6 +1315,10 @@ const createManager = (
       sortFailure(error);
       wakeIdle();
     };
+    trace?.("prepare", {
+      revision: snapshot.revision,
+      camera: presentation.cameraPosition,
+    });
     const steps = function* () {
       const maximumId = yield* stageGaussianOrder(
         snapshot.primitives,
@@ -1319,6 +1382,10 @@ const createManager = (
               textures,
               gpu,
             );
+            trace?.("commit", {
+              revision: snapshot.revision,
+              camera: presentation.cameraPosition,
+            });
             if (newerPublication) {
               newerPublication = false;
               scheduleRefresh();
@@ -1337,7 +1404,16 @@ const createManager = (
       scratch,
       job: enqueueSubmissionSteps(
         submissions,
-        steps(),
+        trace
+          ? tracePresentationSteps(
+              steps(),
+              {
+                revision: snapshot.revision,
+                camera: presentation.cameraPosition,
+              },
+              trace,
+            )
+          : steps(),
         failPublication,
         noteProgress,
       ),
@@ -1423,6 +1499,12 @@ const createManager = (
           try {
             let pending: Promise<Uint32Array>;
             try {
+              trace?.("dispatch", {
+                revision: snapshot?.revision,
+                scene: job.sceneRevision,
+                camera: job.cameraPosition,
+                count,
+              });
               pending = backend.sort(job);
             } catch (cause) {
               throw new GaussianSortWorkerError(
@@ -1431,6 +1513,12 @@ const createManager = (
               );
             }
             const order = await pending;
+            trace?.("result", {
+              revision: snapshot?.revision,
+              scene: job.sceneRevision,
+              camera: job.cameraPosition,
+              bytes: order.byteLength,
+            });
             workerRestarted = false;
             return order;
           } catch (error) {
@@ -1592,7 +1680,13 @@ const createManager = (
       storage: value,
       job: enqueueSubmissionSteps(
         submissions,
-        steps(),
+        trace
+          ? tracePresentationSteps(
+              steps(),
+              { tiles: value.tiles.map((tile) => tile.id) },
+              trace,
+            )
+          : steps(),
         (error) => {
           packing = null;
           sortFailure(error);
@@ -1769,6 +1863,12 @@ const createManager = (
       owners: planned.owners,
       count: visible,
     };
+    trace?.("sort-target", {
+      revision: snapshot.revision,
+      tiles: [...snapshot.tiles.keys()].map((tile) => tile.id),
+      count: visible,
+      camera: camera.position,
+    });
     sortTarget = { storage: targetStorage, memory: targetMemory, snapshot };
     if (publication && !compatible(publication.snapshot, publication))
       cancelPublication();
@@ -2750,6 +2850,11 @@ const createManager = (
             camera.position.some(
               (value, index) => value !== view.position[index],
             );
+          if (moved && trace)
+            trace("camera", {
+              cameraRevision: ++cameraRevision,
+              camera: view.position,
+            });
           camera = { ...view, position: [...view.position] };
           if (!sortTarget) scheduleRefresh();
           else if (moved && sortTarget.snapshot.count && !sortUnavailable) {

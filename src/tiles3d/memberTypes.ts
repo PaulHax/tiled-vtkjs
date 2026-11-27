@@ -73,6 +73,7 @@ export type GeometricErrorScale = "maximum" | "horizontal";
 export type Tiles3dMemberServices = {
   /** Caller-owned pool. Dispose it after disposing every member that uses it. */
   readonly workers: DecodeWorkerPoolHandle;
+  readonly trace?: (stage: string, detail: Record<string, unknown>) => void;
   readonly textureCapabilities: TextureCapabilities;
   /** View-owned realization, shared across members when the renderer needs global order. */
   readonly createContentAdapter?: TileContentAdapterFactory;
