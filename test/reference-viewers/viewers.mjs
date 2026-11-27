@@ -22,6 +22,23 @@ export async function threeViewer(config) {
   if (config.viewer === "three-tiles") {
     const { TilesRenderer } = await import("3d-tiles-renderer");
     const tiles = new TilesRenderer(config.url);
+    if (config.format === "3d-tiles") {
+      const [{ DRACOLoader }, { KTX2Loader }, { GLTFExtensionsPlugin }] =
+        await Promise.all([
+          import("three/addons/loaders/DRACOLoader.js"),
+          import("three/addons/loaders/KTX2Loader.js"),
+          import("3d-tiles-renderer/plugins"),
+        ]);
+      const dracoLoader = new DRACOLoader(tiles.manager).setDecoderPath(
+        "/tiles3d-codecs/",
+      );
+      const ktxLoader = new KTX2Loader(tiles.manager)
+        .setTranscoderPath("/three-basis/")
+        .detectSupport(renderer);
+      tiles.registerPlugin(
+        new GLTFExtensionsPlugin({ dracoLoader, ktxLoader }),
+      );
+    }
     tiles.errorTarget = config.sse ?? 8;
     if (config.loadAncestors !== undefined)
       tiles.loadAncestors = config.loadAncestors;
@@ -46,6 +63,16 @@ export async function threeViewer(config) {
       tiles.registerPlugin(new TilesFadePlugin());
       tiles.registerPlugin(new GaussianSplatPlugin());
     }
+    if (config.format === "pnts" && config.pointSize !== undefined) {
+      tiles.addEventListener("load-model", ({ scene: model }) =>
+        model.traverse((object) => {
+          if (!object.isPoints) return;
+          object.material.size = config.pointSize;
+          object.material.sizeAttenuation = false;
+          object.material.needsUpdate = true;
+        }),
+      );
+    }
     let tileError;
     tiles.addEventListener("load-error", (event) => {
       tileError = event.error;
@@ -56,6 +83,8 @@ export async function threeViewer(config) {
       tiles.update();
     };
     stats = () => ({
+      drawnPoints: renderer.info.render.points,
+      drawCalls: renderer.info.render.calls,
       selected: [...tiles.visibleTiles]
         .map((tile) => tile.content?.uri ?? tile.content?.url)
         .filter(Boolean)
@@ -119,6 +148,81 @@ export async function threeViewer(config) {
   };
 }
 
+async function deckTilesViewer(config) {
+  const [{ Deck, FirstPersonView }, { Tile3DLayer }, { Matrix4 }] =
+    await Promise.all([
+      import("@deck.gl/core"),
+      import("@deck.gl/geo-layers"),
+      import("@math.gl/core"),
+    ]);
+  // The benchmark camera and local tiles share an east-north-up frame at 0, 0.
+  const modelMatrix = new Matrix4([
+    0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 6378137, 0, 0, 1,
+  ]);
+  let tileset;
+  let failure;
+  const deck = new Deck({
+    parent: container(),
+    controller: false,
+    useDevicePixels: false,
+    views: new FirstPersonView({ fovy: verticalFov, near: 0.01, far: 1e8 }),
+    initialViewState: { latitude: 0, longitude: 0, position: [0, 0, 0] },
+    onError: (error) => {
+      failure = error;
+    },
+    layers: [
+      new Tile3DLayer({
+        id: "tiles",
+        data: config.url,
+        pointSize: (config.pointSize ?? 2) / 2,
+        loadOptions: {
+          tileset: {
+            modelMatrix,
+            maximumScreenSpaceError: config.sse ?? 8,
+            ...(config.memoryMiB === undefined
+              ? {}
+              : { maximumMemoryUsage: config.memoryMiB }),
+          },
+        },
+        onTilesetLoad: (loaded) => {
+          tileset = loaded;
+        },
+        onTileError: (_tile, url, message) => {
+          failure = new Error(url + ": " + message);
+        },
+      }),
+    ],
+  });
+  return {
+    canvas: () => deck.getCanvas(),
+    pose({ position, target, up }) {
+      const [east, north, vertical] = target.map((v, i) => v - position[i]);
+      deck.setProps({
+        viewState: {
+          longitude: 0,
+          latitude: 0,
+          position,
+          up,
+          focalDistance: Math.hypot(east, north, vertical),
+          bearing: (Math.atan2(east, north) * 180) / Math.PI,
+          pitch:
+            (-Math.atan2(vertical, Math.hypot(east, north)) * 180) / Math.PI,
+        },
+      });
+    },
+    stats() {
+      if (failure) throw failure;
+      const selected =
+        tileset?.selectedTiles.map((tile) => tile.contentUrl).sort() ?? [];
+      return {
+        ready: selected.length > 0,
+        selected,
+        settled: tileset?.isLoaded() ?? false,
+      };
+    },
+  };
+}
+
 export async function cesiumViewer(config) {
   globalThis.CESIUM_BASE_URL = "/cesium/";
   await new Promise((resolve, reject) => {
@@ -168,6 +272,10 @@ export async function cesiumViewer(config) {
       ? C.Transforms.eastNorthUpToFixedFrame(C.Cartesian3.fromDegrees(-77, 39))
       : C.Matrix4.IDENTITY;
   tiles.modelMatrix = placement;
+  if (config.format === "pnts" && config.pointSize !== undefined)
+    tiles.style = new C.Cesium3DTileStyle({
+      pointSize: String(config.pointSize),
+    });
   const point = (xyz) =>
     C.Matrix4.multiplyByPoint(
       placement,
@@ -359,6 +467,15 @@ export function tiledVtkViewer(config) {
     throw new Error(
       "The vtk.js build must support the benchmark camera and SSE options",
     );
+  if (config.format === "copc") {
+    const [{ id }] = scene.datasets();
+    if (config.pointSize !== undefined)
+      scene.settings.setPointSize(id, "fixed", config.pointSize);
+    if (config.pointBudget !== undefined) {
+      scene.settings.setFixedPointBudget(id, config.pointBudget);
+      scene.settings.setBudgetMode(id, "fixed");
+    }
+  }
   return {
     canvas: document.querySelector("canvas"),
     pose({ position, target, up }) {
@@ -370,18 +487,22 @@ export function tiledVtkViewer(config) {
       const member = snapshot.members[0]?.stats;
       if (member?.sourceState === "failed")
         throw new Error(member.lastError ?? "tiled-vtkjs source failed");
-      if (
-        config.sse !== undefined &&
-        member?.maximumScreenSpaceErrorPx !== config.sse
-      )
+      const configuredSse =
+        config.format === "copc"
+          ? member?.controller?.refinementCutoffPx
+          : member?.maximumScreenSpaceErrorPx;
+      if (config.sse !== undefined && configuredSse !== config.sse)
         throw new Error(
           "Requested SSE " +
             config.sse +
             " but vtk.js configured " +
-            member?.maximumScreenSpaceErrorPx,
+            configuredSse,
         );
       const stats = member?.renderer ?? member;
-      const activity = config.settledReference ? scene.activity() : null;
+      const activity =
+        config.settledReference || config.settleInitial
+          ? scene.activity()
+          : null;
       return {
         ready: (stats?.drawnTiles ?? 0) > 0 || (stats?.drawnPoints ?? 0) > 0,
         ...(activity
@@ -414,7 +535,7 @@ export function tiledVtkViewer(config) {
           (member?.blockedGroups ?? 0) > 0 ||
           member?.resourceState?.status === "blocked",
         blockedGroups: member?.blockedGroups,
-        configuredSse: member?.maximumScreenSpaceErrorPx,
+        configuredSse,
         effectiveSse: member?.effectiveScreenSpaceErrorPx,
         cacheHits: member?.queue?.cacheHits,
         cacheEvictions: member?.queue?.cacheEvictions,
@@ -447,6 +568,7 @@ export function tiledVtkViewer(config) {
 export const viewers = {
   "tiled-vtkjs": tiledVtkViewer,
   cesium: cesiumViewer,
+  "deck-tiles": deckTilesViewer,
   "three-tiles": threeViewer,
   "three-mesh": threeViewer,
   spark: threeViewer,

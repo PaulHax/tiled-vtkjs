@@ -8,6 +8,9 @@
   "dependencies": {
     "3d-tiles-renderer": "0.5.4",
     "3d-tiles-rendererjs-3dgs-plugin": "0.3.1",
+    "@deck.gl/core": "9.4.2",
+    "@deck.gl/geo-layers": "9.4.2",
+    "@math.gl/core": "4.1.1",
     "@sparkjsdev/spark": "2.4.0",
     "cesium": "1.144.0",
     "gaussian-splat-lite": "1.10.3",

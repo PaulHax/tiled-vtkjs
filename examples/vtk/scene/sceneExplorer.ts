@@ -674,6 +674,9 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       let autoSize = 0.5;
       let fixedSize = 2;
       let config: PointCloudMemberConfig = {
+        ...(benchmarkSse === undefined
+          ? {}
+          : { refinementCutoffPx: benchmarkSse }),
         source,
         presentation: pointPresentation("auto", 0.5),
         adaptive: true,

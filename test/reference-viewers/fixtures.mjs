@@ -1,3 +1,4 @@
+import { writePointTiles } from "./prepare-point-tiles.mjs";
 import { execFileSync } from "node:child_process";
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -356,6 +357,10 @@ export async function createFixtures(directory, here) {
     writePly(join(native, "fine.ply"), splats(0, 2, tint, 40)),
     writePly(join(native, "coarse.ply"), splats(0, 2, tint, 12)),
   ]);
+  const { origin: pointOrigin } = await writePointTiles(
+    join(directory, "multipage.copc.laz"),
+    join(directory, "point-tiles"),
+  );
   const single = join(directory, "single");
   await mkdir(single, { recursive: true });
   await copyFile(join(directory, "mesh", "root.glb"), join(single, "root.glb"));
@@ -370,8 +375,9 @@ export async function createFixtures(directory, here) {
     },
   });
   execFileSync(
-    resolve(here, "node_modules/.bin/splat-transform"),
+    process.execPath,
     [
+      resolve(here, "node_modules/@playcanvas/splat-transform/bin/cli.mjs"),
       "--overwrite",
       "-g",
       "cpu",
@@ -404,6 +410,14 @@ export async function createFixtures(directory, here) {
     panDegrees: 8,
   };
   const tests = [
+    [
+      "deck-tiles-mesh-tiles",
+      "deck-tiles",
+      "3d-tiles",
+      "mesh/tileset.json",
+      sceneCamera,
+      "mesh-tiles",
+    ],
     ...["tiled-vtkjs", "cesium", "three-tiles"].flatMap((viewer) => [
       [
         viewer + "-mesh-tiles",
@@ -446,6 +460,17 @@ export async function createFixtures(directory, here) {
       { ...pointCamera, target: [120, 220, 70] },
       "copc-points",
     ],
+    ...["three-tiles", "cesium", "deck-tiles"].map((viewer) => [
+      viewer + "-point-tiles",
+      viewer,
+      "pnts",
+      "point-tiles/tileset.json",
+      {
+        ...pointCamera,
+        target: [120, 220, 70].map((value, i) => value - pointOrigin[i]),
+      },
+      "copc-points",
+    ]),
     [
       "potree-points",
       "potree",
@@ -496,6 +521,7 @@ export async function createFixtures(directory, here) {
       asset,
       camera,
       workload,
+      ...(["copc", "pnts"].includes(format) ? { pointSize: 2, sse: 1 } : {}),
       ...(viewer === "maplibre" ? { maxZoom: 3 } : {}),
       ...(["3d-tiles", "gaussian-3d-tiles", "mesh-in-one-tile"].includes(format)
         ? { sse: 8 }

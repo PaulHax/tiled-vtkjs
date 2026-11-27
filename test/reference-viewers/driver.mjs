@@ -88,13 +88,30 @@ export async function initialize(config) {
   };
 
   const nextFrame = () => new Promise(requestAnimationFrame);
-  const ready = async () => {
-    for (;;) {
-      await nextFrame();
-      if (frame(config.route?.keyframes[0].slice(1) ?? [0, 0]).ready) return;
-    }
-  };
-  await ready();
+  const initialState = config.route?.keyframes[0].slice(1) ?? [0, 0];
+  let navigationToReadyMs;
+  let initialSettledMs;
+  let settledSince;
+  const initialStart = performance.now();
+  for (;;) {
+    const now = await nextFrame();
+    const snapshot = frame(initialState);
+    if (now - initialStart > 180000)
+      throw new Error("Viewer did not reach the initial benchmark pose");
+    if (snapshot.ready) navigationToReadyMs ??= performance.now();
+    if (snapshot.ready && !config.settleInitial) break;
+    if (snapshot.ready && snapshot.settled === undefined)
+      throw new Error(
+        "Initial convergence requires viewer settlement telemetry",
+      );
+    if (snapshot.ready && snapshot.settled) {
+      settledSince ??= now;
+      if (now - settledSince >= 500) {
+        initialSettledMs = performance.now();
+        break;
+      }
+    } else settledSince = undefined;
+  }
 
   const canvas =
     typeof viewer.canvas === "function" ? viewer.canvas() : viewer.canvas;
@@ -178,7 +195,8 @@ export async function initialize(config) {
       return captures;
     },
     gpu,
-    navigationToReadyMs: performance.now(),
+    navigationToReadyMs,
+    initialSettledMs,
     canvas: { width: canvas.width, height: canvas.height },
     async settleReference() {
       for (const [at, label] of config.route.checkpoints) {
@@ -193,6 +211,10 @@ export async function initialize(config) {
           const { ready, settled } = snapshot;
           const current = JSON.stringify([
             snapshot.selected,
+            snapshot.drawnTiles,
+            snapshot.drawnPoints,
+            snapshot.residentBytes,
+            snapshot.workReservedBytes,
             snapshot.readyRequests,
             snapshot.gaussianSorts,
             snapshot.frontierRebuilds,
