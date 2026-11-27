@@ -72,6 +72,7 @@ import { createSubmissionScheduler } from "../core/submissionScheduler";
 import { createGaussianContentAdapterFactory } from "./gaussianAdapter";
 import {
   createGaussianDistanceSorter,
+  resolveWorkerRanges,
   createGaussianSortWorkerBackend,
   type GaussianSortBackend,
   type GaussianSortRange,
@@ -343,7 +344,7 @@ const controlledSortWorkers = () => {
       postMessage(message) {
         const request = message as GaussianSortWorkerRequest;
         if (request.kind === "scene") {
-          ranges = request.ranges;
+          ranges = resolveWorkerRanges(ranges, request.ranges);
           return;
         }
         const deliver = worker.onmessage!;

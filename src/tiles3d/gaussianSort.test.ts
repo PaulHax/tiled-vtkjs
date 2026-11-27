@@ -464,7 +464,7 @@ describe("Gaussian sort worker backend", () => {
     const backend = createGaussianSortWorkerBackend(worker);
     const job: GaussianSortJob = {
       sceneRevision: 1,
-      ranges: [range("tile", [0, 0, 1])],
+      ranges: [{ ...range("tile", [0, 0, 1]), immutablePositions: true }],
       cameraPosition: [0, 0, 0],
     };
     const first = backend.sort(job);
@@ -490,10 +490,61 @@ describe("Gaussian sort worker backend", () => {
       "scene",
       "sort",
     ]);
+    expect(messages[3]).toMatchObject({
+      kind: "scene",
+      ranges: [{ id: "tile", positions: 0 }],
+    });
     backend.dispose();
     await expect(third).rejects.toThrow("disposed");
     expect(worker.terminate).toHaveBeenCalledOnce();
     expect(worker.onmessage).toBe(null);
+  });
+
+  it("resends mutable, replaced and regenerated position arrays", async () => {
+    const { worker, messages } = fakeWorker();
+    const backend = createGaussianSortWorkerBackend(worker);
+    const stable = { ...range("stable", [0, 0, 1]), immutablePositions: true };
+    const mutable = range("mutable", [1, 0, 0]);
+    const replaced = { ...stable, id: "replaced" };
+    const regenerated = {
+      ...stable,
+      id: "regenerated",
+      positions: stable.positions.slice(),
+    };
+    const initial = [replaced, mutable, stable, regenerated];
+    const next = [
+      { ...regenerated, generation: regenerated.generation + 1 },
+      stable,
+      { ...replaced, positions: replaced.positions.slice() },
+      mutable,
+    ];
+    try {
+      for (const [i, ranges] of [initial, next].entries()) {
+        const pending = backend.sort({
+          sceneRevision: i + 1,
+          ranges,
+          cameraPosition: [0, 0, 0],
+        });
+        worker.onmessage?.({
+          data: {
+            kind: "order",
+            jobId: i + 1,
+            order: new Uint32Array(ranges.length),
+          },
+        } as MessageEvent);
+        await pending;
+      }
+      const message = messages[2];
+      if (message?.kind !== "scene") throw new Error("Missing worker scene");
+      expect(message.ranges.map(({ positions }) => positions)).toEqual([
+        regenerated.positions,
+        2,
+        next[2]!.positions,
+        mutable.positions,
+      ]);
+    } finally {
+      backend.dispose();
+    }
   });
 
   it("contains a worker crash and rejects future dispatch", async () => {

@@ -11,6 +11,8 @@ export type GaussianSortRange = {
   id: string;
   generation: number;
   positions: Float32Array;
+  /** The position array stays immutable for this ID and generation across scenes. */
+  readonly immutablePositions?: boolean;
   modelToScene: Mat16;
 };
 
@@ -350,11 +352,28 @@ export type GaussianSortWorkerLike = {
   terminate(): void;
 };
 
+/** Numeric positions refer to a range in the immediately preceding worker scene. */
+type WireSortRange = Omit<GaussianSortRange, "positions"> & {
+  positions: Float32Array | number;
+};
+
+export const resolveWorkerRanges = (
+  previous: readonly GaussianSortRange[],
+  next: readonly WireSortRange[],
+): GaussianSortRange[] =>
+  next.map((range) => ({
+    ...range,
+    positions:
+      typeof range.positions === "number"
+        ? previous[range.positions]!.positions
+        : range.positions,
+  }));
+
 export type GaussianSortWorkerRequest =
   | {
       kind: "scene";
       sceneRevision: number;
-      ranges: readonly GaussianSortRange[];
+      ranges: readonly WireSortRange[];
     }
   | {
       kind: "sort";
@@ -367,13 +386,17 @@ export type GaussianSortWorkerResponse =
   | { kind: "order"; jobId: number; order: Uint32Array }
   | { kind: "error"; jobId: number; message: string };
 
-/** Owns and terminates one worker. Scene attributes are cloned once per revision. */
+/** Owns one worker and reuses immutable position ranges across scene revisions. */
 export const createGaussianSortWorkerBackend = (
   worker: GaussianSortWorkerLike,
   onIdleFailure?: (error: GaussianSortWorkerError) => void,
 ): GaussianSortBackend => {
   let disposed = false;
   let revision: number | null = null;
+  type WorkerRange = Pick<GaussianSortRange, "id" | "generation"> & {
+    index: number;
+  };
+  let previousPositions = new WeakMap<Float32Array, WorkerRange>();
   let sequence = 0;
   let pending: {
     id: number;
@@ -461,11 +484,22 @@ export const createGaussianSortWorkerBackend = (
         };
         try {
           if (revision !== job.sceneRevision) {
+            const nextPositions = new WeakMap<Float32Array, WorkerRange>();
+            const ranges = job.ranges.map((range, index) => {
+              if (!range.immutablePositions) return range;
+              const { positions, id, generation } = range;
+              const previous = previousPositions.get(positions);
+              nextPositions.set(positions, { index, id, generation });
+              return previous?.id === id && previous.generation === generation
+                ? { ...range, positions: previous.index }
+                : range;
+            });
             worker.postMessage({
               kind: "scene",
               sceneRevision: job.sceneRevision,
-              ranges: job.ranges,
+              ranges,
             } satisfies GaussianSortWorkerRequest);
+            previousPositions = nextPositions;
             revision = job.sceneRevision;
           }
           worker.postMessage({

@@ -1,5 +1,6 @@
 import {
   createGaussianDistanceSorter,
+  resolveWorkerRanges,
   type GaussianSortRange,
   type GaussianSortWorkerRequest,
   type GaussianSortWorkerResponse,
@@ -19,7 +20,7 @@ let sceneRevision: number | null = null;
 workerScope.onmessage = ({ data }) => {
   if (data.kind === "scene") {
     sceneRevision = data.sceneRevision;
-    ranges = data.ranges;
+    ranges = resolveWorkerRanges(ranges, data.ranges);
     return;
   }
   try {

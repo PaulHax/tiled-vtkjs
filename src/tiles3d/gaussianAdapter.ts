@@ -1872,6 +1872,7 @@ const createManager = (
       id: packed.id,
       generation: packed.tile.generation,
       positions: packed.primitive.positions,
+      immutablePositions: true,
       modelToScene: packed.matrix,
     }));
     const snapshot: SortSnapshot = {
