@@ -11,6 +11,8 @@ The benchmark gives each viewer an explicit camera path and serves local assets 
 | Native splat LOD       | `spark-splats`, `playcanvas-splats`                                                 | Shared source splats. Spark generates LOD from PLY in the smoke case and accepts paged RAD in custom cases. PlayCanvas uses Streamed SOG. |
 | Raster zoom            | `maplibre-raster`, `openlayers-cog`                                                 | XYZ raster tiles and an internally tiled COG with overviews. OpenLayers reads the COG by byte range.                                      |
 
+The [Svirnas roof comparison](./svirnas/README.md) includes matched crops, repeated close-up scores and the recorded camera path used to measure time to detail.
+
 ## Run the fixtures
 
 Run from the tiled-vtkjs worktree with Node 22.18 or later, the repository dependencies, and Chromium installed for Playwright. The fixture generator needs Python with NumPy and rasterio. Set `BENCHMARK_PYTHON` to the Python executable if those packages are in a virtual environment.

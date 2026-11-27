@@ -1,0 +1,56 @@
+{
+  "assetRoot": "../../../artifacts/svirnas-capture",
+  "cases": [
+    {
+      "id": "vtk-sse-12",
+      "viewer": "tiled-vtkjs",
+      "asset": "svirnas/tileset.json",
+      "format": "gaussian-3d-tiles",
+      "sse": 12,
+      "memoryMiB": 256,
+      "workload": "svirnas-real-scan",
+      "camera": {
+        "target": [-10, 3, 1],
+        "farDistance": 190,
+        "nearDistance": 13,
+        "direction": [0.18, -0.73, 0.68],
+        "panOffset": [21, 2, 0]
+      },
+      "measureDemand": true
+    },
+    {
+      "id": "three-sse-12",
+      "viewer": "three-tiles",
+      "asset": "svirnas/tileset.json",
+      "format": "gaussian-3d-tiles",
+      "sse": 12,
+      "memoryMiB": 256,
+      "workload": "svirnas-real-scan",
+      "camera": {
+        "target": [-10, 3, 1],
+        "farDistance": 190,
+        "nearDistance": 13,
+        "direction": [0.18, -0.73, 0.68],
+        "panOffset": [21, 2, 0]
+      }
+    },
+    {
+      "id": "vtk-sse-6-reference",
+      "viewer": "tiled-vtkjs",
+      "asset": "svirnas/tileset.json",
+      "format": "gaussian-3d-tiles",
+      "sse": 6,
+      "memoryMiB": 768,
+      "workload": "svirnas-real-scan",
+      "camera": {
+        "target": [-10, 3, 1],
+        "farDistance": 190,
+        "nearDistance": 13,
+        "direction": [0.18, -0.73, 0.68],
+        "panOffset": [21, 2, 0]
+      },
+      "measureDemand": true,
+      "referenceSplatLimit": 6000000
+    }
+  ]
+}
