@@ -1,0 +1,186 @@
+{
+  "rendererRevision": "5161788aa90206782799cc40d6953732feb131e8",
+  "viewer": "tiled-vtkjs",
+  "roofPose": {
+    "target": [-10, 3, 1],
+    "up": [0, 0, 1],
+    "position": [-7.691750877424369, -6.361232552667836, 9.720052240841271]
+  },
+  "drawingBuffer": {
+    "width": 960,
+    "height": 720
+  },
+  "gpu": "ANGLE (NVIDIA, NVIDIA RTX 3000 Ada Generation Laptop GPU (0x00002838) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+  "sourceRevision": "86bf498a10158dabc2822d1b5f13ea858e26629e",
+  "runs": [
+    {
+      "run": 1,
+      "endOfHoldMs": 1645.6,
+      "endOfHold": {
+        "coverageRecall": 1,
+        "coveragePrecision": 1,
+        "meanLinearRgbError": 0.002044918310746791,
+        "edgeErrorRatio": 0.03141135019816844,
+        "passed": true
+      },
+      "endOfHoldPngSha256": "ed9cc89e9f4ed422317956e5380f529c9616f51957688d1f15b6844e2238f7bc",
+      "roofRecovery": {
+        "label": "inspect-a",
+        "recoveredMs": null,
+        "passed": false,
+        "lastObservedMs": 1296.5000000001864,
+        "samples": [
+          {
+            "atMs": 46.70000000037271,
+            "scheduledMs": 0,
+            "passed": false
+          },
+          {
+            "atMs": 296.400000000559,
+            "scheduledMs": 250,
+            "passed": false
+          },
+          {
+            "atMs": 546.5000000001864,
+            "scheduledMs": 500,
+            "passed": false
+          },
+          {
+            "atMs": 796.3000000000002,
+            "scheduledMs": 750,
+            "passed": false
+          },
+          {
+            "atMs": 1045.900000000559,
+            "scheduledMs": 1000,
+            "passed": false
+          },
+          {
+            "atMs": 1296.5000000001864,
+            "scheduledMs": 1250,
+            "passed": true
+          }
+        ]
+      },
+      "sustainedRecoveryByStop": {
+        "inspect-a": false,
+        "inspect-b": false,
+        "overview-return": false
+      }
+    },
+    {
+      "run": 2,
+      "endOfHoldMs": 1645.8,
+      "endOfHold": {
+        "coverageRecall": 1,
+        "coveragePrecision": 1,
+        "meanLinearRgbError": 0.0019712543242862853,
+        "edgeErrorRatio": 0.030202334222214522,
+        "passed": true
+      },
+      "endOfHoldPngSha256": "673ccb3f28736898fcb666ac3af3950a148e75213e7bf4c783fa8c0b062fa998",
+      "roofRecovery": {
+        "label": "inspect-a",
+        "recoveredMs": null,
+        "passed": false,
+        "lastObservedMs": 1296.0000000001864,
+        "samples": [
+          {
+            "atMs": 46.70000000037271,
+            "scheduledMs": 0,
+            "passed": false
+          },
+          {
+            "atMs": 296.7000000003727,
+            "scheduledMs": 250,
+            "passed": false
+          },
+          {
+            "atMs": 546.400000000559,
+            "scheduledMs": 500,
+            "passed": false
+          },
+          {
+            "atMs": 796.400000000559,
+            "scheduledMs": 750,
+            "passed": false
+          },
+          {
+            "atMs": 1046.0000000001864,
+            "scheduledMs": 1000,
+            "passed": false
+          },
+          {
+            "atMs": 1296.0000000001864,
+            "scheduledMs": 1250,
+            "passed": true
+          }
+        ]
+      },
+      "sustainedRecoveryByStop": {
+        "inspect-a": false,
+        "inspect-b": false,
+        "overview-return": false
+      }
+    },
+    {
+      "run": 3,
+      "endOfHoldMs": 1645.8,
+      "endOfHold": {
+        "coverageRecall": 1,
+        "coveragePrecision": 1,
+        "meanLinearRgbError": 0.046264072743884596,
+        "edgeErrorRatio": 0.6775283510822993,
+        "passed": false
+      },
+      "endOfHoldPngSha256": "a733048e1e67e91288e4ad051017f30ba830de3a9a4ce8b2993400f9e5f4eb55",
+      "roofRecovery": {
+        "label": "inspect-a",
+        "recoveredMs": null,
+        "passed": false,
+        "lastObservedMs": 1295.9000000003725,
+        "samples": [
+          {
+            "atMs": 46.700000000186265,
+            "scheduledMs": 0,
+            "passed": false
+          },
+          {
+            "atMs": 296.5,
+            "scheduledMs": 250,
+            "passed": false
+          },
+          {
+            "atMs": 547.3000000007451,
+            "scheduledMs": 500,
+            "passed": false
+          },
+          {
+            "atMs": 796.4000000003725,
+            "scheduledMs": 750,
+            "passed": false
+          },
+          {
+            "atMs": 1046.4000000003725,
+            "scheduledMs": 1000,
+            "passed": false
+          },
+          {
+            "atMs": 1295.9000000003725,
+            "scheduledMs": 1250,
+            "passed": false
+          }
+        ]
+      },
+      "sustainedRecoveryByStop": {
+        "inspect-a": false,
+        "inspect-b": false,
+        "overview-return": false
+      }
+    }
+  ],
+  "settledSse12VersusSettledSse6": {
+    "pixels": 183159,
+    "differentPixels": 0
+  }
+}

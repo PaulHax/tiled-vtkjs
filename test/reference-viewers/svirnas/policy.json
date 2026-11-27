@@ -1,0 +1,48 @@
+{
+  "background": [20, 23, 28],
+  "checkpoints": {
+    "inspect-a": {
+      "crop": [0.29, 0.21, 0.73, 0.81],
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35,
+      "maximumRecoveryMs": 1000
+    },
+    "orbit-a": {
+      "crop": [0.18, 0.18, 0.85, 0.85],
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35
+    },
+    "transfer": {
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35
+    },
+    "inspect-b": {
+      "crop": [0.24, 0.2, 0.78, 0.8],
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35,
+      "maximumRecoveryMs": 1000
+    },
+    "orbit-b": {
+      "crop": [0.18, 0.18, 0.85, 0.85],
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35
+    },
+    "overview-return": {
+      "minimumRecall": 0.95,
+      "minimumPrecision": 0.95,
+      "maximumColorError": 0.08,
+      "maximumEdgeError": 0.35,
+      "maximumRecoveryMs": 1000
+    }
+  }
+}
