@@ -369,9 +369,18 @@ export const createSceneHost = (
     devicePixelRatio: currentDevicePixelRatio,
   });
 
+  let previousCameraView: CameraView | undefined;
+  let previousCameraTime = -1;
   const cameraView = (): CameraView => {
     const width = Math.max(1, container.clientWidth);
     const height = Math.max(1, container.clientHeight);
+    if (
+      previousCameraView &&
+      previousCameraTime === camera.getMTime() &&
+      previousCameraView.viewportWidthCssPx === width &&
+      previousCameraView.viewportHeightCssPx === height
+    )
+      return previousCameraView;
     const common = {
       viewProj: transpose(
         camera.getCompositeProjectionMatrix(width / height, -1, 1),
@@ -380,7 +389,7 @@ export const createSceneHost = (
       viewportWidthCssPx: width,
       viewportHeightCssPx: height,
     };
-    return camera.getParallelProjection()
+    previousCameraView = camera.getParallelProjection()
       ? {
           ...common,
           projection: "orthographic",
@@ -391,6 +400,8 @@ export const createSceneHost = (
           projection: "perspective",
           fovY: (camera.getViewAngle() * Math.PI) / 180,
         };
+    previousCameraTime = camera.getMTime();
+    return previousCameraView;
   };
 
   /**
