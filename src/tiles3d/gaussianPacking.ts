@@ -1,6 +1,6 @@
 import type { DecodedGaussianPrimitive } from "./decode/types";
 import {
-  createGaussianShapeWriter,
+  createGaussianShapeTransform,
   writeGaussianColor,
 } from "./gaussianGeometry";
 import {
@@ -89,13 +89,7 @@ export function* packGaussianRanges<Range extends GaussianPackedRange>(
       continue;
     }
     const { origin } = storage;
-    const writeShape = createGaussianShapeWriter(
-      matrix,
-      primitive.scales,
-      primitive.rotations,
-      storage.scales,
-      storage.rotations,
-    );
+    const transformShape = createGaussianShapeTransform(matrix);
     const staticCamera = [0, 0, 0] as const;
     const partial = storage.arena.packingProgress(allocationRevision);
     const bounds: GaussianBounds = partial?.bounds ?? [
@@ -117,6 +111,7 @@ export function* packGaussianRanges<Range extends GaussianPackedRange>(
         run() {
           for (let index = first; index < end; index++) {
             const p = index * 3,
+              q = index * 4,
               destination = offset + index;
             const x = primitive.positions[p]!,
               y = primitive.positions[p + 1]!,
@@ -141,7 +136,12 @@ export function* packGaussianRanges<Range extends GaussianPackedRange>(
               bounds[axis * 2] = Math.min(bounds[axis * 2]!, value);
               bounds[axis * 2 + 1] = Math.max(bounds[axis * 2 + 1]!, value);
             }
-            writeShape(index, destination);
+            const shape = transformShape(
+              primitive.scales.subarray(p, p + 3),
+              primitive.rotations.subarray(q, q + 4),
+            );
+            storage.scales.set(shape.scales, destination * 3);
+            storage.rotations.set(shape.rotation, destination * 4);
             if (primitive.harmonicDegree === 0)
               writeGaussianColor(
                 primitive,
