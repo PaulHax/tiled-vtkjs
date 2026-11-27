@@ -1,6 +1,8 @@
+import createSpzModule from "@adobe/spz";
 import { describe, expect, it } from "vitest";
 import { IDENTITY } from "../core/mat4";
 import type { DecodedGaussianPrimitive } from "./decode";
+import { decodeSpzGaussian } from "./decode/spz";
 import {
   createGaussianShapeTransform,
   gaussianModelCamera,
@@ -93,6 +95,68 @@ describe("Gaussian placement and appearance", () => {
       0,
     );
     expect(color[0]).toBeCloseTo(0.5 + 0.4886025119029199, 6);
+  });
+
+  it("renders identical directional colors from byte-exact SPZ harmonics", async () => {
+    const spz = await createSpzModule();
+    const sh = Float32Array.from(
+      { length: 90 },
+      (_, index) => ((index % 15) - 7) / 8,
+    );
+    const bytes = spz.saveSpzToBuffer(
+      {
+        numPoints: 2,
+        shDegree: 3,
+        antialiased: false,
+        extensions: [],
+        positions: new Float32Array([0, 0, 0, 1, 2, 3]),
+        scales: new Float32Array(6),
+        rotations: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1]),
+        alphas: new Float32Array(2),
+        colors: new Float32Array(6),
+        sh,
+      },
+      {
+        version: 3,
+        from: spz.CoordinateSystem.UNSPECIFIED,
+        sh1Bits: 8,
+        shRestBits: 8,
+      },
+    );
+    const decoded = await decodeSpzGaussian({
+      bytes,
+      count: 2,
+      modelToScene: IDENTITY,
+      extension: primitive().profile,
+      tileUri: "directional.glb",
+    });
+    const harmonicBytes = decoded.quantizedHarmonics!;
+    expect(harmonicBytes.byteLength).toBe(90);
+    expect([...harmonicBytes].map((value) => value / 128)).toEqual([...sh]);
+
+    const unpacked = { ...decoded, sphericalHarmonics: new Float32Array(96) };
+    delete unpacked.quantizedHarmonics;
+    for (let point = 0; point < 2; point++) {
+      unpacked.sphericalHarmonics.set(
+        decoded.sphericalHarmonics.subarray(point * 3, (point + 1) * 3),
+        point * 48,
+      );
+      unpacked.sphericalHarmonics.set(
+        sh.subarray(point * 45, (point + 1) * 45),
+        point * 48 + 3,
+      );
+      for (const camera of [
+        [1, -2, 1],
+        [2, 5, -1],
+        [0, 0, 0],
+      ]) {
+        const packed = new Float32Array(4);
+        const floats = new Float32Array(4);
+        writeGaussianColor(decoded, point, camera, packed, 0);
+        writeGaussianColor(unpacked, point, camera, floats, 0);
+        expect(packed).toEqual(floats);
+      }
+    }
   });
 
   it("retains reconstructed color above one and clamps negative channels only", () => {

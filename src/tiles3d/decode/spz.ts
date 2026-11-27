@@ -34,6 +34,23 @@ type SpzGaussianInput = {
   };
 };
 
+// Streaming keeps the packed cloud and one fixed WASM chunk in flight.
+const SPZ_STREAM_CHUNK_BYTES = 65_536 * 45 * Float32Array.BYTES_PER_ELEMENT;
+const SPZ_PACKED_BYTES_PER_POINT = 9 + 1 + 3 + 3 + 4 + 45;
+const SPZ_OUTPUT_BYTES_PER_POINT = 44 + 12 + 45;
+
+export const estimateSpzMemory = (count: number, compressed: number) => {
+  const packed = 16 + count * SPZ_PACKED_BYTES_PER_POINT;
+  // Legacy gzip may temporarily keep both the old and grown decompression
+  // buffers, or the inflated buffer and the extracted packed streams.
+  const unpacking = Math.max(packed * 3, compressed * 3 + packed);
+  return {
+    retainedBytes: count * SPZ_OUTPUT_BYTES_PER_POINT + 128,
+    scratchBytes:
+      compressed + Math.max(unpacking, packed + SPZ_STREAM_CHUNK_BYTES),
+  };
+};
+
 const finiteArray = (array: Float32Array): boolean =>
   array.every(Number.isFinite);
 
@@ -112,9 +129,14 @@ export const decodeSpzGaussian = async (
             rotations: new Float32Array(input.count * 4),
             scales: new Float32Array(input.count * 3),
             opacities: new Float32Array(input.count),
-            sphericalHarmonics: new Float32Array(
-              input.count * (header.shDegree + 1) ** 2 * 3,
-            ),
+            sphericalHarmonics: new Float32Array(input.count * 3),
+            ...(header.shDegree > 0
+              ? {
+                  quantizedHarmonics: new Int8Array(
+                    input.count * ((header.shDegree + 1) ** 2 - 1) * 3,
+                  ),
+                }
+              : {}),
             harmonicDegree: header.shDegree as 0 | 1 | 2 | 3,
             profile,
             modelToScene: new Float64Array(input.modelToScene),
@@ -153,14 +175,24 @@ export const decodeSpzGaussian = async (
               output.scales[offset * 3 + index] = scale;
             }
           } else if (attribute === 4) output.rotations.set(values, offset * 4);
+          else if (attribute === 2)
+            output.sphericalHarmonics.set(values, offset * 3);
           else {
-            const destinationWidth = coefficientCount * 3;
-            const coefficientOffset = attribute === 2 ? 0 : 3;
-            for (let point = 0; point < points; point += 1) {
-              output.sphericalHarmonics.set(
-                values.subarray(point * width, (point + 1) * width),
-                (offset + point) * destinationWidth + coefficientOffset,
-              );
+            const destination = output.quantizedHarmonics!;
+            const start = offset * width;
+            // With no coordinate conversion the codec's higher bands are
+            // exact multiples of 1/128. Store those same coefficients in bytes.
+            for (let index = 0; index < values.length; index++) {
+              const coefficient = values[index]! * 128;
+              if (
+                !Number.isInteger(coefficient) ||
+                coefficient < -128 ||
+                coefficient > 127
+              )
+                fail(
+                  "SPZ directional coefficient is outside its encoded range",
+                );
+              destination[start + index] = coefficient;
             }
           }
         },

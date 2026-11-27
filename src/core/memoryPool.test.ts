@@ -230,6 +230,35 @@ describe("createMemoryPool", () => {
     owner.close();
   });
 
+  it("stops reclaiming once the live CPU deficit is covered", () => {
+    const pool = createMemoryPool({ totalBytes: 100, cpuBytes: 100 });
+    let first: ReturnType<ReturnType<typeof pool.createOwner>["retain"]>;
+    const reclaimed = vi.fn();
+    const a = pool.createOwner({
+      reclaim: (domain, deficit) => {
+        expect(domain).toBe("cpu");
+        expect(deficit()).toBe(10);
+        first.release();
+      },
+    });
+    const b = pool.createOwner({ reclaim: reclaimed });
+    first = a.retain([new ArrayBuffer(30)]);
+    const other = b.retain([new ArrayBuffer(60)]);
+    const next = b.retain([new ArrayBuffer(20)]);
+    expect(reclaimed).not.toHaveBeenCalled();
+    expect(pool.stats()).toMatchObject({
+      cpuRetainedBytes: 80,
+      cpuReclaimPasses: 1,
+      cpuReclaimedBytes: 30,
+    });
+    pool.configure({ totalBytes: 110, cpuBytes: 110 });
+    expect(reclaimed).not.toHaveBeenCalled();
+    other.release();
+    next.release();
+    a.close();
+    b.close();
+  });
+
   it("counts replacement allocation identity once when multiple handles share it", () => {
     const pool = createMemoryPool({ totalBytes: 100, transitionBytes: 100 });
     const owner = pool.createOwner();

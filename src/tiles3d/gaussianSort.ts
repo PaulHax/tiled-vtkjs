@@ -84,11 +84,20 @@ const rangeCount = (ranges: readonly GaussianSortRange[]): number => {
   return count;
 };
 
+const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+// Scanning a wide histogram is worthwhile once there are at least as many keys.
+const digitBuckets = (count: number): number => (count >= 65536 ? 65536 : 256);
+
+export const gaussianSortHistogramBytes = (count: number): number =>
+  digitBuckets(count) * Uint32Array.BYTES_PER_ELEMENT;
+
 /** Stable LSD radix sorting over all 64 distance bits, without Float32 keys. */
 export const createGaussianDistanceSorter = () => {
-  let keys = new DataView(new ArrayBuffer(0));
+  let keys = new Float64Array(0);
+  let keyDigits: Uint8Array | Uint16Array = new Uint8Array(keys.buffer);
   let scratch = new Uint32Array(0);
-  const offsets = new Uint32Array(256);
+  let offsets = new Uint32Array(256);
 
   return {
     sort(
@@ -97,10 +106,17 @@ export const createGaussianDistanceSorter = () => {
     ): Uint32Array {
       checkCamera(cameraPosition);
       const count = rangeCount(ranges);
+      const buckets = digitBuckets(count);
+      const passes = buckets === 256 ? 8 : 4;
       if (scratch.length !== count) {
-        keys = new DataView(new ArrayBuffer(count * 8));
+        keys = new Float64Array(count);
+        keyDigits =
+          passes === 8
+            ? new Uint8Array(keys.buffer)
+            : new Uint16Array(keys.buffer);
         scratch = new Uint32Array(count);
       }
+      if (offsets.length !== buckets) offsets = new Uint32Array(buckets);
       const order = new Uint32Array(count);
       let id = 0;
       for (const range of ranges) {
@@ -127,36 +143,41 @@ export const createGaussianDistanceSorter = () => {
               `Gaussian range ${range.id} has a nonfinite camera distance`,
             );
           }
-          keys.setFloat64(id * 8, distance, true);
+          keys[id] = distance;
           order[id] = id;
           id += 1;
         }
       }
 
+      if (count < 2) return order;
       let input = order;
       let output = scratch;
       // Positive IEEE-754 representations sort numerically as unsigned bits.
-      // Complement every byte to obtain descending distance, retaining ties.
-      for (let byte = 0; byte < 8; byte += 1) {
+      // Visit each digit in ascending significance, with descending buckets.
+      for (let pass = 0; pass < passes; pass += 1) {
+        const digit = littleEndian ? pass : passes - 1 - pass;
         offsets.fill(0);
-        for (let index = 0; index < count; index += 1) {
-          const bucket = keys.getUint8(input[index]! * 8 + byte) ^ 0xff;
-          offsets[bucket]! += 1;
-        }
+        // A digit histogram is independent of permutation. Read keys in their
+        // original contiguous order and skip passes with no discriminating bits.
+        for (let index = digit; index < keyDigits.length; index += passes)
+          offsets[keyDigits[index]!]! += 1;
         let start = 0;
-        for (let bucket = 0; bucket < 256; bucket += 1) {
+        for (let bucket = buckets - 1; bucket >= 0; bucket -= 1) {
+          if (offsets[bucket] === count) break;
           const length = offsets[bucket]!;
           offsets[bucket] = start;
           start += length;
         }
+        if (start !== count) continue;
         for (let index = 0; index < count; index += 1) {
           const point = input[index]!;
-          const bucket = keys.getUint8(point * 8 + byte) ^ 0xff;
+          const bucket = keyDigits[point * passes + digit]!;
           output[offsets[bucket]!] = point;
           offsets[bucket]! += 1;
         }
         [input, output] = [output, input];
       }
+      if (input !== order) order.set(input);
       return order;
     },
   };

@@ -53,12 +53,14 @@ export type TileContentAdapter = Omit<
   | "submitTile"
   | "submitTileGroup"
   | "submittedTiles"
+  | "retireTile"
 > & {
   /** Gaussian reconstruction color spaces this adapter can present. */
   readonly gaussianColorSpaces?: readonly GaussianAppearanceProfile["colorSpace"][];
   presentationMatrix(): Mat16;
   estimateTileBytes(content: DecodedTileContent): number;
   setCamera(view: CameraView): void;
+  retireTile(id: string, reuse?: "revisit" | "refining"): boolean;
   submitTile(
     id: string,
     content: DecodedTileContent,

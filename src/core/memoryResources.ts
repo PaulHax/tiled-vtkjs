@@ -139,6 +139,8 @@ export type MemoryResourceOptions = {
 export type MemoryResourceStats = MemoryResourceOptions & {
   readonly cpuRetainedBytes: number;
   readonly cpuReservedBytes: number;
+  readonly cpuReclaimPasses: number;
+  readonly cpuReclaimedBytes: number;
   readonly rendererBytes: number;
   readonly workReservedBytes: number;
   /** Physical stages running under the shared page admission limit. */
@@ -153,7 +155,7 @@ type OwnerEntry = {
   closed: boolean;
   readonly leases: Set<LeaseEntry>;
   readonly reservations: Set<WorkEntry>;
-  readonly reclaim?: (domain: MemoryDomain) => void;
+  readonly reclaim?: (domain: MemoryDomain, deficit: () => number) => void;
 };
 
 type LeaseEntry = {
@@ -188,6 +190,8 @@ export const createMemoryResources = (
   let availabilityRevision = 0;
   let cpuRetained = 0;
   let cpuReserved = 0;
+  let cpuReclaimPasses = 0;
+  let cpuReclaimedBytes = 0;
   let renderer = 0;
   let workReserved = 0;
   let reclaiming = false;
@@ -213,14 +217,22 @@ export const createMemoryResources = (
     )
       owners.delete(owner);
   };
-  const reclaim = (domain: MemoryDomain): void => {
-    if (reclaiming) return;
+  const reclaim = (domain: MemoryDomain, deficit: () => number): void => {
+    if (reclaiming || deficit() <= 0) return;
+    const cpuBefore = cpuRetained + cpuReserved;
     reclaiming = true;
     try {
       // Reclaimers may close owners and mutate the registry.
       // oxlint-disable-next-line unicorn/no-useless-spread
-      for (const owner of [...owners]) safeCall(() => owner.reclaim?.(domain));
+      for (const owner of [...owners]) {
+        if (deficit() <= 0) break;
+        safeCall(() => owner.reclaim?.(domain, deficit));
+      }
     } finally {
+      if (domain === "cpu") {
+        cpuReclaimPasses++;
+        cpuReclaimedBytes += Math.max(0, cpuBefore - cpuRetained - cpuReserved);
+      }
       reclaiming = false;
     }
   };
@@ -341,8 +353,12 @@ export const createMemoryResources = (
 
   const checkCpu = (extra: number | (() => number)): void => {
     const additional = () => (typeof extra === "number" ? extra : extra());
-    if (cpuRetained + cpuReserved + additional() > limits.cpuBytes)
-      reclaim("cpu");
+    reclaim("cpu", () => {
+      const added = additional();
+      return added > limits.cpuBytes
+        ? 0
+        : cpuRetained + cpuReserved + added - limits.cpuBytes;
+    });
     const added = additional();
     if (cpuRetained + cpuReserved + added > limits.cpuBytes) {
       throw new ResourcePolicyError(
@@ -455,11 +471,13 @@ export const createMemoryResources = (
       );
     const ceiling =
       limits.totalBytes + (old.length > 0 ? limits.transitionBytes : 0);
-    if (
-      renderer + amount > ceiling ||
-      renderer + amount - credit() > limits.totalBytes
-    )
-      reclaim("renderer");
+    if (amount <= limits.totalBytes)
+      reclaim("renderer", () =>
+        Math.max(
+          renderer + amount - ceiling,
+          renderer + amount - credit() - limits.totalBytes,
+        ),
+      );
     const finalBytes = renderer + amount - credit();
     if (finalBytes > limits.totalBytes)
       throw new ResourcePolicyError(
@@ -502,7 +520,12 @@ export const createMemoryResources = (
 
   return {
     createOwner(
-      options: { readonly reclaim?: (domain: MemoryDomain) => void } = {},
+      options: {
+        readonly reclaim?: (
+          domain: MemoryDomain,
+          deficit: () => number,
+        ) => void;
+      } = {},
     ): MemoryOwner {
       const owner: OwnerEntry = {
         closed: false,
@@ -583,8 +606,8 @@ export const createMemoryResources = (
       limits = options;
       revision += 1;
       availabilityRevision += 1;
-      reclaim("renderer");
-      reclaim("cpu");
+      reclaim("renderer", () => renderer - limits.totalBytes);
+      reclaim("cpu", () => cpuRetained + cpuReserved - limits.cpuBytes);
       changed();
     },
     availability: () => availabilityRevision,
@@ -595,6 +618,8 @@ export const createMemoryResources = (
         maxConcurrentOperations: admission.capacity(),
         cpuRetainedBytes: cpuRetained,
         cpuReservedBytes: cpuReserved,
+        cpuReclaimPasses,
+        cpuReclaimedBytes,
         rendererBytes: renderer,
         workReservedBytes: workReserved,
         activeOperations: admission.activeOperations(),

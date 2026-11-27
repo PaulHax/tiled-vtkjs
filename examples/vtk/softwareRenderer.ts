@@ -9,7 +9,7 @@ export const isSoftwareRenderer = (
   ...descriptions: readonly (string | null)[]
 ): boolean =>
   descriptions.some((description) =>
-    /swiftshader|llvmpipe|softpipe|lavapipe|software rasterizer|software renderer/i.test(
+    /swiftshader|llvmpipe|softpipe|lavapipe|software|microsoft basic render/i.test(
       description ?? "",
     ),
   );

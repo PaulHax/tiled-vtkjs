@@ -3,6 +3,26 @@ export const GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE =
 
 export type GaussianBounds = [number, number, number, number, number, number];
 
+const GROWTH_PAGE_TUPLES = 4096;
+
+const nextCapacity = (
+  current: number,
+  minimum: number,
+  limit: number,
+): number => {
+  const preferred =
+    minimum <= GROWTH_PAGE_TUPLES
+      ? 2 ** Math.ceil(Math.log2(minimum))
+      : Math.ceil(
+          Math.max(
+            minimum,
+            current *
+              (Number.isFinite(limit) && minimum <= limit / 2 ? 1.5 : 1.125),
+          ) / GROWTH_PAGE_TUPLES,
+        ) * GROWTH_PAGE_TUPLES;
+  return Math.max(minimum, Math.min(preferred, limit));
+};
+
 /** Stable tuple ranges; retirement is committed only after a draw-order swap. */
 export const createGaussianStorage = () => {
   let bufferRevision = 0;
@@ -80,6 +100,7 @@ export const createGaussianStorage = () => {
     },
     requiredCapacity(
       requests: readonly { key: string; count: number }[],
+      limit = Number.POSITIVE_INFINITY,
     ): number {
       let projected = capacity;
       const ranges = free.map((entry) => ({ ...entry }));
@@ -87,22 +108,18 @@ export const createGaussianStorage = () => {
         if (allocations.has(request.key)) continue;
         let range = ranges.find((entry) => entry.count >= request.count);
         if (!range) {
+          const tail = ranges.at(-1);
+          const tailFree =
+            tail && tail.offset + tail.count === projected ? tail.count : 0;
           const old = projected;
-          projected = Math.max(1, projected);
-          while (projected < old + request.count) projected *= 2;
-          range = { offset: old, count: projected - old };
-          ranges.push(range);
-          // Allocation joins the growth tail to an adjacent free range first.
-          ranges.sort((left, right) => left.offset - right.offset);
-          for (let index = ranges.length - 1; index > 0; index--) {
-            const previous = ranges[index - 1]!;
-            const current = ranges[index]!;
-            if (previous.offset + previous.count === current.offset) {
-              previous.count += current.count;
-              ranges.splice(index, 1);
-            }
+          projected = nextCapacity(old, old + request.count - tailFree, limit);
+          if (tailFree && tail) {
+            tail.count += projected - old;
+            range = tail;
+          } else {
+            range = { offset: old, count: projected - old };
+            ranges.push(range);
           }
-          range = ranges.find((entry) => entry.count >= request.count)!;
         }
         range.offset += request.count;
         range.count -= request.count;
@@ -117,10 +134,7 @@ export const createGaussianStorage = () => {
       if (existing) return { ...existing, fresh: false };
       let range = free.find((entry) => entry.count >= count);
       if (!range) {
-        const needed = capacity + count;
-        let target = Math.max(1, capacity);
-        while (target < needed) target *= 2;
-        grow(target);
+        grow(api.requiredCapacity([{ key, count }]));
         range = free.find((entry) => entry.count >= count)!;
       }
       const allocation = {
@@ -150,6 +164,12 @@ export const createGaussianStorage = () => {
     },
     markPartial(revision: number, count: number, bounds: GaussianBounds): void {
       progress.set(revision, { count, bounds });
+    },
+    packedRevision(key: string): number | undefined {
+      const revision = allocations.get(key)?.revision;
+      return revision !== undefined && packed.has(revision)
+        ? revision
+        : undefined;
     },
     owns(key: string, revision: number): boolean {
       return allocations.get(key)?.revision === revision;

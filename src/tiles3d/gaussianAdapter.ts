@@ -46,6 +46,7 @@ import { collectContentBuffers } from "./decode/transfer";
 import {
   createGaussianSortController,
   createGaussianSortWorkerBackend,
+  gaussianSortHistogramBytes,
   GaussianSortWorkerError,
   type GaussianSortBackend,
   type GaussianSortPresentation,
@@ -494,6 +495,8 @@ const createManager = (
   const memoryPool =
     firstOptions.memoryPool ?? createMemoryPool({ totalBytes: budget });
   const memory = memoryPool.createOwner();
+  const arenaTupleLimit = (): number =>
+    Math.floor(memoryPool.stats().totalBytes / gpuBytesPerTuple);
   // Reserved capacity, allocated arrays and published storage can differ.
   let arenaMemory: MemoryLease | undefined;
   let realizedMemory: MemoryLease | undefined;
@@ -582,6 +585,7 @@ const createManager = (
     dirty ||
     (waitingForPreparation() &&
       (!sortTarget ||
+        !compatible(sortTarget.snapshot, sortTarget) ||
         [...sortTarget.snapshot.owners].some(([owner, { base }]) =>
           base.some((value, index) => value !== owner.base[index]),
         )));
@@ -709,6 +713,7 @@ const createManager = (
         tile.owner.mesh.retireTile(tile.id);
       if (
         !presented &&
+        !reusableTiles.has(tile) &&
         !storage?.tiles.includes(tile) &&
         !candidate?.tiles.includes(tile) &&
         !packing?.storage.tiles.includes(tile)
@@ -720,6 +725,14 @@ const createManager = (
     }
   };
   const retiredSources = new Set<Tile>();
+  // Recently drawn tiles can occupy spare atlas ranges until active demand needs them.
+  const reusableTiles = new Set<Tile>();
+  const stagingRetirements = new Set<Tile>();
+  const clearReuse = (owner?: Owner): void => {
+    for (const tile of reusableTiles)
+      if (!owner || tile.owner === owner) reusableTiles.delete(tile);
+    releaseRetiredSources();
+  };
   const hideTiles = (tiles: ReadonlySet<Tile>): void => {
     if (!storage || !tiles.size) return;
     const removed = storage.primitives.filter((packed) =>
@@ -886,12 +899,14 @@ const createManager = (
     workerMemory = undefined;
     workerSceneRevision = -1;
   };
+  const sortWorkspaceBytes = (count: number): number =>
+    count ? count * 32 + gaussianSortHistogramBytes(count) : 0;
   const sortWorkBytes = (): number => {
     const count = sortRanges?.reduce(
       (sum, range) => sum + range.positions.length / 3,
       0,
     );
-    return count ? count * 32 + 1024 : 0;
+    return sortWorkspaceBytes(count ?? 0);
   };
   const compatible = (snapshot: SortSnapshot, target: Realization): boolean => {
     const next = target.storage;
@@ -1085,6 +1100,11 @@ const createManager = (
     }
     if (!getOpenGLRenderWindow) orderUploadBytes += order.byteLength;
     actor.setVisibility(order.length > 0);
+    if (packing && storage?.arena !== next.arena) {
+      packing.job.cancel();
+      packing = null;
+      scheduleRefresh();
+    }
     storage = next;
     if (displayedMemory !== nextMemory) {
       if (displayedMemory !== arenaMemory && displayedMemory !== realizedMemory)
@@ -1107,6 +1127,13 @@ const createManager = (
       candidate?.arena === next.arena
         ? candidate.allocationKeys
         : snapshot.primitives.map((packed) => packed.allocationKey);
+    for (const tile of reusableTiles)
+      if (
+        allocationRequests([tile]).some(
+          ({ key }) => !next.arena.packedRevision(key),
+        )
+      )
+        reusableTiles.delete(tile);
     const live = retainRanges(next.arena, resident);
     next.arena.retireExcept(live);
     if (gpu) {
@@ -1115,13 +1142,17 @@ const createManager = (
           ? [...next.primitives, ...candidate.primitives]
           : next.primitives;
       gpu.retireExcept(
-        new Set(
-          packed.flatMap((primitive) =>
+        new Set([
+          ...packed.flatMap((primitive) =>
             live.has(primitive.allocationKey)
               ? [primitive.allocationRevision]
               : [],
           ),
-        ),
+          ...allocationRequests([...reusableTiles]).flatMap(({ key }) => {
+            const revision = next.arena.packedRevision(key);
+            return revision === undefined ? [] : [revision];
+          }),
+        ]),
       );
     }
     releaseRetiredSources();
@@ -1139,8 +1170,9 @@ const createManager = (
     notify(!snapshot.count);
     const retained = sourceTiles();
     if (
-      next === candidate &&
-      allocationSignature(retained) !== storage.signature
+      stagingRetirements.size ||
+      (next === candidate &&
+        allocationSignature(retained) !== storage.signature)
     )
       scheduleRefresh();
   };
@@ -1337,6 +1369,7 @@ const createManager = (
               sorting = null;
               work.release();
               releaseRetiredSources();
+              if (stagingRetirements.size) scheduleRefresh();
             }
           },
         },
@@ -1363,7 +1396,9 @@ const createManager = (
           if (count && workerSceneRevision !== job.sceneRevision)
             nextWorkerMemory = memory.retain(
               [],
-              count * 24 + job.ranges.length * 128 + 1024,
+              count * 24 +
+                job.ranges.length * 128 +
+                gaussianSortHistogramBytes(count),
             );
           try {
             if (!backend) {
@@ -1408,7 +1443,8 @@ const createManager = (
                 workerMemory = nextWorkerMemory;
                 nextWorkerMemory = undefined;
               }
-              if (!count) workerMemory?.setCpu([], 1024);
+              if (!count)
+                workerMemory?.setCpu([], gaussianSortHistogramBytes(0));
               workerSceneRevision = job.sceneRevision;
             }
           }
@@ -1441,15 +1477,17 @@ const createManager = (
         }
       }
       if (!sortTarget) return;
-      if (
-        !publish(
-          presentation,
-          snapshot,
-          sortTarget,
-          performance.now() - sorting!.started,
-        ) &&
-        cachedOrder === presentation
-      ) {
+      const elapsed = performance.now() - sorting!.started;
+      const published = [
+        sortTarget,
+        ...(candidate && realizedMemory
+          ? [{ storage: candidate, memory: realizedMemory }]
+          : []),
+        ...(storage && displayedMemory
+          ? [{ storage, memory: displayedMemory }]
+          : []),
+      ].some((target) => publish(presentation, snapshot, target, elapsed));
+      if (!published && cachedOrder === presentation) {
         // Sorting inputs can survive an atlas change. A refresh can reuse the
         // order with its own current mapping, even if this dispatch cannot.
         scheduleRefresh();
@@ -1507,11 +1545,40 @@ const createManager = (
       const depth = (packed: PackedPrimitive) =>
         packed.tile.id.split("/").length;
       const ranges = [...value.primitives].sort((a, b) => depth(a) - depth(b));
+      const previous = storage;
+      const copies = new Map<PackedPrimitive, PackedPrimitive>();
+      if (
+        previous &&
+        previous.arena !== value.arena &&
+        previous.bufferRevision === previous.arena.bufferRevision &&
+        previous.origin.every(
+          (component, index) => component === value.origin[index],
+        )
+      ) {
+        const sources = new Map(
+          previous.primitives.map((range) => [range.allocationKey, range]),
+        );
+        for (const range of ranges) {
+          if (value.arena.packingProgress(range.allocationRevision)) continue;
+          const source = sources.get(range.allocationKey);
+          if (
+            source &&
+            previous.arena.isPacked(source.allocationRevision) &&
+            source.matrix.every(
+              (component, index) => component === range.matrix[index],
+            )
+          )
+            copies.set(range, source);
+        }
+      }
       yield* packGaussianRanges(
         value,
         ranges,
         tuplesPerStep(GAUSSIAN_ATTRIBUTE_BYTES_PER_TUPLE),
         scheduleRefresh,
+        previous && copies.size
+          ? { storage: previous, ranges: copies }
+          : undefined,
       );
       yield {
         bytes: 0,
@@ -1630,11 +1697,14 @@ const createManager = (
   // Keep tuple ranges whose draw or order work can still reference them.
   const retainRanges = (target: Storage["arena"], keys: Iterable<string>) => {
     const live = new Set(keys);
+    for (const { key } of allocationRequests([...reusableTiles])) live.add(key);
     for (const packed of storage?.arena === target ? storage.primitives : [])
       if (displayed.has(packed.tile)) live.add(packed.allocationKey);
     if (packing?.storage.arena === target)
       for (const packed of packing.storage.primitives)
         live.add(packed.allocationKey);
+    if (packing && storage?.arena === target)
+      for (const packed of storage.primitives) live.add(packed.allocationKey);
     for (const snapshot of [sorting?.snapshot, publication?.snapshot])
       if (snapshot?.atlas === target.identity)
         for (const packed of snapshot.primitives)
@@ -1657,7 +1727,10 @@ const createManager = (
     const planned = useCandidate ? candidatePlan : activePlan;
     const targetStorage = useCandidate ? candidate : storage;
     const targetMemory = useCandidate ? realizedMemory : displayedMemory;
-    if (!planned || !targetStorage) return;
+    if (!planned || !targetStorage) {
+      sortTarget = null;
+      return;
+    }
     const presentedTiles = planned.tiles;
     const primitives = targetStorage.primitives.filter((primitive) =>
       presentedTiles.has(primitive.tile),
@@ -1732,6 +1805,12 @@ const createManager = (
       return;
     }
     try {
+      for (const tile of stagingRetirements)
+        if (
+          !sorting?.snapshot?.tiles.has(tile) &&
+          !publication?.snapshot.tiles.has(tile)
+        )
+          retireReusable(tile);
       // A live atlas migration leaves exactly two physical atlases. Keep its
       // eligible upload running and merge new demand after its presentation.
       if (publication && publication.storage.arena !== storage?.arena) {
@@ -1747,7 +1826,6 @@ const createManager = (
         return;
       }
       if (compactGroup?.some((tile) => tile.retired)) compactGroup = null;
-      sortTarget = null;
       const nextTiles = sourceTiles();
       if (!nextTiles.length && compactGroup && displayed.size) {
         // A mesh-only successor still replaces an accepted Gaussian region
@@ -1762,6 +1840,7 @@ const createManager = (
         return;
       }
       if (!nextTiles.length) {
+        sortTarget = null;
         allocationJob?.cancel();
         allocationJob = null;
         cancelPublication();
@@ -1795,7 +1874,7 @@ const createManager = (
         storage = empty;
         candidate = empty;
         displayed.clear();
-        releaseRetiredSources();
+        clearReuse();
         for (const owner of owners) {
           owner.mesh.setBaseMatrix(owner.base);
           owner.presentedBase = [...owner.base];
@@ -1853,7 +1932,10 @@ const createManager = (
             requests.map((request) => request.key),
           ),
         );
-      const projectedCapacity = nextArena.requiredCapacity(requests);
+      const projectedCapacity = nextArena.requiredCapacity(
+        requests,
+        arenaTupleLimit(),
+      );
       if (
         !compact &&
         arenaMemory !== realizedMemory &&
@@ -1921,6 +2003,12 @@ const createManager = (
         candidate = null;
       }
       arena = nextArena;
+      if (
+        storage?.count &&
+        arena !== storage.arena &&
+        requests.some(({ key }) => storage?.allocationKeys.has(key))
+      )
+        arena.setOrigin([...storage.origin]);
       arena.grow(projectedCapacity);
       candidate = makeStorage(nextTiles, compact ? null : candidate, arena);
       const previousRealizedMemory = realizedMemory;
@@ -1971,6 +2059,7 @@ const createManager = (
   const dropTile = (owner: Owner, id: string, immediate = false): boolean => {
     const tile = owner.tiles.get(id);
     if (!tile) return owner.failed.delete(id);
+    stagingRetirements.delete(tile);
     if (publication?.snapshot.tiles.has(tile)) cancelPublication();
     if (immediate) {
       owner.presented.delete(tile);
@@ -1999,8 +2088,20 @@ const createManager = (
     scheduleRefresh();
     return true;
   };
+  const retireReusable = (tile: Tile): boolean => {
+    if (
+      tile.submitted &&
+      tile.count &&
+      !tile.meshBytes &&
+      displayed.has(tile) &&
+      allocationRequests([tile]).every(({ key }) => arena.packedRevision(key))
+    )
+      reusableTiles.add(tile);
+    return dropTile(tile.owner, tile.id);
+  };
   const dispose = (): void => {
     if (disposed) return;
+    stagingRetirements.clear();
     disposed = true;
     watchCanvas(null);
     sorter.dispose();
@@ -2116,7 +2217,7 @@ const createManager = (
           : (storage?.bytes ?? 0),
         workerAttributeBytes:
           visible * 12 + (sortTarget?.snapshot.primitives.length ?? 0) * 128,
-        sortWorkspaceBytes: visible * 32 + 1024,
+        sortWorkspaceBytes: sortWorkspaceBytes(visible),
         replacementBytes: [...displayed]
           .filter((tile) => tile.retired)
           .reduce((sum, tile) => sum + tile.bytes, 0),
@@ -2177,7 +2278,7 @@ const createManager = (
           (sum, primitive) =>
             sum +
             (primitive.kind === "gaussian"
-              ? (primitive.positions.length / 3) * (2 * gpuBytesPerTuple)
+              ? (primitive.positions.length / 3) * gpuBytesPerTuple
               : 0),
           0,
         );
@@ -2199,26 +2300,10 @@ const createManager = (
             entry.submitted &&
             (entry.meshBytes === 0 || owner.mesh.tileState(id) === "submitted"),
         );
-      const restoreRetired = (id: string): Tile | undefined => {
-        const tile = retainedGeneration(id);
-        if (!tile) return undefined;
-        // IDs name immutable content. Reuse the exact generation that the
-        // renderer still owns instead of competing with its internal mesh ID.
-        retiredSources.delete(tile);
-        tile.retired = false;
-        tile.group = [tile];
-        tile.replacementTiles = [];
-        owner.tiles.set(id, tile);
-        owner.failed.delete(id);
-        owner.submissionRevision++;
-        owner.workRevision++;
-        scheduleRefresh();
-        return tile;
-      };
       const submit = (
         entries: readonly {
           id: string;
-          content: DecodedTileContent;
+          content?: DecodedTileContent;
           onSubmitted?: () => void;
         }[],
         replacementIds: readonly string[],
@@ -2230,27 +2315,17 @@ const createManager = (
           entries.some((entry) => !entry.id || owner.failed.has(entry.id))
         )
           return "failed";
-        const retained = entries.filter(
-          (entry) => !owner.tiles.has(entry.id) && retainedGeneration(entry.id),
-        );
-        if (retained.length) {
-          const fresh = entries.filter((entry) => !retained.includes(entry));
-          const outcome = fresh.length
-            ? submit(fresh, replacementIds)
-            : "queued";
-          if (outcome === "queued") {
-            for (const entry of retained) restoreRetired(entry.id);
-            for (const entry of retained) safeCall(entry.onSubmitted);
-          }
-          return outcome;
-        }
         const group: Tile[] = [];
+        const retained = new Set<Tile>();
+        const nextSources = new Map<Tile, MemoryLease>();
         const oldArenaMemory = arenaMemory;
         const oldArenaCapacity = arenaCapacity;
         let reserved: readonly MemoryLease[] = [];
         let reservedArena: MemoryLease | undefined;
         const rollbackReservations = (): void => {
           for (const lease of reserved) lease.release();
+          for (const lease of nextSources.values()) lease.release();
+          nextSources.clear();
           if (reservedArena && arenaMemory === reservedArena) {
             arenaMemory = oldArenaMemory;
             arenaCapacity = oldArenaCapacity;
@@ -2262,10 +2337,13 @@ const createManager = (
             if (owner.failed.has(entry.id)) return "failed";
             if (owner.tiles.has(entry.id))
               return entries.length === 1 ? "queued" : "failed";
-            if (!entry.id || group.some((tile) => tile.id === entry.id))
-              throw new Error(
-                "Gaussian tile identities must be unique and nonempty",
-              );
+            const cached = retainedGeneration(entry.id);
+            if (cached) {
+              group.push(cached);
+              retained.add(cached);
+              continue;
+            }
+            if (!entry.content) return "failed";
             const hasTranslucentMesh = entry.content.primitives.some(
               (primitive) =>
                 primitive.kind === "mesh" &&
@@ -2283,8 +2361,7 @@ const createManager = (
               ...entry.content,
               primitives: gaussian,
             }).geometry;
-            // A tile's demand includes power-of-two attribute capacity and order.
-            const bytes = count * (2 * gpuBytesPerTuple);
+            const bytes = count * gpuBytesPerTuple;
             group.push({
               id: entry.id,
               key: `${owner.key}:${entry.id}`,
@@ -2309,16 +2386,13 @@ const createManager = (
               onSubmitted: entry.onSubmitted,
             });
           }
-          const additionalCount = group.reduce(
-            (sum, tile) => sum + tile.count,
-            0,
-          );
-          const replacements = new Set(replacementIds);
-          const replacedCount = [...owner.tiles.values()]
-            .filter((tile) => replacements.has(tile.id))
-            .reduce((sum, tile) => sum + tile.count, 0);
+          const predecessors = [...new Set(replacementIds)].flatMap((id) => {
+            const tile = owner.tiles.get(id);
+            return tile ? [tile] : [];
+          });
+          const replacements = new Set(predecessors);
           const charged = chargedTiles();
-          const combined = [...charged, ...group];
+          const combined = [...new Set([...charged, ...group])];
           if (
             combined.some((tile) => tile.count > 0) &&
             combined.some((tile) => tile.hasTranslucentMesh)
@@ -2326,49 +2400,12 @@ const createManager = (
             throw new GaussianRenderingProfileError(
               "translucent triangle interleaving with Gaussian fields is not supported",
             );
-          const residentCount = charged.reduce(
+          const finalTiles = combined.filter((tile) => !replacements.has(tile));
+          const finalCount = finalTiles.reduce(
             (sum, tile) => sum + tile.count,
             0,
           );
-          const projectedCapacity = arena.requiredCapacity(
-            allocationRequests(combined),
-          );
-          const finalTiles = combined.filter(
-            (tile) => tile.owner !== owner || !replacements.has(tile.id),
-          );
-          const fullGaussianBytes = gaussianShare(
-            owner,
-            combined,
-            projectedCapacity * gpuBytesPerTuple,
-          );
-          const meshDemand = Math.max(
-            owner.mesh.workState().residentBytes,
-            owner.mesh.requiredBytes(),
-          );
-          const fullMeshBytes =
-            meshDemand +
-            group.reduce((sum, tile) => sum + tile.meshBytes, 0) -
-            [...owner.tiles.values()]
-              .filter((tile) => replacements.has(tile.id))
-              .reduce((sum, tile) => sum + tile.meshBytes, 0);
-          const compactReplacement =
-            replacementIds.length > 0 &&
-            (fullGaussianBytes + fullMeshBytes > owner.ceiling ||
-              projectedCapacity * gpuBytesPerTuple + fullMeshBytes >
-                memoryPool.stats().totalBytes);
-          const finalCapacity = compactReplacement
-            ? createGaussianStorage().requiredCapacity(
-                allocationRequests(finalTiles),
-              )
-            : projectedCapacity;
-          const gaussianBytes = gaussianShare(
-            owner,
-            compactReplacement ? finalTiles : combined,
-            finalCapacity * gpuBytesPerTuple,
-          );
-          const finalBytes = gaussianBytes + fullMeshBytes;
-          const finalCount = residentCount + additionalCount - replacedCount;
-          const peakCount = residentCount + additionalCount;
+          const peakCount = combined.reduce((sum, tile) => sum + tile.count, 0);
           if (finalCount > maximum || peakCount > maximum * 2) {
             return {
               status: "blocked",
@@ -2382,6 +2419,63 @@ const createManager = (
               },
             };
           }
+          const requests = allocationRequests(combined);
+          let projectedCapacity = arena.requiredCapacity(
+            requests,
+            arenaTupleLimit(),
+          );
+          if (reusableTiles.size && projectedCapacity > arena.capacity) {
+            clearReuse();
+            arena.retireExcept(
+              retainRanges(
+                arena,
+                requests.map(({ key }) => key),
+              ),
+            );
+            projectedCapacity = arena.requiredCapacity(
+              requests,
+              arenaTupleLimit(),
+            );
+          }
+          const fullGaussianBytes = gaussianShare(
+            owner,
+            combined,
+            projectedCapacity * gpuBytesPerTuple,
+          );
+          const meshDemand = Math.max(
+            owner.mesh.workState().residentBytes,
+            owner.mesh.requiredBytes(),
+          );
+          const fullMeshBytes =
+            meshDemand +
+            group.reduce(
+              (sum, tile) => sum + (retained.has(tile) ? 0 : tile.meshBytes),
+              0,
+            ) -
+            predecessors.reduce((sum, tile) => sum + tile.meshBytes, 0);
+          const pool = memoryPool.stats();
+          const growthCannotOverlap =
+            projectedCapacity > arenaCapacity &&
+            pool.rendererBytes + projectedCapacity * gpuBytesPerTuple >
+              pool.totalBytes + pool.transitionBytes;
+          const compactReplacement =
+            replacementIds.length > 0 &&
+            (fullGaussianBytes + fullMeshBytes > owner.ceiling ||
+              projectedCapacity * gpuBytesPerTuple + fullMeshBytes >
+                pool.totalBytes ||
+              growthCannotOverlap);
+          const finalCapacity = compactReplacement
+            ? createGaussianStorage().requiredCapacity(
+                allocationRequests(finalTiles),
+                arenaTupleLimit(),
+              )
+            : projectedCapacity;
+          const gaussianBytes = gaussianShare(
+            owner,
+            compactReplacement ? finalTiles : combined,
+            finalCapacity * gpuBytesPerTuple,
+          );
+          const finalBytes = gaussianBytes + fullMeshBytes;
           const peakBytes =
             ownerChargeFor(owner) +
             (compactReplacement || projectedCapacity > arenaCapacity
@@ -2408,6 +2502,17 @@ const createManager = (
             };
           }
           const grows = compactReplacement || projectedCapacity > arenaCapacity;
+          const alreadyPacked =
+            group.length === 1 &&
+            retained.size === 1 &&
+            !grows &&
+            (displayed.has(group[0]!) ||
+              allocationRequests(group).every(({ key }) =>
+                arena.packedRevision(key),
+              ));
+          if (!alreadyPacked && entries.some((entry) => !entry.content))
+            return "failed";
+
           if (
             grows &&
             (compactGroup ||
@@ -2454,14 +2559,16 @@ const createManager = (
             safeCall(() => options.onAdmissionRefusal?.(cancelled, error));
             return { status: "blocked", refusal: error };
           }
-          for (const tile of group) {
-            tile.sourceMemory = (options.memory ?? memory).retain([
-              ...collectContentBuffers(tile.gaussian).geometry,
-            ]);
-            owner.tiles.set(tile.id, tile);
-          }
+          for (const tile of group)
+            nextSources.set(
+              tile,
+              (options.memory ?? memory).retain(
+                collectContentBuffers(tile.gaussian).geometry,
+              ),
+            );
           const meshEntries = group.flatMap((tile, index) => {
-            const content = meshContent(entries[index]!.content);
+            if (retained.has(tile)) return [];
+            const content = meshContent(entries[index]!.content!);
             if (!content.primitives.length) {
               tile.meshReady = true;
               return [];
@@ -2504,16 +2611,37 @@ const createManager = (
               reserved.slice(0, meshEntries.length),
             );
             if (outcome !== "queued") {
-              for (const admitted of group) {
-                if (owner.tiles.get(admitted.id) === admitted)
-                  dropTile(owner, admitted.id);
-                if (outcome === "failed") owner.failed.add(admitted.id);
-              }
+              if (outcome === "failed")
+                for (const tile of group)
+                  if (!retained.has(tile)) owner.failed.add(tile.id);
               rollbackReservations();
               return outcome;
             }
           }
+          // A retained generation is starting a new admission. Earlier
+          // successors must no longer treat it as their outgoing coverage.
+          if (retained.size)
+            for (const tile of charged)
+              if (tile.owner === owner && !retained.has(tile))
+                tile.replacementTiles = tile.replacementTiles.filter(
+                  (predecessor) => !retained.has(predecessor),
+                );
+          for (const [index, tile] of group.entries()) {
+            retiredSources.delete(tile);
+            reusableTiles.delete(tile);
+            tile.sourceMemory?.release();
+            tile.sourceMemory = nextSources.get(tile);
+            tile.retired = false;
+            tile.group = group;
+            tile.replacementTiles = predecessors;
+            tile.onSubmitted = entries[index]!.onSubmitted;
+            tile.submitted = alreadyPacked;
+            if (alreadyPacked) owner.submissionRevision++;
+            owner.tiles.set(tile.id, tile);
+          }
+          nextSources.clear();
           scheduleRefresh();
+          if (alreadyPacked) safeCall(group[0]!.onSubmitted);
           if (
             grows &&
             oldArenaMemory &&
@@ -2527,10 +2655,10 @@ const createManager = (
         } catch (error) {
           rollbackReservations();
           const policy = resourcePolicyError(error);
-          if (!policy) for (const entry of entries) owner.failed.add(entry.id);
-          for (const tile of group)
-            if (owner.tiles.has(tile.id)) dropTile(owner, tile.id);
           if (policy) return { status: "blocked", refusal: policy };
+          const retainedIds = new Set([...retained].map(({ id }) => id));
+          for (const { id } of entries)
+            if (!retainedIds.has(id)) owner.failed.add(id);
           safeCall(() => options.onError?.(error));
           return "failed";
         }
@@ -2561,7 +2689,10 @@ const createManager = (
             scheduleRefresh();
           }
         },
-        trimReuse: () => owner.mesh.trimReuse(),
+        trimReuse() {
+          clearReuse(owner);
+          owner.mesh.trimReuse();
+        },
         submitTile(id, content, onSubmitted, replacements = []) {
           return submit([{ id, content, onSubmitted }], replacements);
         },
@@ -2570,7 +2701,22 @@ const createManager = (
           const tile = owner.tiles.get(id);
           return tile && !tile.submitted ? dropTile(owner, id) : false;
         },
-        retireTile: (id) => dropTile(owner, id),
+        retireTile(id, reuse) {
+          const tile = owner.tiles.get(id);
+          if (!reuse || !tile) return dropTile(owner, id);
+          if (
+            reuse === "refining" &&
+            !displayed.has(tile) &&
+            (sorting?.snapshot?.tiles.has(tile) ||
+              publication?.snapshot.tiles.has(tile))
+          ) {
+            // Let a submitted intermediate level finish showing its coverage
+            // while the next finer level becomes eligible.
+            stagingRetirements.add(tile);
+            return true;
+          }
+          return retireReusable(tile);
+        },
         setDrawnTiles(ids) {
           const next = new Set(
             ids.filter((id) => owner.tiles.get(id)?.submitted),
@@ -2617,6 +2763,7 @@ const createManager = (
           owner.visibilityRevision++;
           cancelPublication();
           if (!visible) {
+            clearReuse(owner);
             owner.mesh.setVisible(false);
             hideOwner(owner);
           }
@@ -2625,21 +2772,31 @@ const createManager = (
         },
         setResourceCeilingBytes(bytes) {
           if (!Number.isFinite(bytes) || bytes < 0) return [];
+          if (bytes < owner.ceiling) clearReuse(owner);
           owner.ceiling = Math.floor(bytes);
           const cancelled: string[] = [];
-          const finalTiles = chargedTiles().filter(
-            (tile) =>
-              ![...owners].some((entry) =>
-                [...entry.tiles.values()].some((replacement) =>
-                  replacement.replacementTiles.includes(tile),
+          const finalCharge = () => {
+            const replaced = new Set(
+              [...owners].flatMap((entry) =>
+                [...entry.tiles.values()].flatMap(
+                  (replacement) => replacement.replacementTiles,
                 ),
               ),
-          );
-          const finalCharge = () =>
-            gaussianShare(owner, finalTiles, arenaCapacity * gpuBytesPerTuple) +
-            finalTiles
-              .filter((tile) => tile.owner === owner)
-              .reduce((sum, tile) => sum + tile.meshBytes, 0);
+            );
+            const finalTiles = chargedTiles().filter(
+              (tile) => !replaced.has(tile),
+            );
+            return (
+              gaussianShare(
+                owner,
+                finalTiles,
+                arenaCapacity * gpuBytesPerTuple,
+              ) +
+              finalTiles
+                .filter((tile) => tile.owner === owner)
+                .reduce((sum, tile) => sum + tile.meshBytes, 0)
+            );
+          };
           for (const tile of [...owner.tiles.values()].reverse())
             if (!tile.submitted && finalCharge() > owner.ceiling) {
               cancelled.push(...tile.group.map((entry) => entry.id));
@@ -2659,6 +2816,7 @@ const createManager = (
           return [...new Set([...cancelled, ...meshCancelled])];
         },
         clearTiles() {
+          clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.clearTiles();
@@ -2679,8 +2837,18 @@ const createManager = (
         },
         restoreTile(id) {
           if (owner.failed.has(id)) return "failed";
-          if (owner.tiles.has(id)) return "absent";
-          return restoreRetired(id) ? "restored" : "absent";
+          const active = owner.tiles.get(id);
+          if (active)
+            return stagingRetirements.delete(active) ? "restored" : "absent";
+          const tile = retainedGeneration(id);
+          if (
+            !tile ||
+            !allocationRequests([tile]).every(({ key }) =>
+              arena.packedRevision(key),
+            )
+          )
+            return "absent";
+          return submit([{ id }], []) === "queued" ? "restored" : "absent";
         },
         submittedTileIds: () =>
           [...owner.tiles.values()]
@@ -2738,6 +2906,7 @@ const createManager = (
         dispose() {
           if (owner.disposed) return;
           owner.disposed = true;
+          clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
           owner.mesh.dispose();

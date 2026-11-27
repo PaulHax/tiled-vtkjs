@@ -414,9 +414,51 @@ const pointPresentation = (
 
 export const startSceneExplorer = (preset: ExplorerPreset): void => {
   renderExplorerShell(preset);
-  const resourceBudgetBytes = defaultMemoryBudgetBytes();
-  const memory = createMemoryPool({ totalBytes: resourceBudgetBytes });
+  const benchmarkParams = harnessRequested()
+    ? new URLSearchParams(window.location.search)
+    : null;
+  const benchmarkMemoryMiB = benchmarkParams?.get("benchmarkMemoryMiB") ?? null;
+  const resourceBudgetBytes =
+    benchmarkMemoryMiB === null
+      ? defaultMemoryBudgetBytes()
+      : Number(benchmarkMemoryMiB) * 1024 * 1024;
+  if (!Number.isSafeInteger(resourceBudgetBytes) || resourceBudgetBytes <= 0)
+    throw new RangeError("The benchmark memory budget must be positive");
+  const benchmarkOperations = benchmarkParams?.get("benchmarkOperations");
+  const cameraParam = benchmarkParams?.get("benchmarkCamera");
+  const sseParam = benchmarkParams?.get("benchmarkSse");
+  const benchmarkSse = sseParam == null ? undefined : Number(sseParam);
+  if (
+    benchmarkSse !== undefined &&
+    (!Number.isFinite(benchmarkSse) || benchmarkSse <= 0)
+  )
+    throw new RangeError("The benchmark screen-space error must be positive");
+  const memory = createMemoryPool({
+    totalBytes: resourceBudgetBytes,
+    ...(benchmarkOperations == null
+      ? {}
+      : { maxConcurrentOperations: Number(benchmarkOperations) }),
+  });
   const host = createSceneHost(element<HTMLElement>("#viewer"), memory);
+  if (cameraParam != null) {
+    const pose = JSON.parse(cameraParam) as {
+      position?: unknown;
+      target?: unknown;
+      up?: unknown;
+    } | null;
+    const vector = (value: unknown): value is [number, number, number] =>
+      Array.isArray(value) &&
+      value.length === 3 &&
+      value.every(Number.isFinite);
+    if (!vector(pose?.position) || !vector(pose.target) || !vector(pose.up))
+      throw new RangeError(
+        "The benchmark camera requires finite position, target and up vectors",
+      );
+    host.camera.setPosition(...pose.position);
+    host.camera.setFocalPoint(...pose.target);
+    host.camera.setViewUp(...pose.up);
+    host.scheduleRender();
+  }
   const gaussian = createGaussianContentAdapterFactory({
     resourceBudgetBytes,
     getOpenGLRenderWindow: () => host.openGLRenderWindow,
@@ -783,6 +825,13 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       const visible = query<HTMLInputElement>("visible");
       const sse = query<HTMLInputElement>("sse");
       const sseValue = query<HTMLOutputElement>("sse-value");
+      if (benchmarkSse !== undefined) {
+        sse.min = String(Math.min(Number(sse.min), benchmarkSse));
+        sse.max = String(Math.max(Number(sse.max), benchmarkSse));
+        sse.step = "any";
+        sse.value = String(benchmarkSse);
+        sseValue.textContent = String(benchmarkSse) + " px";
+      }
       let config: Tiles3dMemberConfig = {
         endpoint: input.endpoint,
         revision: `${id}:${Date.now()}`,
@@ -1234,9 +1283,17 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
     if (encoded.length > 0) {
       for (const [index, source] of encoded.entries()) {
         if ("source" in source) {
-          await addPointDataset(source, undefined, index === 0);
+          await addPointDataset(
+            source,
+            undefined,
+            index === 0 && cameraParam == null,
+          );
         } else {
-          await addTilesDataset(source, undefined, index === 0);
+          await addTilesDataset(
+            source,
+            undefined,
+            index === 0 && cameraParam == null,
+          );
         }
       }
       syncUrl();
@@ -1295,6 +1352,9 @@ export const startSceneExplorer = (preset: ExplorerPreset): void => {
       attachHarness({
         preset,
         host,
+        benchmarkCamera: cameraParam != null,
+        memoryStats: () => memory.stats(),
+        gaussianStats: () => gaussian.stats(host.renderer),
         viewer: element<HTMLElement>("#viewer"),
         datasets: () =>
           datasets.map((dataset) => ({

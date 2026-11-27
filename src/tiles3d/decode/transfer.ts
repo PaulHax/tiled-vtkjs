@@ -22,9 +22,10 @@ export const collectContentBuffers = (
         primitive.scales,
         primitive.opacities,
         primitive.sphericalHarmonics,
+        primitive.quantizedHarmonics,
         primitive.modelToScene,
       ]) {
-        if (array.buffer instanceof ArrayBuffer) geometry.add(array.buffer);
+        if (array?.buffer instanceof ArrayBuffer) geometry.add(array.buffer);
       }
       continue;
     }

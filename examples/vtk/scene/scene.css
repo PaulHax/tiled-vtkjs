@@ -349,18 +349,13 @@
   transform: translate(-50%, 0);
 }
 
-.dataset-body > :first-child label,
-.dataset-body > label:first-child {
-  margin-top: 11px;
-}
-
 .toggle-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
   min-height: 36px;
-  margin-top: 10px;
+  margin-top: 4px;
 }
 
 .toggle-row label {
@@ -375,6 +370,7 @@
 .toggle-row input {
   width: auto;
   height: auto;
+  margin: 0;
   accent-color: #48a2d7;
 }
 

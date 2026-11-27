@@ -132,6 +132,9 @@ export type Tiles3dMemberStats = {
   readonly blockedGroups: number;
   readonly selectedTiles: number;
   readonly requestedTiles: number;
+  /** Traversal targets and loading obligations, independent of GPU publication. */
+  readonly desiredTileIds: readonly string[];
+  readonly requestedTileIds: readonly string[];
   /** Traversal passes, exposed so hosts can verify stationary frame idempotence. */
   readonly selectionPasses: number;
   readonly errorCount: number;

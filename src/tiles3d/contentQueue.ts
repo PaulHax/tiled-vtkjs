@@ -134,6 +134,7 @@ export type ContentQueue<T> = {
   contents(): ReadonlyMap<string, T>;
   snapshot(): ContentQueueSnapshot;
   trimCache(bytes: number): void;
+  reclaimDecoded(deficit: () => number): void;
   retryBlocked(): void;
   dispose(): void;
 };
@@ -504,6 +505,16 @@ export const createContentQueue = <T>(
     trimCache(bytes) {
       enforceCacheBudget(bytes);
       emit();
+    },
+    reclaimDecoded(deficit) {
+      let evicted = false;
+      for (const [id, tile] of cache) {
+        if (deficit() <= 0) break;
+        if (selected.get(id) === tile) continue;
+        evict(id);
+        evicted = true;
+      }
+      if (evicted) emit();
     },
     state,
     retryBlocked() {

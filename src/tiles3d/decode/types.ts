@@ -173,8 +173,11 @@ export type DecodedGaussianPrimitive = {
   opacities: Float32Array;
   /** EXT_splat_opacity uses a power kernel for semantic opacity above one. */
   opacityKernel?: "power";
-  /** Splat-major, then coefficient in degree/order sequence, then RGB. */
+  /** Splat-major, then coefficient in degree/order sequence, then RGB.
+   * Contains only DC when SPZ higher bands are stored in quantizedHarmonics. */
   sphericalHarmonics: Float32Array;
+  /** SPZ higher-band coefficients with a fixed 1/128 scale, excluding DC. */
+  quantizedHarmonics?: Int8Array;
   harmonicDegree: 0 | 1 | 2 | 3;
   profile: GaussianAppearanceProfile;
   /** Full column-major placement, independent of the tile's mesh RTC origin. */

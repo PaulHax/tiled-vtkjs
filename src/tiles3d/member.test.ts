@@ -557,6 +557,111 @@ describe("createTiles3dMember", () => {
     member.dispose();
   });
 
+  it("draws a valid descendant after its covering ancestors fail", async () => {
+    const h = harness();
+    const manifest = {
+      ...document(),
+      root: tile("root.glb", 8, [tile("middle.glb", 4, [tile("leaf.glb", 0)])]),
+    };
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        maxAttempts: 1,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => manifest,
+        }),
+        fetchContent: async (url, options) =>
+          url.endsWith("/leaf.glb")
+            ? h.config.fetchContent!(url, options)
+            : {
+                ok: false,
+                status: 404,
+                statusText: "Not Found",
+                arrayBuffer: async () => new ArrayBuffer(0),
+              },
+      },
+      h.services,
+    );
+    member.applyAllocation({
+      qualityFraction: 1,
+      memoryBudgetBytes: 4096,
+      regime: "stationary",
+    });
+    member.setCamera(view);
+    await flush();
+    while (h.submissions.hasPending()) h.submissions.prepareFrame();
+    expect(h.contentRequests).toEqual(["/tiles/leaf.glb"]);
+    expect(member.stats()).toMatchObject({
+      errorCount: 2,
+      renderer: { drawnTileIds: ["root/0/0"] },
+    });
+    member.dispose();
+  });
+
+  it("draws affordable detail while its ancestors wait for decode memory", async () => {
+    const h = harness();
+    const manifest = {
+      ...document(),
+      root: tile("root.glb", 8, [tile("middle.glb", 4, [tile("leaf.glb", 0)])]),
+    };
+    const owner = h.memory.createOwner();
+    const pressure = owner.work(new AbortController().signal);
+    pressure.resize(900_000);
+    const member = createTiles3dMember(
+      h.context,
+      {
+        ...h.config,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => manifest,
+        }),
+      },
+      {
+        ...h.services,
+        workers: {
+          decode(request, options) {
+            if (request.contentUrl.endsWith("/leaf.glb"))
+              return h.services.workers.decode(request, options);
+            return {
+              promise: Promise.resolve().then(() => {
+                options?.memory?.resize(200_000);
+                return decoded();
+              }),
+              cancel: vi.fn(),
+            };
+          },
+        },
+      },
+    );
+    try {
+      member.applyAllocation({
+        qualityFraction: 1,
+        memoryBudgetBytes: 4096,
+        regime: "stationary",
+      });
+      member.setCamera(view);
+      await flush();
+      while (h.submissions.hasPending()) {
+        h.submissions.prepareFrame();
+        await flush();
+      }
+      expect(h.contentRequests).toContain("/tiles/leaf.glb");
+      expect(member.stats()).toMatchObject({
+        renderer: { drawnTileIds: ["root/0/0"] },
+      });
+    } finally {
+      member.dispose();
+      pressure.release();
+      owner.close();
+    }
+  });
+
   it("drives implicit subtree arrival into full quadrant content selection", async () => {
     const h = harness();
     const directory = new URL(
@@ -625,6 +730,17 @@ describe("createTiles3dMember", () => {
     expect(member.governorInputs()).toMatchObject({
       physicalHierarchyOperations: 0,
       work: { operations: expect.any(Number) },
+    });
+    while (h.submissions.hasPending()) h.submissions.prepareFrame();
+    const passes = (member.stats() as Tiles3dMemberStats).selectionPasses;
+    member.setCamera({
+      ...view,
+      viewProj: Array.from({ length: 16 }, () => 0),
+      position: [0, 0, -1],
+    });
+    expect(member.stats()).toMatchObject({
+      selectionPasses: passes + 1,
+      renderer: { drawnTiles: 4 },
     });
     member.dispose();
   });
@@ -1605,6 +1721,69 @@ describe("createTiles3dMember", () => {
       memoryConstrained: false,
       renderer: { drawnTiles: 2, submittedTiles: 2, residentBytes: 104 },
     });
+    member.dispose();
+  });
+
+  it("recovers fine coverage when residency falls under an unchanged grant", async () => {
+    const h = harness(true);
+    let overlapBytes = 0;
+    const member = createTiles3dMember(h.context, h.config, {
+      ...h.services,
+      createContentAdapter(options) {
+        const adapter = createMeshContentAdapter(options);
+        return {
+          ...adapter,
+          workState() {
+            const state = adapter.workState();
+            return {
+              ...state,
+              residentBytes: state.residentBytes + overlapBytes,
+            };
+          },
+        };
+      },
+    });
+    const grant = {
+      qualityFraction: 1,
+      memoryBudgetBytes: 4096,
+      regime: "stationary" as const,
+    };
+    member.applyAllocation(grant);
+    member.setCamera(view);
+    await flush();
+    while (h.submissions.hasPending()) {
+      h.submissions.prepareFrame();
+      await flush();
+    }
+    expect(member.stats()).toMatchObject({ renderer: { drawnTiles: 2 } });
+
+    overlapBytes = 200;
+    member.applyAllocation({ ...grant, memoryBudgetBytes: 110 });
+    await flush();
+    while (h.submissions.hasPending()) {
+      h.submissions.prepareFrame();
+      await flush();
+    }
+    expect(member.stats()).toMatchObject({
+      memoryConstrained: true,
+      renderer: { drawnTileIds: ["root"] },
+    });
+
+    overlapBytes = 0;
+    member.prepareFrame();
+    await flush();
+    while (h.submissions.hasPending()) {
+      h.submissions.prepareFrame();
+      await flush();
+    }
+    expect(member.stats()).toMatchObject({
+      memoryConstrained: false,
+      renderer: { drawnTiles: 2 },
+    });
+    const { selectionPasses } = member.stats() as Tiles3dMemberStats;
+    member.prepareFrame();
+    member.prepareFrame();
+    expect(member.stats()).toMatchObject({ selectionPasses });
     member.dispose();
   });
 
