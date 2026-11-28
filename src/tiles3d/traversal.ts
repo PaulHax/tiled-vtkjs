@@ -103,6 +103,8 @@ type Vec3 = readonly [number, number, number];
 type WorldBox = {
   readonly center: Vec3;
   readonly axes: readonly [Vec3, Vec3, Vec3];
+  readonly radius: Vec3;
+  readonly faces: readonly { normal: Vec3; radius: number }[];
 };
 
 type TilePlacement = {
@@ -112,13 +114,38 @@ type TilePlacement = {
 
 const worldBox = (box: TilesetBox, matrix: readonly number[]): WorldBox => {
   const h = box.halfAxes;
+  const axes: [Vec3, Vec3, Vec3] = [
+    transformVector(matrix, [h[0], h[1], h[2]]),
+    transformVector(matrix, [h[3], h[4], h[5]]),
+    transformVector(matrix, [h[6], h[7], h[8]]),
+  ];
+  const extent = (axis: number) =>
+    Math.abs(axes[0][axis]!) +
+    Math.abs(axes[1][axis]!) +
+    Math.abs(axes[2][axis]!);
+  const faces = [];
+  for (let i = 0; i < 3; i++) {
+    const a = axes[(i + 1) % 3]!,
+      b = axes[(i + 2) % 3]!;
+    const x = a[1] * b[2] - a[2] * b[1],
+      y = a[2] * b[0] - a[0] * b[2],
+      z = a[0] * b[1] - a[1] * b[0];
+    // Axis-aligned faces are already included in the world AABB.
+    if (Number(x !== 0) + Number(y !== 0) + Number(z !== 0) < 2) continue;
+    const length = Math.hypot(x, y, z);
+    if (!Number.isFinite(length)) continue;
+    const normal: Vec3 = [x / length, y / length, z / length];
+    const radius = axes.reduce(
+      (sum, axis) => sum + Math.abs(dot(normal, axis)),
+      0,
+    );
+    faces.push({ normal, radius });
+  }
   return {
     center: transformPoint(matrix, box.center),
-    axes: [
-      transformVector(matrix, [h[0], h[1], h[2]]),
-      transformVector(matrix, [h[3], h[4], h[5]]),
-      transformVector(matrix, [h[6], h[7], h[8]]),
-    ],
+    axes,
+    radius: [extent(0), extent(1), extent(2)],
+    faces,
   };
 };
 
@@ -141,23 +168,23 @@ const boxIntersectsFrustum = (
 };
 
 const boxDistance = (box: WorldBox, point: Vec3): number => {
-  // A conservative world AABB is sufficient for SSE: it may refine early,
-  // but never drops detail because an oriented or sheared box was too near.
-  const radius: Vec3 = [
-    Math.abs(box.axes[0][0]) +
-      Math.abs(box.axes[1][0]) +
-      Math.abs(box.axes[2][0]),
-    Math.abs(box.axes[0][1]) +
-      Math.abs(box.axes[1][1]) +
-      Math.abs(box.axes[2][1]),
-    Math.abs(box.axes[0][2]) +
-      Math.abs(box.axes[1][2]) +
-      Math.abs(box.axes[2][2]),
-  ];
-  const dx = Math.max(Math.abs(point[0] - box.center[0]) - radius[0], 0);
-  const dy = Math.max(Math.abs(point[1] - box.center[1]) - radius[1], 0);
-  const dz = Math.max(Math.abs(point[2] - box.center[2]) - radius[2], 0);
-  return Math.hypot(dx, dy, dz);
+  const x = point[0] - box.center[0],
+    y = point[1] - box.center[1],
+    z = point[2] - box.center[2];
+  let distance = Math.hypot(
+    Math.max(Math.abs(x) - box.radius[0], 0),
+    Math.max(Math.abs(y) - box.radius[1], 0),
+    Math.max(Math.abs(z) - box.radius[2], 0),
+  );
+  // Both the AABB distance and each face clearance bound the distance
+  // from below, including for nonuniformly scaled and sheared tiles.
+  for (const { normal, radius } of box.faces) {
+    distance = Math.max(
+      distance,
+      Math.abs(x * normal[0] + y * normal[1] + z * normal[2]) - radius,
+    );
+  }
+  return distance;
 };
 
 const maximumScale = (matrix: readonly number[]): number =>
@@ -489,11 +516,31 @@ const traverseHierarchy = (
         hasSubmittedDescendant(child),
     );
 
-  type Region = { readonly error: number; readonly offset: number };
+  const matrix = options.camera.viewProj;
+  const screenAxes: [Vec3, Vec3] = [
+    [matrix[0]!, matrix[4]!, matrix[8]!],
+    [matrix[1]!, matrix[5]!, matrix[9]!],
+  ];
+  // The clip-space x=0 and y=0 planes conservatively bound the center ray.
+  const spansScreenCenter = (box: WorldBox) =>
+    screenAxes.every((axis, index) => {
+      const distance = dot(axis, box.center) + matrix[12 + index]!;
+      const extent = box.axes.reduce(
+        (sum, halfAxis) => sum + Math.abs(dot(axis, halfAxis)),
+        0,
+      );
+      return Math.abs(distance) <= extent;
+    });
+  type Region = {
+    readonly error: number;
+    readonly offset: number;
+    readonly centered: boolean;
+  };
   type RequestOrder = {
     readonly depth: number;
     readonly offset: number;
     readonly coveredRegion: Region | undefined;
+    readonly parentAtCenter: boolean;
   };
   const requestOrder = new Map<string, RequestOrder>();
 
@@ -503,6 +550,7 @@ const traverseHierarchy = (
     depth: number,
     coveredRegion?: Region,
     retainSubmitted = false,
+    parentAtCenter = true,
   ): VisitResult => {
     let placement = placements.get(tile);
     if (!placement) {
@@ -526,7 +574,8 @@ const traverseHierarchy = (
       };
     }
     const offset = view.centerRayOffset(bounds.center);
-    requestOrder.set(tile.id, { depth, offset, coveredRegion });
+    const centered = tile.children.length > 0 && spansScreenCenter(bounds);
+    requestOrder.set(tile.id, { depth, offset, coveredRegion, parentAtCenter });
     const ownPresented = options.presented?.(tile.id) ?? false;
     const covered = !!coveredRegion || ownPresented;
 
@@ -562,7 +611,9 @@ const traverseHierarchy = (
       tile.children.length > 0 && (ownPresented || contentful)
         ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
         : 0;
-    const childRegion = ownPresented ? { error, offset } : coveredRegion;
+    const childRegion = ownPresented
+      ? { error, offset, centered }
+      : coveredRegion;
     const refine =
       tile.children.length > 0 &&
       (retainSubmitted
@@ -571,7 +622,14 @@ const traverseHierarchy = (
           (error > effective && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
       ? tile.children.map((child) =>
-          visit(child, accumulated, depth + 1, childRegion, retainSubmitted),
+          visit(
+            child,
+            accumulated,
+            depth + 1,
+            childRegion,
+            retainSubmitted,
+            centered,
+          ),
         )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
@@ -601,7 +659,7 @@ const traverseHierarchy = (
       const fallbacks =
         !retainSubmitted && !submitted && hasSubmittedDescendant(tile)
           ? tile.children.map((child) =>
-              visit(child, accumulated, depth + 1, childRegion, true),
+              visit(child, accumulated, depth + 1, childRegion, true, centered),
             )
           : [];
       const visibleFallbacks = fallbacks.filter((child) => child.visible);
@@ -701,22 +759,25 @@ const traverseHierarchy = (
   const requested = [...result.requested].sort((left, right) => {
     const a = requestOrder.get(left)!;
     const b = requestOrder.get(right)!;
-    // First restore regions without coverage. Then let the highest-error
-    // visible fallback refine without waiting for a whole breadth level.
+    // Restore missing coverage first. Under displayed fallbacks, schedule
+    // siblings together when their parent spans the center of the view.
     const aRegion = a.coveredRegion;
     const bRegion = b.coveredRegion;
     const coverageOrder =
       aRegion && bRegion
-        ? bRegion.error - aRegion.error || aRegion.offset - bRegion.offset
+        ? Number(b.parentAtCenter) - Number(a.parentAtCenter) ||
+          Number(bRegion.centered) - Number(aRegion.centered) ||
+          bRegion.error - aRegion.error ||
+          aRegion.offset - bRegion.offset
         : Number(!!aRegion) - Number(!!bRegion);
     return coverageOrder || a.depth - b.depth || a.offset - b.offset;
   });
-  const rootAccumulated = multiply(rootParent, hierarchy.root.transform);
+  const rootPlacement = placements.get(hierarchy.root)!;
   const rootSse = result.visible
     ? screenSpaceError(
         hierarchy.root,
-        rootAccumulated,
-        worldBox(hierarchy.root.boundingVolume, rootAccumulated),
+        rootPlacement.transform,
+        rootPlacement.bounds,
         view,
         errorScale,
       )

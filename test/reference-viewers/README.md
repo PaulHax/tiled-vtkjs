@@ -2,14 +2,15 @@
 
 The benchmark gives each viewer an explicit camera path and serves local assets from the same HTTP Range server. It saves the raw browser samples, per-case summaries, request and Range logs, and canvas screenshots. The generated assets are small correctness fixtures. Use local captures for performance comparisons.
 
-| Workload               | Default cases                                                                       | Scope                                                                                                                                     |
-| ---------------------- | ----------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| Standard mesh 3D Tiles | `tiled-vtkjs-mesh-tiles`, `cesium-mesh-tiles`, `three-tiles-mesh-tiles`             | Same three-level GLB tileset                                                                                                              |
-| SPZ Gaussian 3D Tiles  | `tiled-vtkjs-gaussian-tiles`, `cesium-gaussian-tiles`, `three-tiles-gaussian-tiles` | Same three-level tileset. Three.js uses NASA-AMMOS 3DTilesRendererJS with Gaussian Splat Lite and the Gaussian splat plugin.              |
-| Standalone mesh        | `tiled-vtkjs-mesh`, `three-mesh`                                                    | Same GLB mesh. tiled-vtkjs loads it as one tile.                                                                                          |
-| Point clouds           | `tiled-vtkjs-points`, `potree-points`                                               | COPC and Potree 2 fixtures. For a performance comparison, convert the same source capture to both formats.                                |
-| Native splat LOD       | `spark-splats`, `playcanvas-splats`                                                 | Shared source splats. Spark generates LOD from PLY in the smoke case and accepts paged RAD in custom cases. PlayCanvas uses Streamed SOG. |
-| Raster zoom            | `maplibre-raster`, `openlayers-cog`                                                 | XYZ raster tiles and an internally tiled COG with overviews. OpenLayers reads the COG by byte range.                                      |
+| Workload               | Default cases                                                                                    | Scope                                                                                                                                     |
+| ---------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| Standard mesh 3D Tiles | `tiled-vtkjs-mesh-tiles`, `cesium-mesh-tiles`, `three-tiles-mesh-tiles`, `deck-tiles-mesh-tiles` | Same three-level GLB tileset                                                                                                              |
+| SPZ Gaussian 3D Tiles  | `tiled-vtkjs-gaussian-tiles`, `cesium-gaussian-tiles`, `three-tiles-gaussian-tiles`              | Same three-level tileset. Three.js uses NASA-AMMOS 3DTilesRendererJS with Gaussian Splat Lite and the Gaussian splat plugin.              |
+| Standalone mesh        | `tiled-vtkjs-mesh`, `three-mesh`                                                                 | Same GLB mesh. tiled-vtkjs loads it as one tile.                                                                                          |
+| Point clouds           | `tiled-vtkjs-points`, `three-tiles-point-tiles`, `cesium-point-tiles`, `deck-tiles-point-tiles`  | Same points, colors and additive octree. tiled-vtkjs reads native COPC ranges. The other viewers read uncompressed PNTS tiles.            |
+| Potree                 | `potree-points`                                                                                  | Separate generated Potree 2 fixture.                                                                                                      |
+| Native splat LOD       | `spark-splats`, `playcanvas-splats`                                                              | Shared source splats. Spark generates LOD from PLY in the smoke case and accepts paged RAD in custom cases. PlayCanvas uses Streamed SOG. |
+| Raster zoom            | `maplibre-raster`, `openlayers-cog`                                                              | XYZ raster tiles and an internally tiled COG with overviews. OpenLayers reads the COG by byte range.                                      |
 
 The [Svirnas roof comparison](./svirnas/README.md) includes matched crops, repeated close-up scores and the recorded camera path used to measure time to detail.
 
@@ -37,6 +38,17 @@ The trace first approaches from the coarse view, then reverses zoom on the same 
 
 Compare the screenshots and settled detail alongside frame intervals and request volume. Animation intervals are browser callback cadence. The host timer covers work performed synchronously by the benchmark adapter. Selected tile IDs are available for some viewers. An empty selection, a blank canvas, and a localized coverage hole each measure different behavior. The coverage pass flags globally blank frames and records foreground area, so use image inspection or a dataset-specific mask to assess smaller holes. Use `summary.json` for case summaries and the per-case JSON for samples. The settled-reference pass writes
 `summary-settled-reference.json`. Frame timings from software smoke runs and coverage readback runs are diagnostic.
+
+## Compare a recorded point cloud
+
+The converter walks the COPC hierarchy, writes one PNTS payload per nonempty node and checks the total against the LAS header. Each tile uses a local origin to preserve coordinate precision. The manifest translates the recorded camera by the same amount. It uses a two-pixel point diameter at the focal plane and a one-pixel screen-space error target. The recording must use a Z-up perspective camera with a 30-degree vertical field of view.
+
+```sh
+node test/reference-viewers/prepare-point-tiles.mjs /path/to/LIDAR2019_NdP_54500_98500_EPSG2169.copc.laz test/recordings/luxembourg-points.json artifacts/point-capture
+node test/reference-viewers/run.mjs --manifest artifacts/point-capture/manifest.json --gpu --latency 40 --mbps 80 --out artifacts/point-capture-timing
+```
+
+COPC clients decode LASzip and fetch HTTP ranges from one file. PNTS clients fetch larger, individually addressable tiles. Compare transfer bytes, visible detail and frame intervals together. The deck.gl adapter uses Tile3DLayer and a geospatial first-person view to place local east-north-up captures on the ellipsoid.
 
 ## Run a local capture
 
@@ -69,6 +81,8 @@ Keep the manifest adjacent to its asset root, with paths in each case relative t
 npm --prefix test/reference-viewers run bench -- \
   --manifest /path/to/manifest.json --gpu --repeats 5 --out artifacts/local-capture
 ```
+
+Set `settleInitial: true` on a 3D capture to start motion after the opening view reports continuous convergence for 500 ms. The report records both first reported readiness and initial convergence relative to navigation. Keep these runs separate from first-draw starts.
 
 Use `--vtk-dist /path/to/examples/vtk/dist` to compare locally built tiled-vtkjs revisions that support the benchmark camera and SSE controls with the same manifest. Choose a different output directory per revision. Cases can override `traces` with arrays of `[milliseconds, normalizedZoom, halfTurns]` keyframes starting at zero. Zoom values zero and one select the far and near camera endpoints. For raster, the third value pans horizontally using the configured `panDegrees`.
 

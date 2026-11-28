@@ -261,7 +261,7 @@ describe("packaged Gaussian workers", () => {
           const modelToScene = new Float64Array([
             1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 6000000, 0, 0, 1,
           ]);
-          controller.setScene([
+          const ranges = [
             {
               id: "tileset-a/root",
               generation: 1,
@@ -270,16 +270,26 @@ describe("packaged Gaussian workers", () => {
             },
             {
               id: "tileset-b/root",
+              immutablePositions: true,
               generation: 2,
               positions: new Float32Array([0, 0, -20]),
               modelToScene,
             },
-          ]);
+          ];
+          controller.setScene(ranges);
           controller.request([6000000, 0, 0]);
           await controller.whenIdle();
           controller.request([6000100, 0, 0]);
           await controller.whenIdle();
           controller.request([6000100, 0, 0]);
+          await controller.whenIdle();
+          const moved = modelToScene.slice();
+          moved[12] = 6000100;
+          moved[14] = 20;
+          controller.setScene([
+            { ...ranges[1]!, modelToScene: moved },
+            { ...ranges[0]!, positions: new Float32Array([95, 0, 0]) },
+          ]);
           await controller.whenIdle();
           return { orders, errors };
         } finally {
@@ -290,6 +300,7 @@ describe("packaged Gaussian workers", () => {
         orders: [
           [0, 2, 1],
           [2, 1, 0],
+          [1, 0],
         ],
         errors: [],
       });

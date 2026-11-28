@@ -319,6 +319,10 @@ try {
     {
       "/data": assetRoot,
       "/cesium": resolve(here, "node_modules/cesium/Build/Cesium"),
+      "/three-basis": resolve(
+        here,
+        "node_modules/three/examples/jsm/libs/basis",
+      ),
       "/maplibre": resolve(here, "node_modules/maplibre-gl/dist"),
       "/": vtkDist,
     },
@@ -331,6 +335,7 @@ try {
       "/data",
       "/cesium",
       "/maplibre",
+      "/three-basis",
       "/combined",
       "/mesh",
       "/assets",
@@ -352,6 +357,8 @@ try {
         "ol/layer/WebGLTile.js",
         "ol/proj.js",
         "three/addons/loaders/GLTFLoader.js",
+        "three/addons/loaders/DRACOLoader.js",
+        "three/addons/loaders/KTX2Loader.js",
         "3d-tiles-renderer/plugins",
         ...Object.keys(
           JSON.parse(await readFile(resolve(here, "package.json"), "utf8"))
@@ -576,6 +583,7 @@ try {
           return {
             gpu: globalThis.referenceBenchmark.gpu,
             canvas: globalThis.referenceBenchmark.canvas,
+            initialSettledMs: globalThis.referenceBenchmark.initialSettledMs,
             navigationToReadyMs:
               globalThis.referenceBenchmark.navigationToReadyMs,
           };
@@ -649,10 +657,19 @@ try {
                   checkpoint.atMs +
                   ".png"
                 : name + "-checkpoint-" + checkpoint.label + ".png";
-              await writeFile(
-                resolve(output, file),
-                Buffer.from(image.split(",")[1], "base64"),
-              );
+              const encoded = Buffer.from(image.split(",")[1], "base64");
+              await writeFile(resolve(output, file), encoded);
+              if (settledReference) {
+                const { data, info } = await sharp(encoded)
+                  .removeAlpha()
+                  .raw()
+                  .toBuffer({ resolveWithObject: true });
+                checkpoint.foregroundFraction = foregroundFraction(
+                  data,
+                  info.channels,
+                  background,
+                );
+              }
               const target = checkpoint.recovery
                 ? record.recovery
                 : record.checkpoints;
@@ -727,9 +744,11 @@ try {
           throw new Error("Dataset request returned HTTP error");
         if (errors.length) throw new Error(errors[0]);
         if (
-          ![record.initial, ...Object.values(record.phases)].some(
-            (capture) => capture?.foregroundFraction > 0.001,
-          )
+          ![
+            record.initial,
+            ...Object.values(record.phases),
+            ...(record.checkpoints ?? []),
+          ].some((capture) => capture?.foregroundFraction > 0.001)
         )
           throw new Error("No visible content in any checkpoint");
         const seenResponses = new Set();

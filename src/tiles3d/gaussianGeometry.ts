@@ -276,7 +276,13 @@ export const writeGaussianColor = (
   let x = primitive.positions[position]! - camera[0]!;
   let y = primitive.positions[position + 1]! - camera[1]!;
   let z = primitive.positions[position + 2]! - camera[2]!;
-  const radius = Math.hypot(x, y, z);
+  // Squaring a Float32 position fits in double precision. Very large or tiny
+  // camera offsets still need scaled normalization.
+  const squared = x * x + y * y + z * z;
+  const radius =
+    squared >= 2 ** -1022 && Number.isFinite(squared)
+      ? Math.sqrt(squared)
+      : Math.hypot(x, y, z);
   if (radius > 0) {
     x /= radius;
     y /= radius;
@@ -292,7 +298,7 @@ export const writeGaussianColor = (
   basis[2] = 0.4886025119029199 * z;
   basis[3] = -0.4886025119029199 * x;
   const degree = primitive.harmonicDegree;
-  const count = (degree + 1) ** 2;
+  const count = (degree + 1) * (degree + 1);
   if (degree >= 2) {
     basis[4] = 1.092548430592079 * x * y;
     basis[5] = -1.092548430592079 * y * z;
@@ -324,10 +330,10 @@ export const writeGaussianColor = (
     coefficient < count;
     coefficient++, source += 3
   ) {
-    const weight = basis[coefficient]!;
-    red += weight * (higherBands[source]! * scale);
-    green += weight * (higherBands[source + 1]! * scale);
-    blue += weight * (higherBands[source + 2]! * scale);
+    const weight = basis[coefficient]! * scale;
+    red += weight * higherBands[source]!;
+    green += weight * higherBands[source + 1]!;
+    blue += weight * higherBands[source + 2]!;
   }
   target[offset] = Math.max(0, red);
   target[offset + 1] = Math.max(0, green);
