@@ -712,7 +712,36 @@ describe("traverseTileset", () => {
     expect(ready.requestedTileIds).toEqual(["root"]);
   });
 
-  it("restores broad published coverage before refining an asynchronously admitted region", () => {
+  it.each(["contentless", "failed"] as const)(
+    "requests a drawable fallback below a %s hierarchy level",
+    (kind) => {
+      const leaf = makeTile("root/0/0/0/0", 0);
+      const middle = makeTile("root/0/0/0", 8, [leaf]);
+      const fallback = makeTile("root/0/0", 16, [middle]);
+      const group = makeTile("root/0", 32, [fallback]);
+      const root = makeTile("root", 64, [
+        kind === "contentless" ? withoutContent(group) : group,
+      ]);
+      const statuses: Record<string, TileReadiness> = {
+        root: "submitted",
+        [group.id]: "failed",
+        [leaf.id]: "failed",
+      };
+      const options = { presented: (id: string) => id === root.id };
+      const waiting = select(root, statuses, options);
+      expect(waiting.requestedTileIds).toContain(fallback.id);
+      expect(waiting.requestedTileIds).not.toContain(middle.id);
+      expect(waiting.drawnTileIds).toEqual([root.id]);
+      const ready = select(
+        root,
+        { ...statuses, [fallback.id]: "submitted" },
+        options,
+      );
+      expect(ready.drawnTileIds).toEqual([fallback.id]);
+    },
+  );
+
+  it("preserves displayed detail when every visible sibling has submitted coverage", () => {
     const root = makeTile("root", 16, [
       makeTile("root/0", 0),
       makeTile("root/1", 0),
@@ -729,8 +758,18 @@ describe("traverseTileset", () => {
     });
     expect(rebuilding.desiredTileIds).toEqual(["root/0", "root/1"]);
     expect(rebuilding.requestedTileIds).toContain("root");
-    expect(rebuilding.drawnTileIds).toEqual(["root"]);
+    expect(rebuilding.drawnTileIds).toEqual(["root/0", "root/1"]);
     expect(rebuilding.recoveringCoverage).toBe(true);
+    expect(
+      traverseTileset({ ...options, presented: () => false }).drawnTileIds,
+    ).toEqual(["root"]);
+
+    const missingSibling = traverseTileset({
+      ...options,
+      readiness: (id) => (id === "root/1" ? "loading" : "submitted"),
+      presented: (id) => id === "root/0",
+    });
+    expect(missingSibling.drawnTileIds).toEqual(["root"]);
 
     const recovered = traverseTileset({
       ...options,

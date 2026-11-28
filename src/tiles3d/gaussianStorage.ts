@@ -38,6 +38,7 @@ export const createGaussianStorage = () => {
     { offset: number; count: number; revision: number }
   >();
   let free: { offset: number; count: number }[] = [];
+  let colorViews = new Map<number, readonly number[]>();
   const packedUpdates = new Map<number, [number, number]>();
   const packed = new Map<number, GaussianBounds>();
   const progress = new Map<number, { count: number; bounds: GaussianBounds }>();
@@ -52,6 +53,7 @@ export const createGaussianStorage = () => {
     free.push({ offset: capacity, count: target - capacity });
     capacity = target;
     coalesce();
+    colorViews = new Map();
     packed.clear();
     progress.clear();
     packedUpdates.clear();
@@ -149,6 +151,9 @@ export const createGaussianStorage = () => {
       return { ...allocation, fresh: true };
     },
     grow,
+    get colorViews() {
+      return colorViews;
+    },
     isPacked: (revision: number): boolean => packed.has(revision),
     packedBounds: (revision: number) => packed.get(revision),
     packingProgress: (revision: number) => progress.get(revision),
@@ -179,6 +184,7 @@ export const createGaussianStorage = () => {
       for (const [key, allocation] of allocations)
         if (!live.has(key)) {
           allocations.delete(key);
+          colorViews.delete(allocation.revision);
           packed.delete(allocation.revision);
           progress.delete(allocation.revision);
           packedUpdates.delete(allocation.revision);
@@ -200,6 +206,7 @@ export const createGaussianStorage = () => {
       colors = new Float32Array();
       origin = null;
       allocations.clear();
+      colorViews = new Map();
       packed.clear();
       progress.clear();
       free = [];

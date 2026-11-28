@@ -391,6 +391,13 @@ describe("shared Gaussian realization", () => {
         16,
       );
       expect(final.displayedSplats).toBe(1);
+      await page.evaluate(async () => {
+        const fixture = (globalThis as unknown as { gaussianFixture: Fixture })
+          .gaussianFixture;
+        fixture.setCamera([0, 0, 10]);
+        await fixture.settle();
+      });
+      expect((await pixels(page)).data).toEqual(before.data);
     } finally {
       await page.close();
     }
@@ -496,6 +503,146 @@ describe("coherent mixed presentations and ownership", () => {
       "The streamed presentation did not reach the requested state",
     );
   };
+
+  it("keeps the displayed order when the camera returns before a sort finishes", async () => {
+    const page = await open("single");
+    try {
+      const initial = await api(page, "stepMixedProbe");
+      await api(page, "hold");
+      await api(page, "setCamera", [0, 0, -10]);
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      await api(page, "setCamera", [0, 0, 10]);
+      await api(page, "releaseNext");
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      const returned = await api(page, "stepMixedProbe");
+      expect(returned.pixel).toEqual(initial.pixel);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it("keeps mapper-managed colors when the camera returns after preparation", async () => {
+    const page = await open("sh");
+    try {
+      const initial = await api(page, "stepMixedProbe");
+      await api(page, "hold");
+      await api(page, "setCamera", [0, 0, -10]);
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      const returned = await page.evaluate(async () => {
+        const fixture = (globalThis as unknown as { gaussianFixture: Fixture })
+          .gaussianFixture;
+        fixture.setCamera([1, 0, -10]);
+        fixture.releaseNext();
+        // Drain the sort completion before yielding to the queued browser paint.
+        for (
+          let turn = 0;
+          turn < 100 &&
+          (!fixture.stats().pendingPreparation || !fixture.pending());
+          turn++
+        )
+          await Promise.resolve();
+        if (!fixture.stats().pendingPreparation || fixture.pending() !== 1)
+          throw new Error("Expected prepared colors and a second camera sort");
+        fixture.stepMixedProbe(false);
+        fixture.setCamera([0, 0, 10]);
+        return fixture.stepMixedProbe();
+      });
+      expect(returned.pixel).toEqual(initial.pixel);
+      await api(page, "releaseNext");
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      expect((await api(page, "stepMixedProbe")).pixel).toEqual(initial.pixel);
+      await api(page, "release");
+      await api(page, "settle");
+      expect((await api(page, "stepMixedProbe")).pixel).toEqual(initial.pixel);
+    } finally {
+      await page.close();
+    }
+  });
+
+  it.each(["sorting", "upload", "synchronous paint"])(
+    "keeps the displayed geometry when selection returns during %s",
+    async (phase) => {
+      const page = await open("budgeted-uploads");
+      try {
+        await api(page, "stageMixedProbe", "parent", 1, 1);
+        const coarse = await stepUntil(page, (frame) =>
+          frame.picks.includes("parent"),
+        );
+        await api(page, "stageMixedProbe", "detail", 1, 1);
+        const fine = await stepUntil(page, (frame) =>
+          frame.picks.includes("detail"),
+        );
+        expect(fine.pixel).not.toEqual(coarse.pixel);
+
+        await api(page, "selectGrowth", "parent");
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        if (phase !== "sorting") {
+          await api(page, "releaseNext");
+          await stepUntil(
+            page,
+            (frame) => frame.stats.pendingPreparation && frame.queued,
+            [],
+            false,
+          );
+        }
+        let returned: ProbeFrame;
+        if (phase === "synchronous paint") {
+          returned = await page.evaluate(() => {
+            const fixture = (
+              globalThis as unknown as { gaussianFixture: Fixture }
+            ).gaussianFixture;
+            fixture.selectGrowth("detail");
+            return fixture.stepMixedProbe();
+          });
+        } else {
+          await api(page, "selectGrowth", "detail");
+          if (phase === "sorting") await api(page, "releaseNext");
+          await expect.poll(() => api(page, "pending")).toBe(1);
+          returned = await api(page, "stepMixedProbe");
+        }
+        expect(returned.pixel).toEqual(fine.pixel);
+        expect(returned.picks).toEqual(["detail"]);
+
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        await api(page, "releaseNext");
+        await api(page, "selectGrowth", "parent");
+        await expect.poll(() => api(page, "pending")).toBe(1);
+        await api(page, "releaseNext");
+        const accepted = await stepUntil(page, (frame) =>
+          frame.picks.includes("parent"),
+        );
+        expect(accepted.pixel).toEqual(coarse.pixel);
+      } finally {
+        await page.close();
+      }
+    },
+  );
+
+  it("keeps the displayed colors when the camera returns before the next paint", async () => {
+    const page = await open("budgeted-uploads");
+    try {
+      await api(page, "stageMixedProbe", "detail", 1, 1);
+      const initial = await stepUntil(
+        page,
+        (frame) => frame.stats.displayedSplats === 1,
+      );
+      await api(page, "hold");
+      await api(page, "setCamera", [0, 0, -10]);
+      await expect.poll(() => api(page, "pending")).toBe(1);
+      await api(page, "releaseNext");
+      await stepUntil(
+        page,
+        (frame) => frame.uploads.some((upload) => upload.kind === "order"),
+        [],
+        false,
+      );
+      await api(page, "setCamera", [0, 0, 10]);
+      const returned = await api(page, "stepMixedProbe");
+      expect(returned.pixel).toEqual(initial.pixel);
+    } finally {
+      await page.close();
+    }
+  });
 
   it("budgets mixed upload ranges before paint and preserves the accepted draw on cancellation", async () => {
     const page = await open("budgeted-uploads");

@@ -137,6 +137,8 @@ type Tile = {
   owner: Owner;
   generation: number;
   gaussian: DecodedGaussianPrimitive[];
+  retainedContent?: DecodedTileContent;
+  sourceClaims: number;
   hasTranslucentMesh: boolean;
   count: number;
   bytes: number;
@@ -153,6 +155,7 @@ type Tile = {
 };
 
 type Owner = {
+  retiredById: Map<string, Set<Tile>>;
   key: number;
   options: TileContentAdapterOptions;
   mesh: MeshAdapter;
@@ -355,6 +358,7 @@ const makeStorage = (
     scales: arena.scales,
     rotations: arena.rotations,
     colors: arena.colors,
+    colorViews: arena.colorViews,
     count,
     bytes: arena.bytes,
   };
@@ -539,6 +543,9 @@ const createManager = (
   // Covariance reconstruction can dominate even for a small byte range.
   const tuplesPerStep = (bytes: number) =>
     Math.max(1, Math.min(1024, Math.floor(maxBytes / bytes)));
+  // Index remapping only gathers and writes integers.
+  const indexTuplesPerStep = (bytes: number) =>
+    Math.max(1, Math.floor(Math.min(maxBytes, 64 * 1024) / bytes));
   const uploadTuplesPerStep = (bytes: number) =>
     Math.max(1, Math.floor(Math.min(maxBytes, 1024 * 1024) / bytes));
   // 40 bytes of geometry plus two 16-byte color and 4-byte order textures.
@@ -598,6 +605,7 @@ const createManager = (
     acceptedSortRevision = 0,
     sortTargetRevision = 0;
   let latestColorCamera: readonly number[] | null = null;
+  let mapperColorsDirty = false;
   let context: GaussianGpuContext | null = null;
   let watchedCanvas: WebGL2RenderingContext["canvas"] | null = null;
   const scheduleContextPaint = () => firstOptions.scheduleRender();
@@ -764,6 +772,12 @@ const createManager = (
     (storage && storage.positions !== arena.positions
       ? (storage.positions.length / 3) * gpuBytesPerTuple
       : 0);
+  const forgetRetired = (tile: Tile): void => {
+    retiredSources.delete(tile);
+    const generations = tile.owner.retiredById.get(tile.id);
+    if (!generations?.delete(tile)) return;
+    if (!generations.size) tile.owner.retiredById.delete(tile.id);
+  };
   const releaseRetiredSources = (): void => {
     for (const tile of retiredSources) {
       const presented = displayed.has(tile) || tile.owner.presented.has(tile);
@@ -771,6 +785,7 @@ const createManager = (
         tile.owner.mesh.retireTile(tile.id);
       if (
         !presented &&
+        !tile.sourceClaims &&
         !reusableTiles.has(tile) &&
         !storage?.tiles.includes(tile) &&
         !candidate?.tiles.includes(tile) &&
@@ -778,7 +793,7 @@ const createManager = (
       ) {
         tile.sourceMemory?.release();
         tile.sourceMemory = undefined;
-        retiredSources.delete(tile);
+        forgetRetired(tile);
       }
     }
   };
@@ -1216,6 +1231,7 @@ const createManager = (
     }
     releaseRetiredSources();
     latestColorCamera = [...presentation.cameraPosition];
+    mapperColorsDirty = false;
     if (sortElapsedMs !== null) {
       sortMs = sortElapsedMs;
       sortCount++;
@@ -1236,6 +1252,82 @@ const createManager = (
       scheduleRefresh();
   };
 
+  const samePresentedTiles = (snapshot: SortSnapshot) =>
+    [...snapshot.owners].every(
+      ([owner, { base }]) =>
+        base.every((value, axis) => value === owner.presentedBase[axis]) &&
+        [...owner.presented].every((tile) => snapshot.tiles.has(tile)),
+    ) &&
+    snapshot.tiles.size ===
+      [...snapshot.owners.keys()].reduce(
+        (size, owner) => size + owner.presented.size,
+        0,
+      );
+
+  const isDisplayedFrontier = (snapshot: SortSnapshot, target: Realization) =>
+    storage?.positions === target.storage.positions &&
+    (!getOpenGLRenderWindow ||
+      !snapshot.count ||
+      displayedGpu?.positions === storage.positions) &&
+    samePresentedTiles(snapshot);
+
+  const selectionReturned = (snapshot: SortSnapshot): boolean => {
+    const active = storage;
+    if (!active || active.bufferRevision !== active.arena.bufferRevision)
+      return false;
+    // A queued refresh has not built a target for the current selection yet.
+    if (
+      !dirty &&
+      (!sortTarget ||
+        sortTarget.snapshot.revision <= snapshot.revision ||
+        !compatible(sortTarget.snapshot, sortTarget) ||
+        !samePresentedTiles(sortTarget.snapshot))
+    )
+      return false;
+    if (samePresentedTiles(snapshot)) return false;
+    for (const owner of owners) {
+      if (
+        owner.disposed ||
+        !owner.base.every(
+          (value, axis) => value === owner.presentedBase[axis],
+        ) ||
+        owner.presented.size !== (owner.visible ? owner.drawn.size : 0)
+      )
+        return false;
+      for (const tile of owner.presented)
+        if (
+          tile.retired ||
+          !tile.submitted ||
+          owner.tiles.get(tile.id) !== tile ||
+          !owner.drawn.has(tile.id)
+        )
+          return false;
+    }
+    if (displayed.size && getOpenGLRenderWindow) {
+      const prepared = mapper.getPreparedPointTextures();
+      if (
+        !context ||
+        !prepared ||
+        displayedGpu?.positions !== active.positions ||
+        prepared.window !== context.window ||
+        prepared.context !== context.context ||
+        prepared.generation !== context.generation ||
+        context.context.isContextLost()
+      )
+        return false;
+    }
+    return active.primitives.every(
+      (packed) =>
+        !displayed.has(packed.tile) ||
+        (active.arena.owns(packed.allocationKey, packed.allocationRevision) &&
+          active.arena.isPacked(packed.allocationRevision)),
+    );
+  };
+
+  const displayedAt = (position: readonly number[] | undefined) =>
+    !!position &&
+    latestColorCamera?.every((value, axis) => value === position[axis]);
+
   const publish = (
     presentation: Pick<GaussianSortPresentation, "cameraPosition" | "order">,
     snapshot: SortSnapshot,
@@ -1243,27 +1335,18 @@ const createManager = (
     sortElapsedMs: number | null,
   ): boolean => {
     if (!compatible(snapshot, target)) return false;
+    if (selectionReturned(snapshot)) {
+      scheduleRefresh();
+      return true;
+    }
     if (
-      storage?.positions === target.storage.positions &&
-      (latestColorCamera?.every(
-        (value, axis) => value === presentation.cameraPosition[axis],
-      ) ||
+      ((!mapperColorsDirty && displayedAt(presentation.cameraPosition)) ||
+        (displayedAt(camera?.position) &&
+          !displayedAt(presentation.cameraPosition)) ||
         [...snapshot.owners].some(([owner, { base }]) =>
           base.some((value, axis) => value !== owner.base[axis]),
         )) &&
-      (!getOpenGLRenderWindow ||
-        !snapshot.count ||
-        displayedGpu?.positions === storage.positions) &&
-      [...snapshot.owners].every(
-        ([owner, { base }]) =>
-          base.every((value, index) => value === owner.presentedBase[index]) &&
-          [...owner.presented].every((tile) => snapshot.tiles.has(tile)),
-      ) &&
-      snapshot.tiles.size ===
-        [...snapshot.owners.keys()].reduce(
-          (size, owner) => size + owner.presented.size,
-          0,
-        )
+      isDisplayedFrontier(snapshot, target)
     ) {
       if (publication) newerPublication = true;
       return true;
@@ -1325,8 +1408,8 @@ const createManager = (
         presentation.order,
         order,
         drawToStorage,
-        tuplesPerStep(4),
-        tuplesPerStep(8),
+        indexTuplesPerStep(4),
+        indexTuplesPerStep(8),
       );
       const windowContext = snapshot.count ? context : null;
       if (windowContext) {
@@ -1342,11 +1425,10 @@ const createManager = (
         gpu,
         camera: presentation.cameraPosition,
         recolor: (packed) =>
+          mapperColorsDirty ||
           storage !== next ||
           !displayed.has(packed.tile) ||
-          !latestColorCamera?.every(
-            (value, axis) => value === presentation.cameraPosition[axis],
-          ),
+          !displayedAt(presentation.cameraPosition),
         order,
         colorTuplesPerStep: tuplesPerStep(16),
         uploadTuplesPerStep,
@@ -1377,6 +1459,19 @@ const createManager = (
             !compatible(snapshot, target) ||
             windowContext?.context.isContextLost()
           ) {
+            cancelPublication();
+            scheduleRefresh();
+            return;
+          }
+          // Either the camera or the selected tiles can return while staging a draw.
+          if (
+            selectionReturned(snapshot) ||
+            (displayedAt(camera?.position) &&
+              !displayedAt(presentation.cameraPosition) &&
+              isDisplayedFrontier(snapshot, target))
+          ) {
+            // Mapper-managed colors share the CPU array written during staging.
+            if (!gpu && colorRanges.length) mapperColorsDirty = true;
             cancelPublication();
             scheduleRefresh();
             return;
@@ -2189,6 +2284,11 @@ const createManager = (
       hideTiles(new Set([tile]));
     }
     retiredSources.add(tile);
+    if (!immediate && tile.submitted) {
+      const generations = owner.retiredById.get(id) ?? new Set<Tile>();
+      generations.add(tile);
+      owner.retiredById.set(id, generations);
+    }
     for (const grouped of tile.group)
       if (!grouped.submitted) {
         grouped.retired = true;
@@ -2250,6 +2350,7 @@ const createManager = (
       owner.disposed = true;
       owner.mesh.dispose();
       owner.tiles.clear();
+      owner.retiredById.clear();
     }
     owners.clear();
     displayed.clear();
@@ -2351,6 +2452,7 @@ const createManager = (
       onEmpty: () => void,
     ): TileContentAdapter {
       const owner: Owner = {
+        retiredById: new Map(),
         key: ++nextOwner,
         options,
         mesh: createMeshAdapter({
@@ -2415,14 +2517,14 @@ const createManager = (
         }
         return [...cancelled];
       };
-      const retainedGeneration = (id: string): Tile | undefined =>
-        [...retiredSources].find(
-          (entry) =>
-            entry.owner === owner &&
-            entry.id === id &&
-            entry.submitted &&
-            (entry.meshBytes === 0 || owner.mesh.tileState(id) === "submitted"),
-        );
+      const retainedGeneration = (id: string): Tile | undefined => {
+        const generations = owner.retiredById.get(id);
+        if (!generations) return undefined;
+        for (const tile of generations)
+          if (tile.meshBytes === 0 || owner.mesh.tileState(id) === "submitted")
+            return tile;
+        return undefined;
+      };
       const submit = (
         entries: readonly {
           id: string;
@@ -2491,6 +2593,11 @@ const createManager = (
               owner,
               generation: ++generation,
               gaussian,
+              sourceClaims: 0,
+              retainedContent:
+                gaussian.length === entry.content.primitives.length
+                  ? entry.content
+                  : undefined,
               hasTranslucentMesh,
               count,
               sourceBytes,
@@ -2757,7 +2864,7 @@ const createManager = (
                   (predecessor) => !retained.has(predecessor),
                 );
           for (const [index, tile] of group.entries()) {
-            retiredSources.delete(tile);
+            forgetRetired(tile);
             reusableTiles.delete(tile);
             tile.sourceMemory?.release();
             tile.sourceMemory = nextSources.get(tile);
@@ -2951,6 +3058,7 @@ const createManager = (
           return [...new Set([...cancelled, ...meshCancelled])];
         },
         clearTiles() {
+          owner.retiredById.clear();
           clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
@@ -2969,6 +3077,21 @@ const createManager = (
             : owner.failed.has(id)
               ? "failed"
               : "absent";
+        },
+        retainContent(id) {
+          const tile = retainedGeneration(id);
+          if (!tile?.retainedContent) return undefined;
+          tile.sourceClaims++;
+          let released = false;
+          return {
+            content: tile.retainedContent,
+            release() {
+              if (released) return;
+              released = true;
+              tile.sourceClaims--;
+              releaseRetiredSources();
+            },
+          };
         },
         restoreTile(id) {
           if (owner.failed.has(id)) return "failed";
@@ -3041,6 +3164,7 @@ const createManager = (
         dispose() {
           if (owner.disposed) return;
           owner.disposed = true;
+          owner.retiredById.clear();
           clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);

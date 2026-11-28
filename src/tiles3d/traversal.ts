@@ -532,6 +532,7 @@ const traverseHierarchy = (
       return Math.abs(distance) <= extent;
     });
   type Region = {
+    readonly needsFallback: boolean;
     readonly error: number;
     readonly offset: number;
     readonly centered: boolean;
@@ -541,6 +542,7 @@ const traverseHierarchy = (
     readonly offset: number;
     readonly coveredRegion: Region | undefined;
     readonly parentAtCenter: boolean;
+    centerError: number;
   };
   const requestOrder = new Map<string, RequestOrder>();
 
@@ -574,8 +576,17 @@ const traverseHierarchy = (
       };
     }
     const offset = view.centerRayOffset(bounds.center);
-    const centered = tile.children.length > 0 && spansScreenCenter(bounds);
-    requestOrder.set(tile.id, { depth, offset, coveredRegion, parentAtCenter });
+    const centered =
+      (tile.children.length > 0 || !!coveredRegion) &&
+      spansScreenCenter(bounds);
+    requestOrder.set(tile.id, {
+      depth,
+      offset,
+      coveredRegion,
+      parentAtCenter,
+      centerError:
+        !retainSubmitted && centered ? (coveredRegion?.error ?? 0) : 0,
+    });
     const ownPresented = options.presented?.(tile.id) ?? false;
     const covered = !!coveredRegion || ownPresented;
 
@@ -600,8 +611,8 @@ const traverseHierarchy = (
 
     const authoredContent = hasContent(tile);
     const available = !options.unavailable?.(tile.id);
-    const submitted =
-      authoredContent && options.readiness(tile.id) === "submitted";
+    const state = authoredContent ? options.readiness(tile.id) : undefined;
+    const submitted = state === "submitted";
     const contentful = authoredContent && (available || submitted);
     // Contentless tiles are hierarchy nodes, not drawable levels of detail.
     // Their descendants remain reachable regardless of the node's own SSE, and
@@ -611,9 +622,11 @@ const traverseHierarchy = (
       tile.children.length > 0 && (ownPresented || contentful)
         ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
         : 0;
-    const childRegion = ownPresented
-      ? { error, offset, centered }
-      : coveredRegion;
+    let childRegion = coveredRegion;
+    if (ownPresented)
+      childRegion = { error, offset, centered, needsFallback: true };
+    else if (coveredRegion?.needsFallback && contentful && state !== "failed")
+      childRegion = { ...coveredRegion, needsFallback: false };
     const refine =
       tile.children.length > 0 &&
       (retainSubmitted
@@ -695,6 +708,11 @@ const traverseHierarchy = (
       options.presented && submitted && !coveragePresented,
     );
     if (visibleChildren.every((child) => child.coverageSubmitted)) {
+      const childDrawn = visibleChildren.flatMap((child) => child.drawn);
+      // A complete child frontier can preserve detail already on screen while
+      // the adapter publishes the newly visible siblings.
+      const restoreParent =
+        recoveringCoverage && !childDrawn.some((id) => options.presented?.(id));
       return {
         visible: true,
         coverageSubmitted: true,
@@ -708,12 +726,14 @@ const traverseHierarchy = (
           ...(recoveringCoverage ? [tile.id] : []),
           ...visibleChildren.flatMap((child) => child.requested),
         ],
-        drawn: recoveringCoverage
-          ? [tile.id]
-          : visibleChildren.flatMap((child) => child.drawn),
+        drawn: restoreParent ? [tile.id] : childDrawn,
       };
     }
 
+    // Behind displayed coverage, load one fallback level and the desired
+    // descendants. Other missing intermediate levels need no payload yet.
+    const needsFallback =
+      submitted || !coveredRegion || coveredRegion.needsFallback;
     return {
       visible: true,
       coverageSubmitted: submitted,
@@ -725,7 +745,7 @@ const traverseHierarchy = (
         contentful || visibleChildren.every((child) => child.coveragePossible),
       desired,
       requested: [
-        ...(contentful && !retainSubmitted ? [tile.id] : []),
+        ...(contentful && !retainSubmitted && needsFallback ? [tile.id] : []),
         ...visibleChildren.flatMap((child) => child.requested),
       ],
       // Never partially replace a submitted parent. If it has not arrived yet,
@@ -756,6 +776,20 @@ const traverseHierarchy = (
     }
   }
 
+  // An eligible ancestor unlocks the same focused detail as its waiting leaf.
+  for (const id of result.desired) {
+    const order = requestOrder.get(id)!;
+    if (!order.centerError || options.readiness(id) === "submitted") continue;
+    for (let parent = id; parent.includes("/");) {
+      parent = parent.slice(0, parent.lastIndexOf("/"));
+      const dependency = requestOrder.get(parent);
+      if (dependency)
+        dependency.centerError = Math.max(
+          dependency.centerError,
+          order.centerError,
+        );
+    }
+  }
   const requested = [...result.requested].sort((left, right) => {
     const a = requestOrder.get(left)!;
     const b = requestOrder.get(right)!;
@@ -765,7 +799,8 @@ const traverseHierarchy = (
     const bRegion = b.coveredRegion;
     const coverageOrder =
       aRegion && bRegion
-        ? Number(b.parentAtCenter) - Number(a.parentAtCenter) ||
+        ? b.centerError - a.centerError ||
+          Number(b.parentAtCenter) - Number(a.parentAtCenter) ||
           Number(bRegion.centered) - Number(aRegion.centered) ||
           bRegion.error - aRegion.error ||
           aRegion.offset - bRegion.offset

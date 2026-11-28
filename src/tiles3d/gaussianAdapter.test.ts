@@ -66,6 +66,8 @@ vi.mock("@kitware/vtk.js/Rendering/Core/PointGaussianMapper", () => vtk);
 vi.mock("@kitware/vtk.js/Rendering/SceneGraph/RenderPass", () => vtk);
 
 import { IDENTITY } from "../core/mat4";
+import { createTiles3dMember } from "./member";
+import type { TileContentAdapter } from "./contentAdapter";
 import { createMemoryPool } from "../core/memoryPool";
 import { ResourcePolicyError } from "../core/memoryResources";
 import { createSubmissionScheduler } from "../core/submissionScheduler";
@@ -1571,6 +1573,153 @@ describe("Gaussian admission ownership", () => {
       f.release();
       await f.settle();
       expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(5);
+      expect(f.errors).toEqual([]);
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("returns to a presented Gaussian fallback during a compact replacement without reloading it", async () => {
+    const f = fixture();
+    const fetches: string[] = [];
+    const decodes: string[] = [];
+    const box = { box: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1] };
+    const camera = (distance: number) => ({
+      projection: "perspective" as const,
+      fovY: Math.PI / 3,
+      position: [0, 0, distance] as [number, number, number],
+      viewProj: IDENTITY,
+      viewportWidthCssPx: 100,
+      viewportHeightCssPx: 100,
+    });
+    let adapter!: TileContentAdapter;
+    f.pool.configure({ totalBytes: 480, transitionBytes: 480 });
+    const member = createTiles3dMember(
+      {
+        renderer: f.renderer,
+        memory: f.pool,
+        submissions: f.submissions,
+        devicePixelRatio: 1,
+        scheduleRender() {},
+      },
+      {
+        endpoint: "/tiles",
+        revision: "r1",
+        tilesetToScene: IDENTITY,
+        maximumScreenSpaceErrorPx: 4,
+        cacheBytes: 0,
+        fetchTileset: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({
+            asset: { version: "1.1" },
+            geometricError: 8,
+            root: {
+              geometricError: 8,
+              refine: "REPLACE",
+              boundingVolume: box,
+              content: { uri: "root.glb" },
+              children: ["left", "right"].map((id) => ({
+                geometricError: 0,
+                boundingVolume: box,
+                content: { uri: id + ".glb" },
+              })),
+            },
+          }),
+        }),
+        fetchContent: async (url) => {
+          fetches.push(url);
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            arrayBuffer: async () => new ArrayBuffer(1),
+          };
+        },
+      },
+      {
+        textureCapabilities: { capabilityKey: "none", compressedFormats: [] },
+        createContentAdapter: (options) => (adapter = f.factory(options)),
+        workers: {
+          decode: (request) => {
+            decodes.push(request.contentUrl);
+            return {
+              promise: Promise.resolve(
+                field(request.contentUrl.endsWith("root.glb") ? 8 : 3),
+              ),
+              cancel() {},
+            };
+          },
+        },
+      },
+    );
+    try {
+      member.applyAllocation({
+        qualityFraction: 1,
+        memoryBudgetBytes: 480,
+        regime: "stationary",
+      });
+      member.setCamera(camera(1000));
+      await f.drainUntil(() => adapter.stats().drawnTileIds.includes("root"));
+      f.hold();
+      member.setCamera(camera(10));
+      await f.drainUntil(() => adapter.tileState("root") === "absent");
+      expect(adapter.stats().drawnTileIds).toEqual(["root"]);
+      member.setCamera(camera(1000));
+      f.release();
+      await f.drainUntil(() => member.governorInputs().work.operations === 0);
+      expect(adapter.stats().drawnTileIds).toEqual(["root"]);
+      expect(fetches.filter((url) => url.endsWith("/root.glb"))).toHaveLength(
+        1,
+      );
+      expect(decodes.filter((url) => url.endsWith("/root.glb"))).toHaveLength(
+        1,
+      );
+      member.setCamera(camera(10));
+      await f.drainUntil(() => adapter.stats().drawnTileIds.length === 2);
+      expect([...adapter.stats().drawnTileIds].sort()).toEqual([
+        "root/0",
+        "root/1",
+      ]);
+    } finally {
+      f.release();
+      member.dispose();
+      f.dispose();
+    }
+  });
+
+  it("loads a new source for the same tile ID after clearing a single owner", async () => {
+    const f = fixture();
+    try {
+      const other = f.additionalAdapter();
+      const content = field(2);
+      const otherContent = field(1);
+      f.adapter.submitTile("root", content);
+      other.submitTile("root", otherContent);
+      await f.settle();
+      f.adapter.setDrawnTiles(["root"]);
+      other.setDrawnTiles(["root"]);
+      await f.settle();
+      f.adapter.retireTile("root", "revisit");
+      other.retireTile("root", "revisit");
+      const first = f.adapter.retainContent?.("root");
+      const second = other.retainContent?.("root");
+      expect(first?.content).toBe(content);
+      expect(second?.content).toBe(otherContent);
+      f.adapter.clearTiles();
+      expect(f.adapter.retainContent?.("root")).toBeUndefined();
+      expect(f.adapter.restoreTile("root")).toBe("absent");
+      expect(other.restoreTile("root")).toBe("restored");
+      const updated = field(5);
+      expect(f.adapter.submitTile("root", updated)).toBe("queued");
+      await f.settle();
+      f.adapter.setDrawnTiles(["root"]);
+      other.setDrawnTiles(["root"]);
+      first?.release();
+      second?.release();
+      await f.settle();
+      expect(f.factory.stats(f.renderer)?.displayedSplats).toBe(6);
       expect(f.errors).toEqual([]);
     } finally {
       f.dispose();
