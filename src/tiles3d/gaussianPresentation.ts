@@ -263,11 +263,19 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
         continue;
       // A cancelled upload may have overwritten part of the previous range.
       draw.colorViews.delete(allocationRevision);
-    } else if (!harmonic || !recolor(range)) continue;
-    const modelCamera = harmonic
-      ? gaussianModelCamera(range.matrix, camera)
-      : null;
+    }
+    const evaluated = attributes.colorViews.get(allocationRevision);
+    const currentColors = evaluated?.every(
+      (value, axis) => value === camera[axis],
+    );
+    if (!draw && (!harmonic || (currentColors && !recolor(range)))) continue;
+    const modelCamera =
+      harmonic && !currentColors
+        ? gaussianModelCamera(range.matrix, camera)
+        : null;
     if (modelCamera) {
+      // A cancelled slice may leave a mix of two views in this CPU range.
+      attributes.colorViews.delete(allocationRevision);
       for (let first = 0; first < count; first += colorTuplesPerStep) {
         const size = Math.min(colorTuplesPerStep, count - first);
         yield {
@@ -286,6 +294,7 @@ export function* stageGaussianAttributes<Range extends GaussianPackedRange>({
           },
         };
       }
+      attributes.colorViews.set(allocationRevision, [...camera]);
     }
     if (draw) dirtyColors.push(range);
     if (harmonic) colorUpdates.push([offset, count]);

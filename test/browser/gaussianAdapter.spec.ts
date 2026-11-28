@@ -391,6 +391,13 @@ describe("shared Gaussian realization", () => {
         16,
       );
       expect(final.displayedSplats).toBe(1);
+      await page.evaluate(async () => {
+        const fixture = (globalThis as unknown as { gaussianFixture: Fixture })
+          .gaussianFixture;
+        fixture.setCamera([0, 0, 10]);
+        await fixture.settle();
+      });
+      expect((await pixels(page)).data).toEqual(before.data);
     } finally {
       await page.close();
     }

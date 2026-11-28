@@ -22,6 +22,7 @@ export type GaussianAttributes = {
   scales: Float32Array;
   rotations: Float32Array;
   colors: Float32Array;
+  colorViews: Map<number, readonly number[]>;
 };
 
 type PackingStorage = GaussianAttributes & {
@@ -49,6 +50,10 @@ export function* packGaussianRanges<Range extends GaussianPackedRange>(
       previousStorage?.arena.packedBounds(previous.allocationRevision);
     if (previous && previousStorage && previousBounds) {
       const bounds: GaussianBounds = [...previousBounds];
+      // A partially copied range may contain colors from an earlier view.
+      const sourceView = storage.arena.packingProgress(allocationRevision)
+        ? undefined
+        : previousStorage.colorViews.get(previous.allocationRevision);
       for (
         let first =
           storage.arena.packingProgress(allocationRevision)?.count ?? 0;
@@ -81,6 +86,12 @@ export function* packGaussianRanges<Range extends GaussianPackedRange>(
                 offset,
                 count,
               );
+              if (
+                sourceView &&
+                previousStorage.colorViews.get(previous.allocationRevision) ===
+                  sourceView
+              )
+                storage.colorViews.set(allocationRevision, sourceView);
               onPacked(packed, "copy");
             } else storage.arena.markPartial(allocationRevision, end, bounds);
           },

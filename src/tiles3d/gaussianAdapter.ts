@@ -355,6 +355,7 @@ const makeStorage = (
     scales: arena.scales,
     rotations: arena.rotations,
     colors: arena.colors,
+    colorViews: arena.colorViews,
     count,
     bytes: arena.bytes,
   };
@@ -539,6 +540,9 @@ const createManager = (
   // Covariance reconstruction can dominate even for a small byte range.
   const tuplesPerStep = (bytes: number) =>
     Math.max(1, Math.min(1024, Math.floor(maxBytes / bytes)));
+  // Index remapping only gathers and writes integers.
+  const indexTuplesPerStep = (bytes: number) =>
+    Math.max(1, Math.floor(Math.min(maxBytes, 64 * 1024) / bytes));
   const uploadTuplesPerStep = (bytes: number) =>
     Math.max(1, Math.floor(Math.min(maxBytes, 1024 * 1024) / bytes));
   // 40 bytes of geometry plus two 16-byte color and 4-byte order textures.
@@ -1325,8 +1329,8 @@ const createManager = (
         presentation.order,
         order,
         drawToStorage,
-        tuplesPerStep(4),
-        tuplesPerStep(8),
+        indexTuplesPerStep(4),
+        indexTuplesPerStep(8),
       );
       const windowContext = snapshot.count ? context : null;
       if (windowContext) {
