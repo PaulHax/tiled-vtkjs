@@ -202,6 +202,7 @@ export const createTiles3dMember = (
   let workProgressSerial = 0;
   let selectionPasses = 0;
   type RealizationDemand = {
+    retained?: { content: DecodedTileContent; release(): void };
     blocked?: {
       readonly refusal: TileSubmissionRefusal;
       readonly replacement: string | null;
@@ -555,6 +556,12 @@ export const createTiles3dMember = (
     return ancestor === null ? replacements : [...replacements, ancestor];
   };
 
+  const localContent = (id: string) =>
+    demand.get(id)?.retained?.content ?? queue?.get(id);
+
+  const hasDecodedContent = (id: string) =>
+    queue?.state(id)?.status === "ready" || !!demand.get(id)?.retained;
+
   const waitingForSiblingBeforeReplacement = (id: string): boolean =>
     submittedAncestors(id).some((ancestor) =>
       desiredDescendants(ancestor).some((candidate) => {
@@ -568,7 +575,7 @@ export const createTiles3dMember = (
         if (demand.get(candidate)?.blocked) return false;
         return (
           state === "queued" ||
-          queue?.state(candidate)?.status === "ready" ||
+          hasDecodedContent(candidate) ||
           (demand.has(candidate) && readiness(candidate) !== "failed")
         );
       }),
@@ -583,7 +590,7 @@ export const createTiles3dMember = (
         return (
           state === "queued" ||
           state === "submitted" ||
-          queue?.state(candidate)?.status === "ready"
+          hasDecodedContent(candidate)
         );
       })
     );
@@ -650,7 +657,7 @@ export const createTiles3dMember = (
     const entries = [];
     for (const candidate of desired) {
       if (adapter.tileState(candidate) !== "absent") return undefined;
-      const content = queue.get(candidate);
+      const content = localContent(candidate);
       if (!content) return undefined;
       entries.push({
         id: candidate,
@@ -726,8 +733,13 @@ export const createTiles3dMember = (
     return true;
   };
 
-  const clearAdmissionState = (): void => {
+  const clearDemand = (): void => {
+    for (const tile of demand.values()) tile.retained?.release();
     demand.clear();
+  };
+
+  const clearAdmissionState = (): void => {
+    clearDemand();
     unavailableRepresentations.clear();
   };
 
@@ -744,7 +756,8 @@ export const createTiles3dMember = (
     if (unavailableRepresentations.has(id)) return "failed" as const;
     if (state === "queued") return "loading" as const;
     const entry = queue?.state(id);
-    if (entry?.status === "ready") return "decoded" as const;
+    if (entry?.status === "ready" || demand.get(id)?.retained)
+      return "decoded" as const;
     if (entry?.status === "failed" || entry?.status === "blocked")
       return "failed" as const;
     if (entry) return "loading" as const;
@@ -791,7 +804,7 @@ export const createTiles3dMember = (
         queue?.setSelection([]);
         subtreeQueue?.setSelection([]);
         for (const id of demand.keys()) adapter.cancelTile(id);
-        demand.clear();
+        clearDemand();
         updateDrawSet(true);
         return;
       }
@@ -830,11 +843,15 @@ export const createTiles3dMember = (
           refining ??= new Set(next.desiredTileIds.flatMap(ancestorIds));
           adapter.retireTile(id, refining.has(id) ? "refining" : "revisit");
         }
+        demand.get(id)?.retained?.release();
         demand.delete(id);
       }
       for (const id of nextRequested) {
-        if (!demand.has(id)) demand.set(id, {});
-        adapter.restoreTile(id);
+        const tile = demand.get(id) ?? {};
+        demand.set(id, tile);
+        if (adapter.tileState(id) === "absent")
+          tile.retained ??= adapter.retainContent?.(id);
+        if (!tile.retained) adapter.restoreTile(id);
       }
       queue.setSelection(
         nextContentRequests.filter(({ id }) => {
@@ -842,6 +859,8 @@ export const createTiles3dMember = (
           if (
             state === "submitted" ||
             state === "failed" ||
+            demand.get(id)?.retained ||
+            (state === "queued" && queue?.state(id)?.status !== "ready") ||
             unavailableRepresentations.has(id)
           )
             return false;
@@ -867,7 +886,7 @@ export const createTiles3dMember = (
           : nextRequested;
       for (const id of admissionOrder) {
         if (adapter.tileState(id) !== "absent") continue;
-        const content = queue.get(id);
+        const content = localContent(id);
         if (!content || unavailableRepresentations.has(id)) continue;
 
         const groupOutcome = trySubmitDesiredGroup(id);
@@ -937,6 +956,8 @@ export const createTiles3dMember = (
       return;
     }
     tile.blocked = undefined;
+    tile.retained?.release();
+    tile.retained = undefined;
     // Admission changes REPLACE coverage. Re-run selection so an ancestor is
     // removed from both the fetch obligation and renderer only after every
     // required descendant has crossed the shared admission boundary.

@@ -57,6 +57,10 @@ export type TileContentAdapter = Omit<
 > & {
   /** Gaussian reconstruction color spaces this adapter can present. */
   readonly gaussianColorSpaces?: readonly GaussianAppearanceProfile["colorSpace"][];
+  /** Keep a retired decoded payload available until this demand ends. */
+  retainContent?(
+    id: string,
+  ): { content: DecodedTileContent; release(): void } | undefined;
   presentationMatrix(): Mat16;
   estimateTileBytes(content: DecodedTileContent): number;
   setCamera(view: CameraView): void;

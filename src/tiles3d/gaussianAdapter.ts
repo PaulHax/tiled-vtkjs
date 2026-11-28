@@ -137,6 +137,8 @@ type Tile = {
   owner: Owner;
   generation: number;
   gaussian: DecodedGaussianPrimitive[];
+  retainedContent?: DecodedTileContent;
+  sourceClaims: number;
   hasTranslucentMesh: boolean;
   count: number;
   bytes: number;
@@ -153,6 +155,7 @@ type Tile = {
 };
 
 type Owner = {
+  retiredById: Map<string, Set<Tile>>;
   key: number;
   options: TileContentAdapterOptions;
   mesh: MeshAdapter;
@@ -769,6 +772,12 @@ const createManager = (
     (storage && storage.positions !== arena.positions
       ? (storage.positions.length / 3) * gpuBytesPerTuple
       : 0);
+  const forgetRetired = (tile: Tile): void => {
+    retiredSources.delete(tile);
+    const generations = tile.owner.retiredById.get(tile.id);
+    if (!generations?.delete(tile)) return;
+    if (!generations.size) tile.owner.retiredById.delete(tile.id);
+  };
   const releaseRetiredSources = (): void => {
     for (const tile of retiredSources) {
       const presented = displayed.has(tile) || tile.owner.presented.has(tile);
@@ -776,6 +785,7 @@ const createManager = (
         tile.owner.mesh.retireTile(tile.id);
       if (
         !presented &&
+        !tile.sourceClaims &&
         !reusableTiles.has(tile) &&
         !storage?.tiles.includes(tile) &&
         !candidate?.tiles.includes(tile) &&
@@ -783,7 +793,7 @@ const createManager = (
       ) {
         tile.sourceMemory?.release();
         tile.sourceMemory = undefined;
-        retiredSources.delete(tile);
+        forgetRetired(tile);
       }
     }
   };
@@ -2274,6 +2284,11 @@ const createManager = (
       hideTiles(new Set([tile]));
     }
     retiredSources.add(tile);
+    if (!immediate && tile.submitted) {
+      const generations = owner.retiredById.get(id) ?? new Set<Tile>();
+      generations.add(tile);
+      owner.retiredById.set(id, generations);
+    }
     for (const grouped of tile.group)
       if (!grouped.submitted) {
         grouped.retired = true;
@@ -2335,6 +2350,7 @@ const createManager = (
       owner.disposed = true;
       owner.mesh.dispose();
       owner.tiles.clear();
+      owner.retiredById.clear();
     }
     owners.clear();
     displayed.clear();
@@ -2436,6 +2452,7 @@ const createManager = (
       onEmpty: () => void,
     ): TileContentAdapter {
       const owner: Owner = {
+        retiredById: new Map(),
         key: ++nextOwner,
         options,
         mesh: createMeshAdapter({
@@ -2500,14 +2517,14 @@ const createManager = (
         }
         return [...cancelled];
       };
-      const retainedGeneration = (id: string): Tile | undefined =>
-        [...retiredSources].find(
-          (entry) =>
-            entry.owner === owner &&
-            entry.id === id &&
-            entry.submitted &&
-            (entry.meshBytes === 0 || owner.mesh.tileState(id) === "submitted"),
-        );
+      const retainedGeneration = (id: string): Tile | undefined => {
+        const generations = owner.retiredById.get(id);
+        if (!generations) return undefined;
+        for (const tile of generations)
+          if (tile.meshBytes === 0 || owner.mesh.tileState(id) === "submitted")
+            return tile;
+        return undefined;
+      };
       const submit = (
         entries: readonly {
           id: string;
@@ -2576,6 +2593,11 @@ const createManager = (
               owner,
               generation: ++generation,
               gaussian,
+              sourceClaims: 0,
+              retainedContent:
+                gaussian.length === entry.content.primitives.length
+                  ? entry.content
+                  : undefined,
               hasTranslucentMesh,
               count,
               sourceBytes,
@@ -2842,7 +2864,7 @@ const createManager = (
                   (predecessor) => !retained.has(predecessor),
                 );
           for (const [index, tile] of group.entries()) {
-            retiredSources.delete(tile);
+            forgetRetired(tile);
             reusableTiles.delete(tile);
             tile.sourceMemory?.release();
             tile.sourceMemory = nextSources.get(tile);
@@ -3036,6 +3058,7 @@ const createManager = (
           return [...new Set([...cancelled, ...meshCancelled])];
         },
         clearTiles() {
+          owner.retiredById.clear();
           clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
@@ -3054,6 +3077,21 @@ const createManager = (
             : owner.failed.has(id)
               ? "failed"
               : "absent";
+        },
+        retainContent(id) {
+          const tile = retainedGeneration(id);
+          if (!tile?.retainedContent) return undefined;
+          tile.sourceClaims++;
+          let released = false;
+          return {
+            content: tile.retainedContent,
+            release() {
+              if (released) return;
+              released = true;
+              tile.sourceClaims--;
+              releaseRetiredSources();
+            },
+          };
         },
         restoreTile(id) {
           if (owner.failed.has(id)) return "failed";
@@ -3126,6 +3164,7 @@ const createManager = (
         dispose() {
           if (owner.disposed) return;
           owner.disposed = true;
+          owner.retiredById.clear();
           clearReuse(owner);
           hideOwner(owner);
           for (const id of owner.tiles.keys()) dropTile(owner, id, true);
