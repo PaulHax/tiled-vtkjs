@@ -203,6 +203,42 @@ describe("traverseTileset", () => {
     expect(result.drawnTileIds).toEqual(["root"]);
   });
 
+  it("requests the siblings needed to refine a centered parent before peripheral descendants", () => {
+    const leaf = (id: string, x: number): TilesetTile => ({
+      ...makeTile(id, 0, [], matrix(x)),
+      boundingVolume: {
+        center: [0, 0, 0],
+        halfAxes: [0.05, 0, 0, 0, 0.05, 0, 0, 0, 0.05],
+      },
+    });
+    const root = {
+      ...makeTile("root", 8, [
+        makeTile("root/0", 4, [leaf("root/0/0", -0.9)], matrix(1.1)),
+        makeTile("root/1", 1, [leaf("root/1/0", 0), leaf("root/1/1", 0.7)]),
+      ]),
+      boundingVolume: {
+        center: [0, 0, 0],
+        halfAxes: [3, 0, 0, 0, 1, 0, 0, 0, 1],
+      },
+    } satisfies TilesetTile;
+    const camera = view(
+      [0, 0, 10],
+      multiply(perspective(Math.PI / 2, 1, 0.1, 100), matrix(0, 0, -10)),
+    );
+    const selection = select(
+      root,
+      { root: "submitted" },
+      {
+        camera,
+        presented: (id) => id === "root",
+      },
+    );
+    expect(
+      selection.requestedTileIds.filter((id) => id.split("/").length === 3),
+    ).toEqual(["root/1/0", "root/1/1", "root/0/0"]);
+    expect(selection.drawnTileIds).toEqual(["root"]);
+  });
+
   it("reuses hierarchy across camera changes and invalidates replaced or evicted subtrees", () => {
     const root = implicitRoot();
     const parsed = parseSubtree(

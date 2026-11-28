@@ -516,11 +516,31 @@ const traverseHierarchy = (
         hasSubmittedDescendant(child),
     );
 
-  type Region = { readonly error: number; readonly offset: number };
+  const matrix = options.camera.viewProj;
+  const screenAxes: [Vec3, Vec3] = [
+    [matrix[0]!, matrix[4]!, matrix[8]!],
+    [matrix[1]!, matrix[5]!, matrix[9]!],
+  ];
+  // The clip-space x=0 and y=0 planes conservatively bound the center ray.
+  const spansScreenCenter = (box: WorldBox) =>
+    screenAxes.every((axis, index) => {
+      const distance = dot(axis, box.center) + matrix[12 + index]!;
+      const extent = box.axes.reduce(
+        (sum, halfAxis) => sum + Math.abs(dot(axis, halfAxis)),
+        0,
+      );
+      return Math.abs(distance) <= extent;
+    });
+  type Region = {
+    readonly error: number;
+    readonly offset: number;
+    readonly centered: boolean;
+  };
   type RequestOrder = {
     readonly depth: number;
     readonly offset: number;
     readonly coveredRegion: Region | undefined;
+    readonly parentAtCenter: boolean;
   };
   const requestOrder = new Map<string, RequestOrder>();
 
@@ -530,6 +550,7 @@ const traverseHierarchy = (
     depth: number,
     coveredRegion?: Region,
     retainSubmitted = false,
+    parentAtCenter = true,
   ): VisitResult => {
     let placement = placements.get(tile);
     if (!placement) {
@@ -553,7 +574,8 @@ const traverseHierarchy = (
       };
     }
     const offset = view.centerRayOffset(bounds.center);
-    requestOrder.set(tile.id, { depth, offset, coveredRegion });
+    const centered = tile.children.length > 0 && spansScreenCenter(bounds);
+    requestOrder.set(tile.id, { depth, offset, coveredRegion, parentAtCenter });
     const ownPresented = options.presented?.(tile.id) ?? false;
     const covered = !!coveredRegion || ownPresented;
 
@@ -589,7 +611,9 @@ const traverseHierarchy = (
       tile.children.length > 0 && (ownPresented || contentful)
         ? screenSpaceError(tile, accumulated, bounds, view, errorScale)
         : 0;
-    const childRegion = ownPresented ? { error, offset } : coveredRegion;
+    const childRegion = ownPresented
+      ? { error, offset, centered }
+      : coveredRegion;
     const refine =
       tile.children.length > 0 &&
       (retainSubmitted
@@ -598,7 +622,14 @@ const traverseHierarchy = (
           (error > effective && (options.refinable?.(tile.id) ?? true)));
     const childResults = refine
       ? tile.children.map((child) =>
-          visit(child, accumulated, depth + 1, childRegion, retainSubmitted),
+          visit(
+            child,
+            accumulated,
+            depth + 1,
+            childRegion,
+            retainSubmitted,
+            centered,
+          ),
         )
       : [];
     const visibleChildren = childResults.filter((child) => child.visible);
@@ -628,7 +659,7 @@ const traverseHierarchy = (
       const fallbacks =
         !retainSubmitted && !submitted && hasSubmittedDescendant(tile)
           ? tile.children.map((child) =>
-              visit(child, accumulated, depth + 1, childRegion, true),
+              visit(child, accumulated, depth + 1, childRegion, true, centered),
             )
           : [];
       const visibleFallbacks = fallbacks.filter((child) => child.visible);
@@ -728,13 +759,16 @@ const traverseHierarchy = (
   const requested = [...result.requested].sort((left, right) => {
     const a = requestOrder.get(left)!;
     const b = requestOrder.get(right)!;
-    // First restore regions without coverage. Then let the highest-error
-    // visible fallback refine without waiting for a whole breadth level.
+    // Restore missing coverage first. Under displayed fallbacks, schedule
+    // siblings together when their parent spans the center of the view.
     const aRegion = a.coveredRegion;
     const bRegion = b.coveredRegion;
     const coverageOrder =
       aRegion && bRegion
-        ? bRegion.error - aRegion.error || aRegion.offset - bRegion.offset
+        ? Number(b.parentAtCenter) - Number(a.parentAtCenter) ||
+          Number(bRegion.centered) - Number(aRegion.centered) ||
+          bRegion.error - aRegion.error ||
+          aRegion.offset - bRegion.offset
         : Number(!!aRegion) - Number(!!bRegion);
     return coverageOrder || a.depth - b.depth || a.offset - b.offset;
   });
