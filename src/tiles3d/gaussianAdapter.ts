@@ -602,6 +602,7 @@ const createManager = (
     acceptedSortRevision = 0,
     sortTargetRevision = 0;
   let latestColorCamera: readonly number[] | null = null;
+  let mapperColorsDirty = false;
   let context: GaussianGpuContext | null = null;
   let watchedCanvas: WebGL2RenderingContext["canvas"] | null = null;
   const scheduleContextPaint = () => firstOptions.scheduleRender();
@@ -1220,6 +1221,7 @@ const createManager = (
     }
     releaseRetiredSources();
     latestColorCamera = [...presentation.cameraPosition];
+    mapperColorsDirty = false;
     if (sortElapsedMs !== null) {
       sortMs = sortElapsedMs;
       sortCount++;
@@ -1240,6 +1242,82 @@ const createManager = (
       scheduleRefresh();
   };
 
+  const samePresentedTiles = (snapshot: SortSnapshot) =>
+    [...snapshot.owners].every(
+      ([owner, { base }]) =>
+        base.every((value, axis) => value === owner.presentedBase[axis]) &&
+        [...owner.presented].every((tile) => snapshot.tiles.has(tile)),
+    ) &&
+    snapshot.tiles.size ===
+      [...snapshot.owners.keys()].reduce(
+        (size, owner) => size + owner.presented.size,
+        0,
+      );
+
+  const isDisplayedFrontier = (snapshot: SortSnapshot, target: Realization) =>
+    storage?.positions === target.storage.positions &&
+    (!getOpenGLRenderWindow ||
+      !snapshot.count ||
+      displayedGpu?.positions === storage.positions) &&
+    samePresentedTiles(snapshot);
+
+  const selectionReturned = (snapshot: SortSnapshot): boolean => {
+    const active = storage;
+    if (!active || active.bufferRevision !== active.arena.bufferRevision)
+      return false;
+    // A queued refresh has not built a target for the current selection yet.
+    if (
+      !dirty &&
+      (!sortTarget ||
+        sortTarget.snapshot.revision <= snapshot.revision ||
+        !compatible(sortTarget.snapshot, sortTarget) ||
+        !samePresentedTiles(sortTarget.snapshot))
+    )
+      return false;
+    if (samePresentedTiles(snapshot)) return false;
+    for (const owner of owners) {
+      if (
+        owner.disposed ||
+        !owner.base.every(
+          (value, axis) => value === owner.presentedBase[axis],
+        ) ||
+        owner.presented.size !== (owner.visible ? owner.drawn.size : 0)
+      )
+        return false;
+      for (const tile of owner.presented)
+        if (
+          tile.retired ||
+          !tile.submitted ||
+          owner.tiles.get(tile.id) !== tile ||
+          !owner.drawn.has(tile.id)
+        )
+          return false;
+    }
+    if (displayed.size && getOpenGLRenderWindow) {
+      const prepared = mapper.getPreparedPointTextures();
+      if (
+        !context ||
+        !prepared ||
+        displayedGpu?.positions !== active.positions ||
+        prepared.window !== context.window ||
+        prepared.context !== context.context ||
+        prepared.generation !== context.generation ||
+        context.context.isContextLost()
+      )
+        return false;
+    }
+    return active.primitives.every(
+      (packed) =>
+        !displayed.has(packed.tile) ||
+        (active.arena.owns(packed.allocationKey, packed.allocationRevision) &&
+          active.arena.isPacked(packed.allocationRevision)),
+    );
+  };
+
+  const displayedAt = (position: readonly number[] | undefined) =>
+    !!position &&
+    latestColorCamera?.every((value, axis) => value === position[axis]);
+
   const publish = (
     presentation: Pick<GaussianSortPresentation, "cameraPosition" | "order">,
     snapshot: SortSnapshot,
@@ -1247,27 +1325,18 @@ const createManager = (
     sortElapsedMs: number | null,
   ): boolean => {
     if (!compatible(snapshot, target)) return false;
+    if (selectionReturned(snapshot)) {
+      scheduleRefresh();
+      return true;
+    }
     if (
-      storage?.positions === target.storage.positions &&
-      (latestColorCamera?.every(
-        (value, axis) => value === presentation.cameraPosition[axis],
-      ) ||
+      ((!mapperColorsDirty && displayedAt(presentation.cameraPosition)) ||
+        (displayedAt(camera?.position) &&
+          !displayedAt(presentation.cameraPosition)) ||
         [...snapshot.owners].some(([owner, { base }]) =>
           base.some((value, axis) => value !== owner.base[axis]),
         )) &&
-      (!getOpenGLRenderWindow ||
-        !snapshot.count ||
-        displayedGpu?.positions === storage.positions) &&
-      [...snapshot.owners].every(
-        ([owner, { base }]) =>
-          base.every((value, index) => value === owner.presentedBase[index]) &&
-          [...owner.presented].every((tile) => snapshot.tiles.has(tile)),
-      ) &&
-      snapshot.tiles.size ===
-        [...snapshot.owners.keys()].reduce(
-          (size, owner) => size + owner.presented.size,
-          0,
-        )
+      isDisplayedFrontier(snapshot, target)
     ) {
       if (publication) newerPublication = true;
       return true;
@@ -1346,11 +1415,10 @@ const createManager = (
         gpu,
         camera: presentation.cameraPosition,
         recolor: (packed) =>
+          mapperColorsDirty ||
           storage !== next ||
           !displayed.has(packed.tile) ||
-          !latestColorCamera?.every(
-            (value, axis) => value === presentation.cameraPosition[axis],
-          ),
+          !displayedAt(presentation.cameraPosition),
         order,
         colorTuplesPerStep: tuplesPerStep(16),
         uploadTuplesPerStep,
@@ -1381,6 +1449,19 @@ const createManager = (
             !compatible(snapshot, target) ||
             windowContext?.context.isContextLost()
           ) {
+            cancelPublication();
+            scheduleRefresh();
+            return;
+          }
+          // Either the camera or the selected tiles can return while staging a draw.
+          if (
+            selectionReturned(snapshot) ||
+            (displayedAt(camera?.position) &&
+              !displayedAt(presentation.cameraPosition) &&
+              isDisplayedFrontier(snapshot, target))
+          ) {
+            // Mapper-managed colors share the CPU array written during staging.
+            if (!gpu && colorRanges.length) mapperColorsDirty = true;
             cancelPublication();
             scheduleRefresh();
             return;
